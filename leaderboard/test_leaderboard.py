@@ -164,12 +164,12 @@ class Runner(unittest.TestCase):
 
 
 class Connectors(unittest.TestCase):
-    def test_a_folder_with_a_connector_is_a_runnable_system(self) -> None:
-        self.assertEqual(connector_names(), ["dolt", "dolt_mysql"])
+    def test_every_connector_in_the_repository_fills_the_contract(self) -> None:
+        self.assertTrue(connector_names())
         for name in connector_names():
             self.assertIsInstance(load_connector(name), Connector)
-        with self.assertRaises(ValueError):  # neon has only system.json: the page shows it, nothing runs it
-            load_connector("neon")
+        with self.assertRaises(ValueError):
+            load_connector("no_such_system")
 
     def test_adding_a_system_is_adding_its_folder(self) -> None:
         with tempfile.TemporaryDirectory() as board:

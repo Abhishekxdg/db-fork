@@ -1,9 +1,10 @@
 """What a leaderboard system provides, and how the runner finds it.
 
 A folder leaderboard/<name>/ with both system.json and connector.py is a runnable
-system. A folder with only system.json is shown on the page but never run. The
-runner imports nothing but these connector.py files, so it only loads code that
-lives in this repository. Each defines CONNECTOR, an instance of a Connector.
+system. A folder without connector.py is never run. The page can still show it
+from a leaderboard/mock/<name>.json preview. The runner imports nothing but these
+connector.py files, so it only loads code that lives in this repository. Each
+defines CONNECTOR, an instance of a Connector.
 
 main's microbench/runner2.py builds the database adapter from `backend`, so a
 connector can only use a backend that main's WorkerContext already supports.
