@@ -61,11 +61,20 @@ What a run creates, all named after `bb_<run id>` and all deleted at the end:
   `bb_<run id>_<branch>`, inside the project in `TIGER_PROJECT_ID`.
 
 At most 5 branches or forks are alive at once, besides the root. A run creates
-16 branches. Tiger and Xata averaged about 55 s per branch in earlier measurements,
+16 branches. Hosted deletions may continue asynchronously after the API accepts
+them, so this is not a vendor quota guarantee. Tiger and Xata averaged about 55 s per branch in earlier measurements,
 so their runs should take 15 to 25 minutes.
 
-If a run is killed, `leaderboard/.runs/<system>.journal.json` keeps the name, and
-the next run of that system deletes everything with that name before it starts.
+If a run is killed, `leaderboard/.runs/<system>.journal.json` keeps the name and
+target scope privately, without API keys. The next run deletes those resources
+before starting only if its target matches. A changed target or an older journal
+without a scope stops the run and preserves the journal for manual recovery.
+Restore the original account/project or local data directory before retrying;
+do not discard the journal until its resources have been removed.
+
+`--deadline-min` bounds startup, recovery, provisioning, loading, and measurement
+(default 120 minutes). Cleanup then gets its own 20-minute limit, and server stop
+gets 60 seconds. A cleanup failure retains the journal for a later retry.
 
 ## Mock data
 
@@ -77,8 +86,8 @@ client in US East. Each file's `basis` says so.
 
 - The build adds a mock only for a system with no result file. So a system's first
   real result, or even its first error record, replaces its mock.
-- The page labels mock entries "(mock)", fades their bars, and shows a notice. The
-  Data filter hides them.
+- The page shows mocks in a separate, unranked preview. They never affect measured
+  scores or ratio baselines. The Data filter hides them.
 - Mock files sit outside `results/`, and the validator rejects a result file that
   carries a `mock` key, so a mock cannot be published as a measurement.
 - To remove them all, delete `leaderboard/mock/` and run the build again.
@@ -104,7 +113,10 @@ The suite in `suite.json` runs 8 rows, 3 tries each, on the `item` table:
 - **Branches:** every row starts from the tip of a chain of 4 branches. Each data
   row runs on its own new branch. After every run, the runner checks that the tip
   still has the dump's row counts.
-- **Determinism:** the seed in `suite.json` fixes the keys and the generated rows.
+- **Determinism:** each row and try has its own seeded random stream, including
+  generated values. A failed try cannot change later tries' statements or inputs.
+  INSERT reserves distinct integer keys above the loaded maximum for all tries;
+  unexpected collisions fail the try instead of being retried outside its timing.
 - **Load:** the time to load the dump. Provisioning is recorded but not ranked.
 - **Hosted results** include the network round trip from the client. Each one
   records its region, where the client ran, and a round-trip baseline: the median
@@ -145,8 +157,10 @@ password of any connection URI in an error record or message.
 - its identity differs from `system.json`;
 - any key or string looks like a credential.
 
-`results/` and `data.js` are git-ignored until the suite is frozen, because
-db-fork is public and a pushed result is a published one.
+`results/` and `data.js` are tracked: db-fork is public, so pushing them publishes
+them. Existing `local-1` measurements are retained as historical files, but the
+build excludes them from `local-2`, which changes the workload's random streams
+and INSERT keys. New measurements require a committed tree and a full rerun.
 
 ## Rules
 
@@ -155,7 +169,10 @@ db-fork is public and a pushed result is a published one.
 - No result caching between tries or runs.
 - The runner queries the server version and records it.
 - Results come only from a committed tree. Changing `suite.json` changes its
-  digest, so results from different suites are never compared.
+  digest, so results from different suites are never compared. Bump the suite
+  name whenever workload semantics change. The runner snapshots source files,
+  dataset, and Git HEAD before starting and rejects results if they change during
+  the run, even when `--allow-dirty` is used for testing.
 
 ## Adding a system
 
@@ -170,12 +187,14 @@ db-fork is public and a pushed result is a published one.
    optionally `install`, as in `leaderboard/dolt/`. `start` must send the server's
    output to a log file, and `stop` must stop only the process `start` launched.
 4. **Runner.** Add a class to `leaderboard/run.py` with `backend`, `needs_psql`,
-   `version_sql`, `provision`, `load`, and `delete`, and register it in `SYSTEMS`.
+   `version_sql`, `scope`, `provision`, `load`, and `delete`, and register it in `SYSTEMS`.
    Everything it creates must be named after the run's database, so `delete` can
-   find it by name. A hosted class also sets `keys`, `region`, `service`, and
+   find it by name. `scope` must identify the deletion target without secrets;
+   cleanup refuses a journal from a different scope. A hosted class also sets `keys`, `region`, `service`, and
    `preflight`, and every `service` key must be in the validator's allowlist.
 5. **Trial.** Run it with `--max-batch 5 --allow-dirty --out /tmp/lb`, and check that
    every cell is filled and nothing is left behind.
 6. **Result.** Commit, run it in full, then validate and build.
 
-Tests: `python -m unittest leaderboard.test_leaderboard`.
+Tests: `python -m unittest discover -s leaderboard -p 'test_*.py'` and
+`node leaderboard/test_page.cjs`.
