@@ -141,16 +141,12 @@
         min-width: 36rem;
     }
 
-    /* Mock entries stand in for systems without a real run: marked, and faded. */
+    /* Mock entries are previews, never measurements. */
     .mock-note {
         background: #FFF1DC;
         border: 1px solid #FFCB80;
         border-radius: 0.5rem;
         padding: 0.5rem 0.75rem;
-    }
-
-    .summary tr.mock .summary-bar {
-        opacity: 0.45;
     }
 
     .details th {
@@ -261,7 +257,7 @@ const FILTERS = {
     hosting: e => state.hosted[e.hosted],
     system: e => state.system[e.system],
     machine: e => state.machine[e.machine],
-    tags: e => e.tags.some(t => state.tag[t]),
+    tags: e => Object.values(state.tag).every(Boolean) || e.tags.some(t => state.tag[t]),
     data: e => state.kind[e.mock ? 'mock' : 'measured'],
 };
 
@@ -366,6 +362,7 @@ function detailTable(view, ranked, best, entries) {
     head.append(document.createElement('th'), ...entries.map(e => {
         const th = document.createElement('th');
         th.textContent = label(e).replace(' (', '\n(');
+        if (e.mock) th.title = e.basis;
         return th;
     }));
     const body = table.createTBody();
@@ -390,10 +387,10 @@ function detailTable(view, ranked, best, entries) {
         }
         for (const e of entries) {
             const value = row.value(e);
-            const ratio = ratioOf(row, value, best.get(row));
+            const ratio = e.mock ? null : ratioOf(row, value, best.get(row));
             const td = tr.insertCell();
-            td.textContent = value === null ? 'failed' : `${value.toFixed(3)}s (×${ratio.toFixed(2)})`;
-            colorize(td, ratio);
+            td.textContent = value === null ? 'failed' : `${value.toFixed(3)}s` + (ratio === null ? '' : ` (×${ratio.toFixed(2)})`);
+            if (!e.mock) colorize(td, ratio);
         }
     }
     return scrolling(table);
@@ -413,18 +410,21 @@ function paragraph(text, className = 'note') {
     return p;
 }
 
-/// Rank one table. The best value per row comes from this table only. A ranked row
+/// Rank measured entries only; mocks are a separate, unranked raw-value preview.
+/// The best value per row comes from this table only. A ranked row
 /// that no entry here has a value for is dropped, and an entry that lacks any
 /// remaining ranked row is listed below the ranking instead of in it.
 function renderGroup(title, entries) {
     const view = VIEWS[state.view];
-    const best = new Map(view.rows.map(r => [r, bestOf(entries, r)]));
+    const measured = entries.filter(e => !e.mock);
+    const mocks = entries.filter(e => e.mock);
+    const best = new Map(view.rows.map(r => [r, bestOf(measured, r)]));
     const ranked = view.ranked(view.rows);
     const usable = ranked.filter(r => best.get(r) !== null);
     const dropped = ranked.filter(r => best.get(r) === null);
 
     const scored = [], incomplete = [];
-    for (const e of usable.length ? entries : []) {
+    for (const e of usable.length ? measured : []) {
         const missing = usable.filter(r => r.value(e) === null);
         if (missing.length) {
             incomplete.push({e, missing});
@@ -442,17 +442,25 @@ function renderGroup(title, entries) {
     summary.className = 'summary';
     const raw = e => usable.length === 1 ? usable[0].value(e) : null;
     summary.append(...scored.map(({e, score}) => summaryRow(e, score, raw(e))));
-    section.append(heading, scrolling(summary));
+    section.append(heading);
+    if (measured.length) section.append(scrolling(summary));
 
-    if (dropped.length) {
+    if (measured.length && dropped.length) {
         section.append(paragraph(`Not ranked, because no result in this table has a value: ${dropped.map(r => r.label).join(', ')}.`));
     }
     for (const {e, missing} of incomplete) {
         section.append(paragraph(`${label(e)} is not ranked: it has ${usable.length - missing.length} of ${usable.length} rows. Missing: ${missing.map(r => r.label).join(', ')}.`));
     }
-    const details = document.createElement('h3');
-    details.textContent = 'Detailed comparison';
-    section.append(details, detailTable(view, ranked, best, [...scored.map(s => s.e), ...incomplete.map(i => i.e), ...(usable.length ? [] : entries)]));
+    if (measured.length) {
+        const details = document.createElement('h3');
+        details.textContent = 'Detailed comparison';
+        section.append(details, detailTable(view, ranked, best, [...scored.map(s => s.e), ...incomplete.map(i => i.e), ...(usable.length ? [] : measured)]));
+    }
+    if (mocks.length) {
+        const preview = document.createElement('h3');
+        preview.textContent = 'Mock preview (not ranked)';
+        section.append(preview, detailTable({...view, tickable: false}, [], best, mocks));
+    }
     return section;
 }
 
@@ -490,7 +498,8 @@ function render() {
     const mocked = uniq(shown.filter(e => e.mock).map(e => e.system));
     el('mock-note').hidden = !mocked.length;
     el('mock-note').textContent = `Mock data for ${mocked.join(', ')}: illustrative numbers, not measurements.`
-        + ' Each mock stands in until that system has a real run, then disappears. Hover a mock entry to see its basis.';
+        + ' Excluded from measured rankings and ratios. Each mock stands in until that system has a real run, then disappears.'
+        + ' Hover a mock entry to see its basis.';
     el('shown').textContent = `Showing ${shown.length} of ${data.length} results`
         + (mocked.length ? `, ${shown.filter(e => e.mock).length} of them mock.` : '.')
         + (hidden.length ? ` Hidden by ${hidden.map(([name, n]) => `${name}: ${n}`).join(', ')}.` : '');
@@ -503,7 +512,7 @@ function render() {
 
 el('method').textContent = `Suite ${suite.suite}: table ${suite.table} with ${suite.dataset.row_counts[suite.table]} rows,`
     + ` ${suite.tries} tries per row, seed ${suite.seed}. A value is the sum of the timed database calls in one batch.`
-    + ' Each ratio adds 10 ms, then divides by the best value in the same table.'
+    + ' Each ratio adds 10 ms, then divides by the best measured value in the same table.'
     + ' The score is the geometric mean of the ranked rows\' ratios.';
 render();
 </script>
