@@ -13,7 +13,9 @@ from unittest import mock
 
 import psycopg2
 
+from dblib import dolt as dolt_pg, dolt_mysql
 from leaderboard import run as runner
+from leaderboard.connector import load_connector
 
 
 class Recovery(unittest.TestCase):
@@ -44,9 +46,8 @@ class Recovery(unittest.TestCase):
             self.assertTrue(path.exists())
 
     def test_scopes_identify_actual_targets(self):
-        for key, module, host in (("dolt", runner.dolt_pg, "DOLT_HOST"),
-                                  ("dolt_mysql", runner.dolt_mysql, "DOLT_MYSQL_HOST")):
-            server = runner.SYSTEMS[key]
+        for key, module, host in (("dolt", dolt_pg, "DOLT_HOST"), ("dolt_mysql", dolt_mysql, "DOLT_MYSQL_HOST")):
+            server = load_connector(key)
             original = server.scope()
             with mock.patch.object(module, host, "other-host"):
                 self.assertNotEqual(server.scope(), original)
@@ -77,11 +78,12 @@ class RunLifecycle(unittest.TestCase):
         self.server = mock.Mock(needs_psql=False)
         self.server.scope.return_value = {"host": "fixture"}
         for attr, value in (("ROOT", self.root), ("BOARD", self.board),
-                            ("RUNS", self.board / ".runs"), ("SYSTEMS", {"dolt": self.server})):
+                            ("RUNS", self.board / ".runs")):
             patch = mock.patch.object(runner, attr, value)
             patch.start()
             self.addCleanup(patch.stop)
-        for attr, value in (("start_server", None), ("lifecycle", True), ("measure", ("1", 0, []))):
+        for attr, value in (("start_server", None), ("lifecycle", True), ("measure", ("1", 0, [])),
+                            ("load_connector", self.server)):
             patch = mock.patch.object(runner, attr, return_value=value)
             setattr(self, attr, patch.start())
             self.addCleanup(patch.stop)

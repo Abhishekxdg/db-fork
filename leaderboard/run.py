@@ -3,8 +3,8 @@
 From the repository root:
     python -m leaderboard.run <system> --machine <label>
 
-<system> must be a key of SYSTEMS, so the runner only loads adapters that live
-in this repository. The result lands in <out>/<system>/results/<YYYYMMDD>/<machine>.json
+<system> names a folder with a connector.py, so the runner only loads code that
+lives in this repository. The result lands in <out>/<system>/results/<YYYYMMDD>/<machine>.json
 only after cleanup succeeded. From the server start on, a failure publishes
 {"error": ...} in its place, so a stale success never stays current. A preflight
 failure publishes nothing.
@@ -34,15 +34,13 @@ import statistics
 import subprocess
 import sys
 import time
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
 
 import psycopg2
-from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
 import dblib.result_collector as rc
-from dblib import dolt as dolt_pg, dolt_mysql
-from dblib.dolt import DOLT_DATA_DIR, DoltToolSuite, commit_dolt_schema
+from leaderboard.connector import Connector, connector_names, load_connector
 from leaderboard.validate import BOARD, MACHINE_RE, SCHEMA_VERSION, sha256
 from microbench import task2_pb2 as tp
 from microbench.operations.crud import (
@@ -59,7 +57,6 @@ from microbench.runner2 import (
     WorkerContext,
     register_all_operations,
 )
-from util.import_db import load_sql_file
 
 ROOT = BOARD.parent
 RUNS = BOARD / ".runs"
@@ -114,70 +111,6 @@ def bounded(seconds: float, label: str):
         psycopg2.extensions.set_wait_callback(previous_callback)
 
 
-class Doltgres:
-    """Doltgres over the Postgres protocol: backend dolt."""
-
-    backend = tp.Backend.DOLT
-    needs_psql = True
-    version_sql = "SELECT dolt_version()"
-    data_dir = Path(DOLT_DATA_DIR).expanduser()
-
-    def scope(self) -> dict:
-        return {"host": dolt_pg.DOLT_HOST, "port": dolt_pg.DOLT_PORT, "user": dolt_pg.DOLT_USER,
-                "data_dir": str(self.data_dir.resolve())}
-
-    def _admin(self) -> psycopg2.extensions.connection:
-        conn = psycopg2.connect(DoltToolSuite.get_default_connection_uri())
-        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
-        return conn
-
-    def provision(self, db: str) -> BackendInfo:
-        with closing(self._admin()) as conn, conn.cursor() as cur:
-            cur.execute(f"CREATE DATABASE {db}")
-        return BackendInfo(default_branch_name="main")
-
-    def load(self, info: BackendInfo, db: str, dump: Path) -> None:
-        uri = DoltToolSuite.get_initial_connection_uri(db)
-        load_sql_file(uri, dump)
-        commit_dolt_schema(uri)
-
-    def delete(self, db: str) -> None:
-        with closing(self._admin()) as conn, conn.cursor() as cur:
-            cur.execute(f"DROP DATABASE IF EXISTS {db}")
-        shutil.rmtree(self.data_dir / ".dolt_dropped_databases" / db, ignore_errors=True)
-
-
-class Dolt:
-    """Dolt over the MySQL protocol: backend dolt_mysql."""
-
-    backend = tp.Backend.DOLT_MYSQL
-    needs_psql = False
-    version_sql = "SELECT dolt_version()"
-    data_dir = Path(dolt_mysql.DOLT_MYSQL_DATA_DIR)
-
-    def scope(self) -> dict:
-        return {"host": dolt_mysql.DOLT_MYSQL_HOST, "port": dolt_mysql.DOLT_MYSQL_PORT,
-                "user": dolt_mysql.DOLT_MYSQL_USER, "data_dir": str(self.data_dir.resolve())}
-
-    def provision(self, db: str) -> BackendInfo:
-        with closing(dolt_mysql.connect()) as conn, conn.cursor() as cur:
-            cur.execute(f"CREATE DATABASE {db}")
-        return BackendInfo(default_branch_name="main")
-
-    def load(self, info: BackendInfo, db: str, dump: Path) -> None:
-        dolt_mysql.load_sql_dump(db, str(dump))
-        with closing(dolt_mysql.connect(db)) as conn, conn.cursor() as cur:
-            cur.execute("CALL DOLT_COMMIT('-Am', 'Load SQL schema')")
-
-    def delete(self, db: str) -> None:
-        dolt_mysql.drop_database(db)
-        shutil.rmtree(self.data_dir / ".dolt_dropped_databases" / db, ignore_errors=True)
-
-
-SYSTEMS = {"dolt": Doltgres(), "dolt_mysql": Dolt()}
-System = Doltgres | Dolt
-
-
 def lifecycle(sysdir: Path, step: str) -> bool:
     """Run a system's install, start, check, or stop script. Hosted systems have none."""
     script = sysdir / step
@@ -217,7 +150,7 @@ def journal(system: str) -> Path:
     return RUNS / f"{system}.journal.json"
 
 
-def clean_up(system: str, server: System) -> Exception | None:
+def clean_up(system: str, server: Connector) -> Exception | None:
     """Delete everything named after the database the journal names, then delete
     the journal. The journal stays if the delete fails. Reports instead of raising."""
     try:  # an unreadable journal fails the run too, and stays for a person to inspect
@@ -390,7 +323,7 @@ def run_row(ctx: WorkerContext, row: dict, chain: list, suite: dict, max_batch: 
     return data_row(ctx, operation, f"row_{op}", tip_id, batch, tries)
 
 
-def measure(server: System, info: BackendInfo, db: str, suite: dict, max_batch: int | None,
+def measure(server: Connector, info: BackendInfo, db: str, suite: dict, max_batch: int | None,
             deadline: float) -> tuple[str, float, list]:
     """Verify the load, build the chain, and run every row.
     Returns the server version, the round-trip baseline in ms, and the cells."""
@@ -460,7 +393,7 @@ def run(system: str, machine: str, out: Path, max_batch: int | None, allow_dirty
         raise RunError(f"machine label {machine!r} must match {MACHINE_RE.pattern}")
     if not math.isfinite(deadline_min) or deadline_min <= 0:
         raise RunError("--deadline-min must be finite and greater than zero")
-    server, sysdir = SYSTEMS[system], BOARD / system
+    server, sysdir = load_connector(system), BOARD / system
     meta_path = sysdir / "system.json"
     meta_bytes = meta_path.read_bytes()
     meta = json.loads(meta_bytes)
@@ -578,7 +511,7 @@ def run(system: str, machine: str, out: Path, max_batch: int | None, allow_dirty
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run the leaderboard suite on one system.")
-    parser.add_argument("system", choices=sorted(SYSTEMS))
+    parser.add_argument("system", choices=connector_names())
     parser.add_argument("--machine", default=os.environ.get("machine"), help="machine label; defaults to $machine")
     parser.add_argument("--client-location", default=os.environ.get("client_location"),
                         help="where this machine runs, recorded for hosted systems; defaults to $client_location")

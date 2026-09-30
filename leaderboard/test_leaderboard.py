@@ -14,7 +14,8 @@ from pathlib import Path
 from unittest import mock
 
 from leaderboard.build import build
-from leaderboard.run import SYSTEMS, RunError, clean_up, exclusive, scrub
+from leaderboard.connector import Connector, connector_names, load_connector
+from leaderboard.run import RunError, clean_up, exclusive, scrub
 from leaderboard.validate import BOARD, SCHEMA_VERSION, sha256, validate
 from microbench.datagen import DynamicDataGenerator
 
@@ -154,12 +155,30 @@ class Runner(unittest.TestCase):
         with tempfile.TemporaryDirectory() as runs, mock.patch("leaderboard.run.RUNS", Path(runs)):
             journal = Path(runs) / "dolt.journal.json"
             journal.write_text('{"run_id": "1a2b')  # cut short by a kill mid-write
-            self.assertIsInstance(clean_up("dolt", SYSTEMS["dolt"]), ValueError)
+            self.assertIsInstance(clean_up("dolt", load_connector("dolt")), ValueError)
             self.assertTrue(journal.exists())
 
     def test_errors_never_carry_a_uri_password(self) -> None:
         self.assertEqual(scrub("connect failed: postgresql://owner:hunter2@ep-1.neon.tech/db?sslmode=require"),
                          "connect failed: postgresql://owner:***@ep-1.neon.tech/db?sslmode=require")
+
+
+class Connectors(unittest.TestCase):
+    def test_a_folder_with_a_connector_is_a_runnable_system(self) -> None:
+        self.assertEqual(connector_names(), ["dolt", "dolt_mysql"])
+        for name in connector_names():
+            self.assertIsInstance(load_connector(name), Connector)
+        with self.assertRaises(ValueError):  # neon has only system.json: the page shows it, nothing runs it
+            load_connector("neon")
+
+    def test_adding_a_system_is_adding_its_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as board:
+            for name, files in (("new", ("system.json", "connector.py")), ("preview", ("system.json",)),
+                                ("stray", ("connector.py",))):
+                (Path(board) / name).mkdir()
+                for file in files:
+                    (Path(board) / name / file).write_text("")
+            self.assertEqual(connector_names(Path(board)), ["new"])
 
 
 if __name__ == "__main__":
