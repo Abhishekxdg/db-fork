@@ -56,6 +56,22 @@ and show how to start the launcher. Nothing is published remotely by the wizard.
 Everything runs on one machine. The target databases are either local servers
 (Doltgres, Dolt) or hosted services (Neon, Tiger Cloud, Xata).
 
+## Official deployment direction (not implemented)
+
+Official rankings should come from controlled benchmark workers, not arbitrary
+contributor machines. Contributors would request a run or submit a database
+configuration. Workers would pin the machine specification, OS image, resource
+limits, benchmark revision, dataset, and seed. Managed services also need fixed
+client regions and provider-specific service configurations. Keep workers separate
+from the website/API host so web traffic does not affect measurements.
+
+The intended pipeline is: run request → standardized worker → result JSON →
+server-side validation → build `data.js` → deploy static files → browser display.
+The current validator checks file consistency; it does not attest that a run came
+from an approved environment. Submission, job scheduling, trusted-run provenance,
+and deployment are future work. The local launcher remains a development tool;
+local results must not be mixed into future official rankings.
+
 ## Quick start
 
 Prerequisites: Python 3.13, `dolt` and `doltgres` on `PATH`, and `psql` from libpq.
