@@ -167,6 +167,12 @@ class ResultFiles(unittest.TestCase):
         self.assertEqual([(e["load_time"], e["source"]) for e in entries], [(9.0, "dolt/results/20260930/box.json")])
         self.assertEqual(excluded, [])
 
+    def test_previous_suite_is_excluded(self) -> None:
+        self.write(self.payload(suite="local-1", suite_sha256="0" * 64))
+        entries, excluded = build(self.board)
+        self.assertEqual(entries, [])
+        self.assertIn("suite differs", excluded[0]["reason"])
+
     def test_a_mock_stands_in_only_until_a_real_file_exists(self) -> None:
         mock = {"basis": "Mock, not a measurement.", "date": "2026-09-30", "machine": "box", "region": "r",
                 "rtt_ms": 20.0, "client_location": "US East", "provision_time": 5.0, "load_time": 9.0,

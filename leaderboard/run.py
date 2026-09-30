@@ -12,7 +12,7 @@ failure publishes nothing.
 Hosted systems read their API keys from the environment, set at launch from
 Bitwarden. Everything a run creates is named after its database, bb_<run id>,
 and cleanup deletes by that name, so even a killed run leaves nothing behind
-once the next run of that system starts.
+once the next run of that system starts with the same target configuration.
 """
 
 from __future__ import annotations
@@ -20,12 +20,17 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import fcntl
+import hashlib
 import json
+import math
 import os
 import platform
+import random
 import re
 import secrets
+import select
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
@@ -37,7 +42,7 @@ import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
 import dblib.result_collector as rc
-from dblib import dolt_mysql
+from dblib import dolt as dolt_pg, dolt_mysql, neon as neon_api, xata as xata_api
 from dblib.dolt import DOLT_DATA_DIR, DoltToolSuite, commit_dolt_schema
 from dblib.neon import NeonToolSuite
 from dblib.tiger import TigerToolSuite
@@ -70,10 +75,47 @@ POINT_OPS = {"read": ReadOperation, "insert": InsertOperation, "update": UpdateO
 RANGE_OPS = {"range_read": RangeReadOperation, "range_update": RangeUpdateOperation}
 LOAD_TIMEOUT = 900  # seconds for psql to load the dump
 VENDOR_TIMEOUT = 1200  # seconds for a hosted service to become ready, or to disappear after a delete
+STOP_TIMEOUT = 60
 
 
 class RunError(Exception):
     """The run cannot produce a valid result."""
+
+
+class DeadlineExpired(BaseException):
+    """Abort the run, bypassing handlers that turn operation failures into null cells."""
+
+
+def wait_for_postgres(conn) -> None:
+    """Use interruptible Python waits, not blocking libpq calls; propagate Ctrl-C."""
+    while (state := conn.poll()) != psycopg2.extensions.POLL_OK:
+        if state == psycopg2.extensions.POLL_READ:
+            select.select([conn.fileno()], [], [])
+        elif state == psycopg2.extensions.POLL_WRITE:
+            select.select([], [conn.fileno()], [])
+        else:
+            raise psycopg2.OperationalError(f"unexpected PostgreSQL poll state: {state}")
+
+
+@contextmanager
+def bounded(seconds: float, label: str):
+    """Bound socket, SQL, and subprocess waits on this Unix-only, single-threaded runner."""
+    def expired(*_):
+        raise DeadlineExpired(f"{label} passed its {seconds:g} s deadline")
+
+    previous_handler = signal.signal(signal.SIGALRM, expired)
+    previous_callback = psycopg2.extensions.get_wait_callback()
+    psycopg2.extensions.set_wait_callback(wait_for_postgres)
+    # Repeat during stack unwinding so a row's finally/delete cannot stall the abort.
+    signal.setitimer(signal.ITIMER_REAL, seconds, 1)
+    try:
+        yield
+    except DeadlineExpired as e:
+        raise RunError(str(e)) from None
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        psycopg2.extensions.set_wait_callback(previous_callback)
 
 
 class Doltgres:
@@ -83,6 +125,10 @@ class Doltgres:
     needs_psql = True
     version_sql = "SELECT dolt_version()"
     data_dir = Path(DOLT_DATA_DIR).expanduser()
+
+    def scope(self) -> dict:
+        return {"host": dolt_pg.DOLT_HOST, "port": dolt_pg.DOLT_PORT, "user": dolt_pg.DOLT_USER,
+                "data_dir": str(self.data_dir.resolve())}
 
     def _admin(self) -> psycopg2.extensions.connection:
         conn = psycopg2.connect(DoltToolSuite.get_default_connection_uri())
@@ -112,6 +158,10 @@ class Dolt:
     needs_psql = False
     version_sql = "SELECT dolt_version()"
     data_dir = Path(dolt_mysql.DOLT_MYSQL_DATA_DIR)
+
+    def scope(self) -> dict:
+        return {"host": dolt_mysql.DOLT_MYSQL_HOST, "port": dolt_mysql.DOLT_MYSQL_PORT,
+                "user": dolt_mysql.DOLT_MYSQL_USER, "data_dir": str(self.data_dir.resolve())}
 
     def provision(self, db: str) -> BackendInfo:
         with closing(dolt_mysql.connect()) as conn, conn.cursor() as cur:
@@ -155,6 +205,11 @@ class Neon:
     # What the adapter requests: dblib/neon.py create_neon_project and _create_branch_impl.
     service = {"region": region, "pg_version": 17, "endpoint_type": "read_write"}
 
+    def scope(self) -> dict:
+        # A rotated key requires explicit recovery, never a search in an unknown account.
+        return {"api": neon_api.NEON_API_BASE_URL,
+                "credential_sha256": hashlib.sha256(neon_api.API_KEY.encode()).hexdigest()}
+
     def preflight(self) -> None:
         NeonToolSuite._request("GET", "projects", params={"limit": 1})
 
@@ -193,6 +248,9 @@ class Tiger:
     @staticmethod
     def _project() -> str:
         return os.environ["TIGER_PROJECT_ID"]  # checked with the other keys before the run
+
+    def scope(self) -> dict:
+        return {"project_id": self._project()}
 
     def preflight(self) -> None:
         TigerToolSuite.list_tiger_services(self._project())
@@ -235,6 +293,10 @@ class Xata:
     service = {"region": region, "instance_type": "xata.medium", "image": "postgres:18.0", "replicas": 0,
                "scale_to_zero_minutes": 30}
 
+    def scope(self) -> dict:
+        # The adapter captures its organization at import; record its actual request target.
+        return {"api": xata_api.XATA_API_BASE_URL}
+
     def preflight(self) -> None:
         XataToolSuite._request("GET", "projects")
 
@@ -268,7 +330,8 @@ def lifecycle(sysdir: Path, step: str) -> bool:
     env = {**os.environ, "PYTHON": sys.executable}
     # check is polled while the server starts, so its failures stay quiet.
     out = subprocess.DEVNULL if step == "check" else None
-    return subprocess.run([str(script)], env=env, stdout=out, stderr=out).returncode == 0
+    return subprocess.run([str(script)], env=env, stdout=out, stderr=out,
+                          timeout=STOP_TIMEOUT if step == "stop" else LOAD_TIMEOUT).returncode == 0
 
 
 def start_server(sysdir: Path) -> None:
@@ -294,20 +357,25 @@ def exclusive(system: str):
 
 
 def journal(system: str) -> Path:
-    """Names what a run creates, from before its creation until its deletion."""
+    """Privately names a run's resources and target, until deletion succeeds."""
     return RUNS / f"{system}.journal.json"
 
 
 def clean_up(system: str, server: System) -> Exception | None:
     """Delete everything named after the database the journal names, then delete
     the journal. The journal stays if the delete fails. Reports instead of raising."""
-    if not journal(system).exists():
-        return None
     try:  # an unreadable journal fails the run too, and stays for a person to inspect
-        server.delete(json.loads(journal(system).read_text())["name"])
+        if not journal(system).exists():
+            return None
+        record = json.loads(journal(system).read_text())
+        if record.get("scope") != server.scope():
+            raise RunError("recovery journal has a different or missing target scope; restore its target before retrying")
+        if not re.fullmatch(r"bb_[0-9a-f]{8}", record["name"]):
+            raise RunError("recovery journal has an invalid resource name")
+        server.delete(record["name"])
+        journal(system).unlink()
     except Exception as e:  # the caller turns this into the run's error record
         return e
-    journal(system).unlink()
     return None
 
 
@@ -430,19 +498,38 @@ def timed_connects(ctx: WorkerContext, chain: list[tuple[str, str]], batch: int)
 def data_row(ctx: WorkerContext, operation, name: str, tip_id: str, batch: int, tries: int) -> list[float | None]:
     """All tries of one data operation, on one fresh branch off the tip."""
     ctx.db_tools.create_branch(name, parent_id=tip_id, timed=False)
-    ctx.db_tools.connect_branch(name, timed=False)
-    ctx.clear_pk_cache()
-    cells = []
-    for _ in range(tries):
-        ctx.result_collector.reset()
-        try:
-            for _ in range(batch):
-                operation.execute(ctx)
-            cells.append(batch_total(ctx.result_collector, batch))
-        except Exception:
-            cells.append(None)
-    drop_branch(ctx, name)
-    return cells
+    try:
+        ctx.db_tools.connect_branch(name, timed=False)
+        ctx.clear_pk_cache()
+        insert_keys = None
+        if isinstance(operation, InsertOperation):
+            columns = ctx.get_pk_columns(operation.table_name)
+            if len(columns) != 1:
+                raise RunError("the INSERT suite needs one integer primary key")
+            maximum = ctx.db_tools.execute_sql(f"SELECT max({columns[0]}) FROM {operation.table_name}")[0][0]
+            maximum = 0 if maximum is None else maximum
+            if type(maximum) is not int:
+                raise RunError("the INSERT suite needs one integer primary key")
+            # Reserve all tries' keys before any write, so failures cannot change later inputs.
+            insert_keys = random.Random(f"{ctx.seed}:{name}:keys").sample(range(maximum + 1, 2**31), batch * tries)
+        cells = []
+        for trial in range(tries):
+            ctx.rnd.seed(f"{ctx.seed}:{name}:{trial}")
+            ctx._table_datagen = None  # Faker owns a separately seeded RNG too.
+            ctx._modified_keys.clear()
+            if insert_keys is not None:
+                keys = insert_keys[trial * batch:(trial + 1) * batch]
+                operation = InsertOperation(operation.table_name, primary_keys=((key,) for key in keys))
+            ctx.result_collector.reset()
+            try:
+                for _ in range(batch):
+                    operation.execute(ctx)
+                cells.append(batch_total(ctx.result_collector, batch))
+            except Exception:
+                cells.append(None)
+        return cells
+    finally:
+        drop_branch(ctx, name)
 
 
 def run_row(ctx: WorkerContext, row: dict, chain: list, suite: dict, max_batch: int | None) -> list[float | None]:
@@ -512,68 +599,110 @@ def publish(out: Path, system: str, machine: str, day: dt.date, payload: dict) -
     return path
 
 
+def source_snapshot(dump: Path) -> dict:
+    """Capture effective inputs, including edits to an already-dirty working tree."""
+    def git(*args: str) -> str:
+        return subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True,
+                              check=True, timeout=30).stdout
+
+    files = git("ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", *CODE_PATHS)
+    paths = {ROOT / name for name in files.split("\0") if name} | {dump}
+    return {"commit": git("rev-parse", "HEAD").strip(),
+            "status": git("status", "--porcelain", "--", *CODE_PATHS),
+            "files": {str(p): sha256(p) if p.is_file() else None for p in paths}}
+
+
 def run(system: str, machine: str, out: Path, max_batch: int | None, allow_dirty: bool, deadline_min: float,
         client_location: str | None) -> Path:
     if not MACHINE_RE.fullmatch(machine or ""):
         raise RunError(f"machine label {machine!r} must match {MACHINE_RE.pattern}")
+    if not math.isfinite(deadline_min) or deadline_min <= 0:
+        raise RunError("--deadline-min must be finite and greater than zero")
     server, sysdir = SYSTEMS[system], BOARD / system
-    meta = json.loads((sysdir / "system.json").read_text())
+    meta_path = sysdir / "system.json"
+    meta_bytes = meta_path.read_bytes()
+    meta = json.loads(meta_bytes)
     hosted = meta["hosted"] == "yes"
     if hosted and not (client_location or "").strip():
         raise RunError("a hosted system needs --client-location, where this machine runs, such as 'US East'")
     suite_path = BOARD / "suite.json"
-    suite = json.loads(suite_path.read_text())
+    suite_bytes = suite_path.read_bytes()
+    suite = json.loads(suite_bytes)
     dump = ROOT / suite["dataset"]["path"]
-    if sha256(dump) != suite["dataset"]["sha256"]:
+    snapshot = source_snapshot(dump)
+    digests = snapshot["files"]
+    if (digests[str(suite_path)] != hashlib.sha256(suite_bytes).hexdigest()
+            or digests[str(meta_path)] != hashlib.sha256(meta_bytes).hexdigest()):
+        raise RunError("suite or system metadata changed during preflight")
+    if digests[str(dump)] != suite["dataset"]["sha256"]:
         raise RunError(f"{dump} does not match the digest in suite.json")
     if server.needs_psql and shutil.which("psql") is None:
         raise RunError("psql is not on PATH")
-    status = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--", *CODE_PATHS],
-                            capture_output=True, text=True, check=True)
-    dirty = bool(status.stdout.strip())
+    dirty = bool(snapshot["status"].strip())
     if dirty and not allow_dirty:
         raise RunError("the working tree has uncommitted changes")
     if hosted and (missing := [k for k in server.keys if not os.environ.get(k)]):
         raise RunError(f"{', '.join(missing)} not set; load them from Bitwarden when launching the run")
     if hosted:
         try:  # the keys work and the account reaches its project, before anything is created
-            server.preflight()
+            with bounded(VENDOR_TIMEOUT, "preflight"):
+                server.preflight()
         except Exception as e:
             raise RunError(f"{system} preflight failed: {scrub(str(e))}") from e
     os.environ.setdefault("PGCONNECT_TIMEOUT", "10")
     if hosted:  # bound every statement, since a stalled network call would block the run forever
-        os.environ.setdefault("PGOPTIONS", "-c statement_timeout=120s")
+        os.environ["PGOPTIONS"] = os.environ.get("PGOPTIONS", "") + " -c statement_timeout=120s"
 
     RUNS.mkdir(parents=True, exist_ok=True)
     run_id = secrets.token_hex(4)
     db, started = f"bb_{run_id}", dt.datetime.now(dt.UTC)
     failure: Exception | None = None
     try:
-        start_server(sysdir)
-        if leftover := clean_up(system, server):
-            raise RunError(f"cannot delete what an earlier run left behind: {leftover}")
-        # Journaled before the create, so a kill at any later point leaves a record.
-        journal(system).write_text(json.dumps({"run_id": run_id, "name": db}))
-        t0 = time.perf_counter()
-        info = server.provision(db)
-        provision_time = time.perf_counter() - t0
-        t0 = time.perf_counter()
-        server.load(info, db, dump)
-        load_time = time.perf_counter() - t0
-        version, rtt_ms, cells = measure(server, info, db, suite, max_batch, time.monotonic() + deadline_min * 60)
+        deadline = time.monotonic() + deadline_min * 60
+        with bounded(deadline_min * 60, "run"):
+            start_server(sysdir)
+            if leftover := clean_up(system, server):
+                raise RunError(f"cannot delete what an earlier run left behind: {leftover}")
+            # Private, scoped, and durable before any create; a killed run remains recoverable.
+            with open(journal(system), "x", opener=lambda path, flags: os.open(path, flags, 0o600)) as record:
+                json.dump({"run_id": run_id, "name": db, "scope": server.scope()}, record)
+                record.flush()
+                os.fsync(record.fileno())
+            t0 = time.perf_counter()
+            info = server.provision(db)
+            provision_time = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            server.load(info, db, dump)
+            load_time = time.perf_counter() - t0
+            version, rtt_ms, cells = measure(server, info, db, suite, max_batch, deadline)
     except Exception as e:  # recorded below as the run's error, after cleanup
         failure = e
     finally:
-        cleanup_failure = clean_up(system, server)
-        if not lifecycle(sysdir, "stop"):
-            cleanup_failure = cleanup_failure or RunError(f"{system}: the server did not stop")
-        failure = failure or cleanup_failure
+        try:
+            with bounded(VENDOR_TIMEOUT, "cleanup"):
+                cleanup_failure = clean_up(system, server)
+                failure = failure or cleanup_failure
+        except Exception as e:
+            failure = failure or e
+        finally:
+            try:
+                with bounded(STOP_TIMEOUT, "server stop"):
+                    if not lifecycle(sysdir, "stop"):
+                        raise RunError(f"{system}: the server did not stop")
+            except Exception as e:
+                failure = failure or e
+
+    if failure is None:
+        try:
+            if source_snapshot(dump) != snapshot:
+                raise RunError("source, dataset, or Git HEAD changed during the run; results were not published")
+        except Exception as e:
+            failure = e
 
     if failure:
         detail = (scrub(str(failure)).splitlines() or [""])[0][:300]
         publish(out, system, machine, started.date(), {"error": f"{type(failure).__name__}: {detail}"})
         raise RunError(f"{system} failed: {detail}") from failure
-    commit = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
     payload = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
@@ -586,13 +715,13 @@ def run(system: str, machine: str, out: Path, max_batch: int | None, allow_dirty
         "tags": meta["tags"],
         "version": version,
         "suite": suite["suite"],
-        "suite_sha256": sha256(suite_path),
+        "suite_sha256": digests[str(suite_path)],
         "seed": suite["seed"],
-        "commit": commit.stdout.strip(),
+        "commit": snapshot["commit"],
         "dirty": dirty,
         "dataset_sha256": suite["dataset"]["sha256"],
         "python": platform.python_version(),
-        "lock_sha256": sha256(ROOT / "requirements.lock"),
+        "lock_sha256": digests[str(ROOT / "requirements.lock")],
         "provision_time": round(provision_time, 6),
         "load_time": round(load_time, 6),
     }
@@ -614,7 +743,8 @@ def main() -> int:
     parser.add_argument("--out", type=Path, default=BOARD, help="directory that receives <system>/results/")
     parser.add_argument("--max-batch", type=int, help="cap every batch for a short run; the validator rejects it")
     parser.add_argument("--allow-dirty", action="store_true", help="allow uncommitted changes; the validator rejects it")
-    parser.add_argument("--deadline-min", type=float, default=120.0, help="stop the run after this many minutes")
+    parser.add_argument("--deadline-min", type=float, default=120.0,
+                        help="bound startup through measurement; cleanup has a separate deadline")
     args = parser.parse_args()
     try:
         with exclusive(args.system):

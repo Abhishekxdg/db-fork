@@ -5,6 +5,7 @@ This module implements the standard database CRUD operations including
 point operations (single row) and range operations (multiple rows).
 """
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import psycopg
@@ -92,8 +93,16 @@ class InsertOperation(Operation):
     if there are primary key collisions.
     """
 
-    def __init__(self, table_name: str):
+    def __init__(self, table_name: str, primary_keys: Iterable[tuple] | None = None):
         self.table_name = table_name
+        # A benchmark can supply collision-free keys; those inserts never retry.
+        self.primary_keys = iter(primary_keys) if primary_keys is not None else None
+
+    def _next_row(self, context: 'WorkerContext', pk_columns: list[str]) -> dict:
+        row = context.generate_row(self.table_name)
+        if self.primary_keys is not None:
+            row.update(zip(pk_columns, next(self.primary_keys), strict=True))
+        return row
 
     def _generate_insert_data(self, context: 'WorkerContext'):
         """Shared logic: generate insert SQL and row data.
@@ -121,7 +130,7 @@ class InsertOperation(Operation):
         # Try to insert with retries for PK collisions
         inserted = False
         for attempt in range(5):
-            row_data = context.generate_row(self.table_name)
+            row_data = self._next_row(context, pk_columns)
             pk_tuple = tuple(row_data[pk] for pk in pk_columns)
 
             try:
@@ -135,7 +144,7 @@ class InsertOperation(Operation):
                 break
             except SqlError as e:
                 # Only a key collision is worth retrying with a new row.
-                if attempt == 4 or not is_duplicate_key(e.__cause__):
+                if self.primary_keys is not None or attempt == 4 or not is_duplicate_key(e.__cause__):
                     raise
 
         if not inserted:
@@ -148,7 +157,7 @@ class InsertOperation(Operation):
         # Try to insert with retries for PK collisions
         inserted = False
         for attempt in range(5):
-            row_data = context.generate_row(self.table_name)
+            row_data = self._next_row(context, pk_columns)
             pk_tuple = tuple(row_data[pk] for pk in pk_columns)
 
             try:
@@ -163,7 +172,7 @@ class InsertOperation(Operation):
                 break
             except SqlError as e:
                 # Only a key collision is worth retrying with a new row.
-                if attempt == 4 or not is_duplicate_key(e.__cause__):
+                if self.primary_keys is not None or attempt == 4 or not is_duplicate_key(e.__cause__):
                     raise
 
         if not inserted:

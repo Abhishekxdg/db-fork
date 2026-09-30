@@ -77,18 +77,21 @@ def load_sql_file(
             env=env,
         )
 
-        # Stream stdout in real-time
-        if verbose:
-            for line in process.stdout:
-                print(line, end="")
-
-        # Wait for completion and get return code
         try:
+            # Stream stdout in real-time
+            if verbose:
+                for line in process.stdout:
+                    print(line, end="")
+
+            # Wait for completion and get return code
             _, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
+        except BaseException as error:
+            # A runner deadline or Ctrl-C must not leave psql loading during cleanup.
             process.kill()
             process.communicate()
-            raise RuntimeError(f"psql did not finish within {timeout} s")
+            if isinstance(error, subprocess.TimeoutExpired):
+                raise RuntimeError(f"psql did not finish within {timeout} s") from error
+            raise
 
         if process.returncode != 0:
             print(f"✗ Error executing SQL file: {stderr}", file=sys.stderr)
