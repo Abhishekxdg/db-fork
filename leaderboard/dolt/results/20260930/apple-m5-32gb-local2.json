@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "run_id": "50cccb97",
+  "system": "Doltgres",
+  "date": "2026-09-30",
+  "machine": "apple-m5-32gb-local2",
+  "proprietary": "no",
+  "hosted": "no",
+  "tuned": "no",
+  "tags": [
+    "Go",
+    "Postgres protocol",
+    "Git-style branches"
+  ],
+  "version": "0.54.10",
+  "suite": "local-2",
+  "suite_sha256": "0ec69fc69e2c371e59cd6dd24ade31e7b1cc32645c0b4d14018566a5a9cc392c",
+  "seed": 20260929,
+  "commit": "e4390895deaa53fa29e1c5bf9bd7929b72f0050f",
+  "dirty": false,
+  "dataset_sha256": "3a1b5d4f01a98a27cc2241b4267e51a17f31a4469e0e3ed38c7d8df4abe1826e",
+  "python": "3.13.14",
+  "lock_sha256": "7ae09064a562613f4cd3ab164917169c08f062b0c26d419de7ea8b4bc5b0cfec",
+  "provision_time": 0.083593,
+  "load_time": 3.439954,
+  "result": [
+    [0.017706, 0.022784, 0.017643],
+    [0.016937, 0.017954, 0.016975],
+    [0.026411, 0.021412, 0.019368],
+    [0.157511, 0.156764, 0.160621],
+    [0.171928, 0.171157, 0.170619],
+    [4.742519, 4.813684, 5.20844],
+    [5.368889, 5.348593, 5.338807],
+    [1.209488, 1.308176, 1.189742]
+  ]
+}

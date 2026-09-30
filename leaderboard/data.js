@@ -1,5 +1,5 @@
 const suite = {
- "suite": "local-2",
+ "suite": "local-3",
  "seed": 20260929,
  "tries": 3,
  "table": "item",
@@ -249,8 +249,20 @@ const data = [
 const excluded = [
  {
   "system": "dolt",
+  "machine": "apple-m5-32gb-local2",
+  "source": "dolt/results/20260930/apple-m5-32gb-local2.json",
+  "reason": "invalid: suite differs from the current suite.json; suite_sha256 differs from the current suite.json"
+ },
+ {
+  "system": "dolt",
   "machine": "apple-m5-32gb",
   "source": "dolt/results/20260930/apple-m5-32gb.json",
+  "reason": "invalid: suite differs from the current suite.json; suite_sha256 differs from the current suite.json"
+ },
+ {
+  "system": "dolt_mysql",
+  "machine": "apple-m5-32gb-local2",
+  "source": "dolt_mysql/results/20260930/apple-m5-32gb-local2.json",
   "reason": "invalid: suite differs from the current suite.json; suite_sha256 differs from the current suite.json"
  },
  {
