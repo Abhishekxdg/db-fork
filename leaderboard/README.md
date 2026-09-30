@@ -79,7 +79,7 @@ Prerequisites: Python 3.13, `dolt` and `doltgres` on `PATH`, and `psql` from lib
 ```bash
 # Once, from the repository root
 python3.13 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.lock && pip install -e . --no-deps
+pip install -r leaderboard/requirements.lock && pip install -e . --no-deps
 python build_protos.py
 export PATH="$(brew --prefix libpq)/bin:$PATH"   # libpq is keg-only
 
@@ -163,7 +163,7 @@ tables** using a CH-benCHmark-style retail schema. Only `item`, with **1,000
 initial rows**, is targeted by timed reads and writes; all tables are loaded and
 included in branches. This is a small branching and CRUD microbenchmark, **not
 the full CH-benCHmark, TPC-C, or TPC-H workload suite**. The dataset SHA-256 pins
-the SQL file; the workload seed fixes generated operation inputs separately.
+the SQL file. The workload seed fixes which keys each try targets, not generated values.
 
 The suite in `suite.json` runs 8 rows, 3 tries each, on the `item` table:
 
@@ -184,10 +184,12 @@ The suite in `suite.json` runs 8 rows, 3 tries each, on the `item` table:
 - **Branches:** every row starts from the tip of a chain of 4 branches. Each data
   row runs on its own new branch. After every run, the runner checks that the tip
   still has the dump's row counts.
-- **Determinism:** each row and try has its own seeded random stream, including
-  generated values. A failed try cannot change later tries' statements or inputs.
-  INSERT reserves distinct integer keys above the loaded maximum for all tries;
-  unexpected collisions fail the try instead of being retried outside its timing.
+- **Determinism:** each row and try has its own seeded random stream. It fixes the
+  keys that reads, updates, and ranges target, provided the server lists keys in
+  the same order every time, and a failed try cannot change later tries' keys.
+  Generated values come from main's unseeded row generator, so they differ between
+  runs. INSERT keys are random too: a collision is retried, up to 5 attempts in
+  all, and a failed attempt is not timed.
 - **Load:** the time to load the dump. Provisioning is recorded but not ranked.
 - **Hosted results** include the network round trip from the client. Each one
   records its region, where the client ran, and a round-trip baseline: the median
@@ -247,21 +249,22 @@ and INSERT keys. New measurements require a committed tree and a full rerun.
 
 ## Adding a system
 
-1. **Adapter.** Subclass `DBToolSuite` in `dblib/` with branch create, connect,
-   current branch, list, and delete. `dblib/dolt.py` is the smallest example. Add
-   the backend to the `Backend` enum in `microbench/task2.proto`, run
-   `python build_protos.py`, and construct the adapter in `WorkerContext.__enter__`
-   in `microbench/runner2.py`.
+1. **Adapter.** The leaderboard uses main's shared code as it is. The backend must
+   already exist in main's `microbench/task2.proto`, and main's
+   `WorkerContext.__enter__` in `microbench/runner2.py` must build its adapter.
+   An adapter main lacks, or a fix one needs, goes to main first.
 2. **Identity.** Create `leaderboard/<system>/system.json` with `system`,
    `proprietary`, `hosted`, `tuned`, and `tags`.
 3. **Local server scripts.** Add executable `start`, `check`, and `stop` scripts, and
    optionally `install`, as in `leaderboard/dolt/`. `start` must send the server's
    output to a log file, and `stop` must stop only the process `start` launched.
-4. **Runner.** Add a class to `leaderboard/run.py` with `backend`, `needs_psql`,
-   `version_sql`, `scope`, `provision`, `load`, and `delete`, and register it in `SYSTEMS`.
+4. **Connector.** Add `leaderboard/<system>/connector.py` defining `CONNECTOR`, a
+   `Connector` from `leaderboard/connector.py` with `backend`, `needs_psql`,
+   `version_sql`, `scope`, `provision`, `load`, and `delete`. The runner finds it
+   by its folder, so no other file changes.
    Everything it creates must be named after the run's database, so `delete` can
    find it by name. `scope` must identify the deletion target without secrets;
-   cleanup refuses a journal from a different scope. A hosted class also sets `keys`, `region`, `service`, and
+   cleanup refuses a journal from a different scope. A hosted connector also sets `keys`, `region`, `service`, and
    `preflight`, and every `service` key must be in the validator's allowlist.
 5. **Trial.** Run it with `--max-batch 5 --allow-dirty --out /tmp/lb`, and check that
    every cell is filled and nothing is left behind.

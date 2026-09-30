@@ -41,7 +41,7 @@
                     <details class="wizard-requirements"><summary>Tools &amp; credentials</summary><ul id="database-requirements" class="database-requirements"></ul><div id="credential-requirements" hidden><p>Set these variables in Terminal, or enter them when prompted.</p><a class="text-link" href="README.md#hosted-systems">Credential setup ↗</a></div></details>
                     <details class="wizard-setup"><summary>First run? Set up the runner</summary><p>Use Python 3.13 and the database tools listed above.</p><pre><code>python3.13 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.lock
+pip install -r leaderboard/requirements.lock
 pip install -e . --no-deps
 python build_protos.py</code></pre><p>On macOS, libpq’s tools may need adding to your PATH. <a class="text-link" href="README.md#quick-start">Full setup instructions ↗</a></p></details>
                 </section>
