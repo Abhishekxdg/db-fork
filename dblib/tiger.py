@@ -147,7 +147,7 @@ class TigerToolSuite(DBToolSuite):
         if not r.ok:
             raise Exception(f"Tiger API error {r.status_code}: {r.text}")
 
-        if r.status_code == 204:
+        if r.status_code == 204 or not r.content:
             return {}
 
         return r.json()
