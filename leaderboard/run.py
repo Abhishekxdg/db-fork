@@ -62,7 +62,7 @@ ROOT = BOARD.parent
 RUNS = BOARD / ".runs"
 # What a run imports or reads. A change here, tracked or not, makes the run dirty.
 # Results and data.js are outputs, so a new, uncommitted result never does.
-CODE_PATHS = ["dblib", "microbench", "util", "leaderboard", "db_setup", "pyproject.toml", "requirements.lock",
+CODE_PATHS = ["dblib", "microbench", "util", "leaderboard", "db_setup", "pyproject.toml",
               ":!leaderboard/*/results/*", ":!leaderboard/data.js"]
 POINT_OPS = {"read": ReadOperation, "insert": InsertOperation, "update": UpdateOperation}
 RANGE_OPS = {"range_read": RangeReadOperation, "range_update": RangeUpdateOperation}
@@ -496,7 +496,7 @@ def run(system: str, machine: str, out: Path, max_batch: int | None, allow_dirty
         "dirty": dirty,
         "dataset_sha256": suite["dataset"]["sha256"],
         "python": platform.python_version(),
-        "lock_sha256": digests[str(ROOT / "requirements.lock")],
+        "lock_sha256": digests[str(BOARD / "requirements.lock")],
         "provision_time": round(provision_time, 6),
         "load_time": round(load_time, 6),
     }

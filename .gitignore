@@ -218,5 +218,3 @@ db_setup/BIRD-Critic-sol
 
 # MacOS specific files
 *.DS_Store
-# Leaderboard runtime files: server logs, pid files, locks, and run journals
-leaderboard/.runs/

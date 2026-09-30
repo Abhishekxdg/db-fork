@@ -70,8 +70,8 @@ class RunLifecycle(unittest.TestCase):
         self.suite = self.board / "suite.json"
         self.suite.write_text(json.dumps({"suite": "test", "seed": 1,
                                           "dataset": {"path": "dump.sql", "sha256": runner.sha256(self.dump)}}))
-        (self.root / "requirements.lock").write_text("fixture\n")
-        (self.root / ".gitignore").write_text("leaderboard/.runs/\n")
+        (self.board / "requirements.lock").write_text("fixture\n")
+        (self.board / ".gitignore").write_text(".runs/\n")
         self.git("init", "-q")
         self.git("add", ".")
         self.git("commit", "-qm", "fixture")
@@ -118,7 +118,7 @@ class RunLifecycle(unittest.TestCase):
         self.assertFalse(runner.journal("dolt").exists())
 
     def test_changes_to_dirty_inputs_or_head_cannot_publish_success(self):
-        for target in (self.suite, self.meta, self.dump, self.root / "requirements.lock"):
+        for target in (self.suite, self.meta, self.dump, self.board / "requirements.lock"):
             with self.subTest(target=target.name):
                 original = target.read_text()
                 target.write_text(original + "\n")
