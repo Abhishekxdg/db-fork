@@ -28,10 +28,6 @@ def _require_connection(func):
     return wrapper
 
 
-class SqlError(Exception):
-    """A query failed. The driver's own exception is attached as __cause__."""
-
-
 class DBToolSuite(ABC):
     """
     An API for interacting with Postgres via a shared connection. The connection
@@ -147,7 +143,7 @@ class DBToolSuite(ABC):
             branch_name: Name of the branch to delete.
             branch_id: Backend-specific ID of the branch to delete.
         """
-        raise NotImplementedError(f"{type(self).__name__} cannot delete branches")
+        pass
 
     ######################################################################
     # Protected async methods (async variants of above)
@@ -395,7 +391,7 @@ class DBToolSuite(ABC):
             ):
                 self._delete_branch_impl(branch_name, branch_id)
         except Exception as e:
-            raise Exception(f"Error deleting branch '{branch_name}': {e}") from e
+            raise Exception(f"Error deleting branch '{branch_name}': {e}")
         if timed:
             self.result_collector.record_num_keys_touched(0)
             self.result_collector.flush_record()
@@ -427,7 +423,7 @@ class DBToolSuite(ABC):
                         res = cur.fetchall()
                 # print(f"Executed query: {query} with vars: {vars}")
         except Exception as e:
-            raise SqlError(f"Error executing sql query: {query}; {vars}; {e}") from e
+            raise Exception(f"Error executing sql query: {query}; {vars}; {e}")
         if timed:
             # Record query with args for debugging/analysis
             query_with_args = f"{query} -- args: {vars}" if vars else query
@@ -491,7 +487,7 @@ class DBToolSuite(ABC):
             ):
                 await self._delete_branch_impl_async(branch_name, branch_id)
         except Exception as e:
-            raise Exception(f"Error deleting branch '{branch_name}': {e}") from e
+            raise Exception(f"Error deleting branch '{branch_name}': {e}")
         if timed:
             self.result_collector.record_num_keys_touched(0)
             self.result_collector.flush_record()
@@ -520,7 +516,7 @@ class DBToolSuite(ABC):
                     if cur.description is not None:
                         res = await cur.fetchall()
         except Exception as e:
-            raise SqlError(f"Error executing async sql query: {query}; {vars}; {e}") from e
+            raise Exception(f"Error executing async sql query: {query}; {vars}; {e}")
         if timed:
             # Record query with args for debugging/analysis
             query_with_args = f"{query} -- args: {vars}" if vars else query

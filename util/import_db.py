@@ -1,27 +1,14 @@
 import argparse
-import os
 import subprocess
 import sys
 from pathlib import Path
 from typing import Union
-from urllib.parse import unquote, urlsplit, urlunsplit
-
-
-def _split_password(uri: str) -> tuple[str, str | None]:
-    """The URI without its password, and the password, so psql never sees it on argv."""
-    parts = urlsplit(uri)
-    userinfo, _, host = parts.netloc.rpartition("@")
-    user, colon, password = userinfo.partition(":")
-    if not colon:
-        return uri, None
-    return urlunsplit(parts._replace(netloc=f"{user}@{host}")), unquote(password)
 
 
 def load_sql_file(
     connection_uri: str,
     sql_file_path: Union[str, Path],
     verbose: bool = False,
-    timeout: float | None = None,
 ) -> None:
     """
     Loads and executes a SQL file into a PostgreSQL database using psql.
@@ -33,7 +20,6 @@ def load_sql_file(
         connection_uri: PostgreSQL connection URI string
         sql_file_path: Path to the .sql file to execute
         verbose: If True, prints progress
-        timeout: Seconds to wait for psql before killing it; None waits forever
 
     Raises:
         FileNotFoundError: If the SQL file doesn't exist
@@ -47,14 +33,11 @@ def load_sql_file(
     if verbose:
         print(f"Loading SQL file via psql: {sql_file_path}")
 
-    # Build psql command with connection URI. The password goes through the
-    # environment, because a command line is visible to every local user.
+    # Build psql command with connection URI
     # Use -a (echo all) or -e (echo queries) for progress when verbose
-    uri, password = _split_password(connection_uri)
-    env = {**os.environ, "PGPASSWORD": password} if password is not None else None
     cmd = [
         "psql",
-        uri,
+        connection_uri,
         "-f",
         str(sql_file_path),
         "-v",
@@ -74,26 +57,18 @@ def load_sql_file(
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,  # Line buffered
-            env=env,
         )
 
-        try:
-            # Stream stdout in real-time
-            if verbose:
-                for line in process.stdout:
-                    print(line, end="")
+        # Stream stdout in real-time
+        if verbose:
+            for line in process.stdout:
+                print(line, end="")
 
-            # Wait for completion and get return code
-            _, stderr = process.communicate(timeout=timeout)
-        except BaseException as error:
-            # A runner deadline or Ctrl-C must not leave psql loading during cleanup.
-            process.kill()
-            process.communicate()
-            if isinstance(error, subprocess.TimeoutExpired):
-                raise RuntimeError(f"psql did not finish within {timeout} s") from error
-            raise
+        # Wait for completion and get return code
+        process.wait()
 
         if process.returncode != 0:
+            stderr = process.stderr.read()
             print(f"✗ Error executing SQL file: {stderr}", file=sys.stderr)
             raise RuntimeError(f"psql failed: {stderr}")
 

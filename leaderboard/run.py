@@ -25,7 +25,6 @@ import json
 import math
 import os
 import platform
-import random
 import re
 import secrets
 import select
@@ -42,11 +41,8 @@ import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
 import dblib.result_collector as rc
-from dblib import dolt as dolt_pg, dolt_mysql, neon as neon_api, xata as xata_api
+from dblib import dolt as dolt_pg, dolt_mysql
 from dblib.dolt import DOLT_DATA_DIR, DoltToolSuite, commit_dolt_schema
-from dblib.neon import NeonToolSuite
-from dblib.tiger import TigerToolSuite
-from dblib.xata import XataToolSuite
 from leaderboard.validate import BOARD, MACHINE_RE, SCHEMA_VERSION, sha256
 from microbench import task2_pb2 as tp
 from microbench.operations.crud import (
@@ -73,8 +69,8 @@ CODE_PATHS = ["dblib", "microbench", "util", "leaderboard", "db_setup", "pyproje
               ":!leaderboard/*/results/*", ":!leaderboard/data.js"]
 POINT_OPS = {"read": ReadOperation, "insert": InsertOperation, "update": UpdateOperation}
 RANGE_OPS = {"range_read": RangeReadOperation, "range_update": RangeUpdateOperation}
-LOAD_TIMEOUT = 900  # seconds for psql to load the dump
-VENDOR_TIMEOUT = 1200  # seconds for a hosted service to become ready, or to disappear after a delete
+SCRIPT_TIMEOUT = 900  # seconds for an install, start, or check script
+VENDOR_TIMEOUT = 1200  # seconds for a hosted preflight, and for cleanup to delete what a run created
 STOP_TIMEOUT = 60
 
 
@@ -142,7 +138,7 @@ class Doltgres:
 
     def load(self, info: BackendInfo, db: str, dump: Path) -> None:
         uri = DoltToolSuite.get_initial_connection_uri(db)
-        load_sql_file(uri, dump, timeout=LOAD_TIMEOUT)
+        load_sql_file(uri, dump)
         commit_dolt_schema(uri)
 
     def delete(self, db: str) -> None:
@@ -178,148 +174,8 @@ class Dolt:
         shutil.rmtree(self.data_dir / ".dolt_dropped_databases" / db, ignore_errors=True)
 
 
-def create_database(uri: str, db: str) -> None:
-    """Create db on the server that uri points at."""
-    with closing(psycopg2.connect(uri)) as conn:
-        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
-        with conn.cursor() as cur:
-            cur.execute(f"CREATE DATABASE {db}")
-
-
-def wait_until(done, what: str) -> None:
-    deadline = time.monotonic() + VENDOR_TIMEOUT
-    while not done():
-        if time.monotonic() > deadline:
-            raise RunError(f"{what} after {VENDOR_TIMEOUT} s")
-        time.sleep(1)
-
-
-class Neon:
-    """Neon: one project per run, named after the run's database."""
-
-    backend = tp.Backend.NEON
-    needs_psql = True
-    version_sql = "SHOW server_version"
-    keys = ("NEON_API_KEY_ORG",)
-    region = "aws-us-east-1"
-    # What the adapter requests: dblib/neon.py create_neon_project and _create_branch_impl.
-    service = {"region": region, "pg_version": 17, "endpoint_type": "read_write"}
-
-    def scope(self) -> dict:
-        # A rotated key requires explicit recovery, never a search in an unknown account.
-        return {"api": neon_api.NEON_API_BASE_URL,
-                "credential_sha256": hashlib.sha256(neon_api.API_KEY.encode()).hexdigest()}
-
-    def preflight(self) -> None:
-        NeonToolSuite._request("GET", "projects", params={"limit": 1})
-
-    def provision(self, db: str) -> BackendInfo:
-        created = NeonToolSuite.create_neon_project(db, region_id=self.region)
-        create_database(created["connection_uris"][0]["connection_uri"], db)
-        return BackendInfo(neon_project_id=created["project"]["id"], default_branch_id=created["branch"]["id"],
-                           default_branch_name=created["branch"]["name"])
-
-    def load(self, info: BackendInfo, db: str, dump: Path) -> None:
-        uri = NeonToolSuite._get_neon_connection_uri(info.neon_project_id, info.default_branch_id, db)
-        load_sql_file(uri, dump, timeout=LOAD_TIMEOUT)
-
-    def _projects(self, db: str) -> list[dict]:
-        found = NeonToolSuite._request("GET", "projects", params={"search": db})["projects"]
-        return [p for p in found if p["name"] == db]
-
-    def delete(self, db: str) -> None:
-        for project in self._projects(db):
-            NeonToolSuite._request("DELETE", f"projects/{project['id']}")
-        wait_until(lambda: not self._projects(db), f"Neon project {db} is still listed")
-
-
-class Tiger:
-    """Tiger Cloud: a root service per run and one forked service per branch,
-    inside the account's project. The forks are named <root>_<branch>."""
-
-    backend = tp.Backend.TIGER
-    needs_psql = True
-    version_sql = "SHOW server_version"
-    keys = ("TIGER_ACCESS_KEY", "TIGER_SECRET_KEY", "TIGER_PROJECT_ID")
-    region = "us-east-1"
-    # What the adapter requests: dblib/tiger.py create_tiger_service and _create_branch_impl.
-    service = {"region": region, "cpu_millis": 1000, "memory_gbs": 4}
-
-    @staticmethod
-    def _project() -> str:
-        return os.environ["TIGER_PROJECT_ID"]  # checked with the other keys before the run
-
-    def scope(self) -> dict:
-        return {"project_id": self._project()}
-
-    def preflight(self) -> None:
-        TigerToolSuite.list_tiger_services(self._project())
-
-    def provision(self, db: str) -> BackendInfo:
-        created = TigerToolSuite.create_tiger_service(db, project_id=self._project(), region_code=self.region,
-                                                      cpu_millis=self.service["cpu_millis"],
-                                                      memory_gbs=self.service["memory_gbs"])
-        ready = TigerToolSuite.wait_for_service(created["project_id"], created["service_id"], timeout=VENDOR_TIMEOUT)
-        password, host, port = created["initial_password"], ready["endpoint"]["host"], ready["endpoint"]["port"]
-        info = BackendInfo(default_branch_id=created["service_id"], default_branch_name=created["name"],
-                           default_uri=f"postgresql://tsdbadmin:{password}@{host}:{port}/tsdb")
-        info.tiger = {"project_id": created["project_id"], "service_id": created["service_id"],
-                      "service_name": created["name"], "password": password, "region": created["region_code"],
-                      "services": {}}
-        return info
-
-    def load(self, info: BackendInfo, db: str, dump: Path) -> None:
-        load_sql_file(info.default_uri, dump, timeout=LOAD_TIMEOUT)
-
-    def _services(self, db: str) -> list[dict]:
-        listed = TigerToolSuite.list_tiger_services(self._project())
-        return [s for s in listed if s["name"] == db or s["name"].startswith(f"{db}_")]
-
-    def delete(self, db: str) -> None:
-        for service in sorted(self._services(db), key=lambda s: s["name"] == db):  # the root last
-            TigerToolSuite.delete_tiger_service(self._project(), service["service_id"])
-        wait_until(lambda: not self._services(db), f"Tiger services named {db} are still listed")
-
-
-class Xata:
-    """Xata: one project per run, named after the run's database."""
-
-    backend = tp.Backend.XATA
-    needs_psql = True
-    version_sql = "SHOW server_version"
-    keys = ("XATA_API_KEY", "XATA_ORGANIZATION_ID")
-    region = "us-east-1"
-    # What the adapter requests: dblib/xata.py create_xata_project.
-    service = {"region": region, "instance_type": "xata.medium", "image": "postgres:18.0", "replicas": 0,
-               "scale_to_zero_minutes": 30}
-
-    def scope(self) -> dict:
-        # The adapter captures its organization at import; record its actual request target.
-        return {"api": xata_api.XATA_API_BASE_URL}
-
-    def preflight(self) -> None:
-        XataToolSuite._request("GET", "projects")
-
-    def provision(self, db: str) -> BackendInfo:
-        project_id, branch_id, branch_name, uri = XataToolSuite.create_xata_project(db, region=self.region)
-        create_database(uri, db)
-        return BackendInfo(xata_project_id=project_id, default_branch_id=branch_id, default_branch_name=branch_name)
-
-    def load(self, info: BackendInfo, db: str, dump: Path) -> None:
-        uri = XataToolSuite._get_xata_connection_uri(info.xata_project_id, info.default_branch_id, db)
-        load_sql_file(uri, dump, timeout=LOAD_TIMEOUT)
-
-    def _projects(self, db: str) -> list[dict]:
-        return [p for p in XataToolSuite._request("GET", "projects")["projects"] if p["name"] == db]
-
-    def delete(self, db: str) -> None:
-        for project in self._projects(db):
-            XataToolSuite.delete_project(project["id"])
-        wait_until(lambda: not self._projects(db), f"Xata project {db} is still listed")
-
-
-SYSTEMS = {"dolt": Doltgres(), "dolt_mysql": Dolt(), "neon": Neon(), "tiger": Tiger(), "xata": Xata()}
-System = Doltgres | Dolt | Neon | Tiger | Xata
+SYSTEMS = {"dolt": Doltgres(), "dolt_mysql": Dolt()}
+System = Doltgres | Dolt
 
 
 def lifecycle(sysdir: Path, step: str) -> bool:
@@ -331,7 +187,7 @@ def lifecycle(sysdir: Path, step: str) -> bool:
     # check is polled while the server starts, so its failures stay quiet.
     out = subprocess.DEVNULL if step == "check" else None
     return subprocess.run([str(script)], env=env, stdout=out, stderr=out,
-                          timeout=STOP_TIMEOUT if step == "stop" else LOAD_TIMEOUT).returncode == 0
+                          timeout=STOP_TIMEOUT if step == "stop" else SCRIPT_TIMEOUT).returncode == 0
 
 
 def start_server(sysdir: Path) -> None:
@@ -501,25 +357,11 @@ def data_row(ctx: WorkerContext, operation, name: str, tip_id: str, batch: int, 
     try:
         ctx.db_tools.connect_branch(name, timed=False)
         ctx.clear_pk_cache()
-        insert_keys = None
-        if isinstance(operation, InsertOperation):
-            columns = ctx.get_pk_columns(operation.table_name)
-            if len(columns) != 1:
-                raise RunError("the INSERT suite needs one integer primary key")
-            maximum = ctx.db_tools.execute_sql(f"SELECT max({columns[0]}) FROM {operation.table_name}")[0][0]
-            maximum = 0 if maximum is None else maximum
-            if type(maximum) is not int:
-                raise RunError("the INSERT suite needs one integer primary key")
-            # Reserve all tries' keys before any write, so failures cannot change later inputs.
-            insert_keys = random.Random(f"{ctx.seed}:{name}:keys").sample(range(maximum + 1, 2**31), batch * tries)
         cells = []
         for trial in range(tries):
+            # Fixes this try's key choices. main's row generator is unseeded, so values still vary.
             ctx.rnd.seed(f"{ctx.seed}:{name}:{trial}")
-            ctx._table_datagen = None  # Faker owns a separately seeded RNG too.
             ctx._modified_keys.clear()
-            if insert_keys is not None:
-                keys = insert_keys[trial * batch:(trial + 1) * batch]
-                operation = InsertOperation(operation.table_name, primary_keys=((key,) for key in keys))
             ctx.result_collector.reset()
             try:
                 for _ in range(batch):

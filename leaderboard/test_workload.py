@@ -1,21 +1,17 @@
 """Replay the real leaderboard workload without starting a database server."""
 
-import asyncio
 import copy
 import json
+import random
 import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from psycopg2.errors import UniqueViolation
-
-from dblib.db_api import SqlError
 from dblib.result_collector import ResultCollector
 from leaderboard.run import BOARD, build_chain, run_row, task_config
 from leaderboard.test_leaderboard import ITEM_DDL
 from microbench import task2_pb2 as tp
-from microbench.operations.crud import InsertOperation
 from microbench.runner2 import BackendInfo, SharedBranchManager, WorkerContext, register_all_operations
 
 
@@ -62,23 +58,34 @@ class MemoryDatabase:
         return ITEM_DDL
 
     def execute_sql(self, sql, params=None, timed=False):
+        # main's adapters wrap every driver error in a plain Exception.
         if timed:
             calls = self.calls.setdefault(self.branch, [])
             calls.append((sql, copy.deepcopy(params)))
             if self.fail == (self.branch, len(calls)):
                 self.fail = None
-                raise SqlError("injected failure") from UniqueViolation("duplicate key")
+                raise Exception("injected failure")
         if sql.startswith("INSERT"):
             key = params["i_id"]
             if key in self.branches[self.branch]:
-                raise SqlError("duplicate key") from UniqueViolation("duplicate key")
+                raise Exception("duplicate key")
             self.branches[self.branch].add(key)
         if sql.startswith(("INSERT", "UPDATE")):
             assert self.branch.startswith("row_")
         self.record(timed)
-        if sql.upper().startswith("SELECT MAX("):
-            return [(max(self.branches[self.branch]),)]
         return [(1,)]
+
+
+def targets(calls: dict) -> dict:
+    """The rows each statement targets, which the seed fixes. main's row generator is unseeded,
+    so generated values and insert keys are left out."""
+    def target(params):
+        if not isinstance(params, dict):
+            return params  # a point read's key
+        bounds = {k: v for k, v in params.items() if k.startswith(("_start_", "_end_"))}
+        return bounds or params["i_id"]  # a range's bounds, or a point update's key
+    return {branch: [(sql, target(params)) for sql, params in rows]
+            for branch, rows in calls.items() if branch != "row_insert"}
 
 
 class Workload(unittest.TestCase):
@@ -90,10 +97,14 @@ class Workload(unittest.TestCase):
             patcher = mock.patch(f"util.db_helpers.{name}", return_value=value)
             patcher.start()
             self.addCleanup(patcher.stop)
+        # Keys come back in key order. main's query has no ORDER BY, so a real server is assumed to do the same.
         patcher = mock.patch("util.db_helpers.get_pk_values", side_effect=lambda db, *args:
                              [(key,) for key in sorted(db.branches[db.branch])])
         patcher.start()
         self.addCleanup(patcher.stop)
+        # main's row generator draws integers from the global random module; pin it so insert counts cannot flake.
+        self.addCleanup(random.setstate, random.getstate())
+        random.seed(0)
 
     def replay(self, fail=None, max_batch=None):
         with tempfile.TemporaryDirectory() as output:
@@ -108,65 +119,36 @@ class Workload(unittest.TestCase):
             self.assertEqual(set(db.branches), {"main", *(name for name, _ in chain)})
             return result, db.calls
 
-    def test_full_suite_repeats_and_inserts_have_no_collisions(self):
+    def row_index(self, operation):
+        return next(i for i, row in enumerate(self.suite["rows"]) if row["op"] == operation)
+
+    def test_full_suite_fills_every_cell_and_repeats_its_targets(self):
         result, calls = self.replay()
         _, repeated = self.replay()
-        self.assertEqual(calls, repeated)
         self.assertEqual([len(row) for row in result], [3] * 8)
         self.assertTrue(all(cell is not None for row in result for cell in row), result)
-        inserted = [args["i_id"] for sql, args in calls["row_insert"]]
-        self.assertEqual(len(inserted), 3000)
-        self.assertEqual(len(set(inserted)), 3000)
-        self.assertTrue(all(key > 1000 for key in inserted))
+        self.assertEqual(targets(calls), targets(repeated))
 
     def test_failed_try_does_not_change_later_tries_or_rows(self):
         _, baseline = self.replay(max_batch=6)
-        operations = ["read", "range_read", "insert", "update", "range_update"]
-        for operation in operations:
+        for operation in ["read", "range_read", "update", "range_update"]:
             with self.subTest(operation=operation):
                 name = f"row_{operation}"
                 result, calls = self.replay(fail=(name, 3), max_batch=6)
-                row_index = next(i for i, row in enumerate(self.suite["rows"]) if row["op"] == operation)
-                self.assertIsNone(result[row_index][0])
-                self.assertTrue(all(cell is not None for cell in result[row_index][1:]))
-                # A duplicate is a failed benchmark try, not a hidden extra INSERT.
+                self.assertIsNone(result[self.row_index(operation)][0])
+                self.assertTrue(all(cell is not None for cell in result[self.row_index(operation)][1:]))
                 self.assertEqual(len(calls[name]), 3 + 6 * 2)
-                self.assertEqual(calls[name][:3], baseline[name][:3])
-                self.assertEqual(calls[name][3:], baseline[name][6:])
-                for other in baseline.keys() - {name}:
-                    self.assertEqual(calls[other], baseline[other], other)
+                failed, clean = targets(calls), targets(baseline)
+                self.assertEqual(failed[name][:3], clean[name][:3])
+                self.assertEqual(failed[name][3:], clean[name][6:])
+                for other in clean.keys() - {name}:
+                    self.assertEqual(failed[other], clean[other], other)
 
-    def test_explicit_insert_keys_disable_retries_but_legacy_callers_keep_them(self):
-        for asynchronous in (False, True):
-            for explicit in (False, True):
-                with self.subTest(asynchronous=asynchronous, explicit=explicit):
-                    context = mock.Mock()
-                    context.db_tools.autocommit = True
-                    context.get_pk_columns.return_value = ["i_id"]
-                    context.generate_row.side_effect = [{"i_id": 7}, {"i_id": 8}]
-                    error = SqlError("duplicate key")
-                    error.__cause__ = UniqueViolation("duplicate key")
-                    execute = mock.AsyncMock(side_effect=[error, None]) if asynchronous else \
-                        mock.Mock(side_effect=[error, None])
-                    setattr(context.db_tools, "execute_sql_async" if asynchronous else "execute_sql", execute)
-                    operation = InsertOperation("item", primary_keys=[(1500,)]) if explicit else InsertOperation("item")
-
-                    def run():
-                        if asynchronous:
-                            asyncio.run(operation.execute_async(context))
-                        else:
-                            operation.execute(context)
-
-                    if explicit:
-                        with self.assertRaises(SqlError):
-                            run()
-                        self.assertEqual(execute.call_count, 1)
-                        self.assertEqual(execute.call_args.args[1]["i_id"], 1500)
-                        context.track_modified_key.assert_not_called()
-                    else:
-                        run()
-                        self.assertEqual(execute.call_count, 2)
-                        context.track_modified_key.assert_called_once_with((8,))
+    def test_failed_insert_is_retried_inside_its_try(self):
+        # main's insert makes up to 5 attempts, so a failure costs one untimed extra statement, not the try.
+        result, calls = self.replay(fail=("row_insert", 3), max_batch=6)
+        self.assertTrue(all(cell is not None for cell in result[self.row_index("insert")]))
+        self.assertEqual(len(calls["row_insert"]), 6 * 3 + 1)
 
 
 if __name__ == "__main__":

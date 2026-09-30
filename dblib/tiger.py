@@ -13,8 +13,6 @@ import dblib.result_collector as rc
 
 
 TIGER_API_BASE = "https://console.cloud.timescale.com/public/api/v1"
-REQUEST_TIMEOUT = 30  # seconds for one API call
-POLL_INTERVAL = 0.5
 
 
 class TigerToolSuite(DBToolSuite):
@@ -44,8 +42,6 @@ class TigerToolSuite(DBToolSuite):
         self.project_id = project_id
         self.current_service_id = service_id
         self.current_service_name = service_name
-        # Forks are named after the root service, so a run's services can be found by name.
-        self.root_name = service_name
         self.password = password
         self.region_code = region_code
         self.autocommit = autocommit
@@ -97,7 +93,6 @@ class TigerToolSuite(DBToolSuite):
         r = requests.get(
                 f"{TIGER_API_BASE}/projects/{project_id}/services/{service_id}",
                 headers=headers,
-                timeout=REQUEST_TIMEOUT,
                 )
         if not r.ok:
             raise Exception(f"Tiger API error {r.status_code}: {r.text}")
@@ -142,12 +137,12 @@ class TigerToolSuite(DBToolSuite):
         url = f"{TIGER_API_BASE}{endpoint}"
         headers = self._auth_header()
 
-        r = requests.request(method, url, headers=headers, timeout=REQUEST_TIMEOUT, **kwargs)
+        r = requests.request(method, url, headers=headers, **kwargs)
 
         if not r.ok:
             raise Exception(f"Tiger API error {r.status_code}: {r.text}")
 
-        if r.status_code == 204 or not r.content:
+        if r.status_code == 204:
             return {}
 
         return r.json()
@@ -171,7 +166,7 @@ class TigerToolSuite(DBToolSuite):
                         f"Service {service_id} did not become READY"
                         )
 
-            time.sleep(POLL_INTERVAL)
+            time.sleep(3)
 
     def _build_pg_uri(self, service_info: dict) -> str:
         host = service_info["endpoint"]["host"]
@@ -198,7 +193,6 @@ class TigerToolSuite(DBToolSuite):
             r = requests.get(
                 f"{TIGER_API_BASE}/projects/{project_id}/services/{service_id}",
                 headers=headers,
-                timeout=REQUEST_TIMEOUT,
             )
             r.raise_for_status()
             service = r.json()
@@ -206,21 +200,17 @@ class TigerToolSuite(DBToolSuite):
                 return service
             if time.time() - start > timeout:
                 raise TimeoutError(f"Service {service_id} did not become READY within {timeout}s")
-            time.sleep(POLL_INTERVAL)
+            time.sleep(5)
 
     @classmethod
     def create_tiger_service(
             cls,
             name: str,
-            project_id: str = None,
+            project_id: str = "tdzyl504xn",
             region_code: str = "us-east-1",  # FIX: removed erroneous leading space
             cpu_millis: int = 1000,
             memory_gbs: int = 4,
             ):
-        # The project belongs to the account running the benchmark.
-        project_id = project_id or os.environ.get("TIGER_PROJECT_ID")
-        if not project_id:
-            raise ValueError("TIGER_PROJECT_ID is not set in the environment.")
         access_key = os.environ.get("TIGER_ACCESS_KEY")
         secret_key = os.environ.get("TIGER_SECRET_KEY")
 
@@ -246,7 +236,6 @@ class TigerToolSuite(DBToolSuite):
                 f"{TIGER_API_BASE}/projects/{project_id}/services",
                 headers=headers,
                 json=payload,
-                timeout=REQUEST_TIMEOUT,
                 )
 
         if not r.ok:
@@ -271,27 +260,11 @@ class TigerToolSuite(DBToolSuite):
         r = requests.get(
                 f"{TIGER_API_BASE}/projects/{project_id}/services/{service_id}",
                 headers=headers,
-                timeout=REQUEST_TIMEOUT,
                 )
 
         if not r.ok:
             raise Exception(r.text)
 
-        return r.json()
-
-    @classmethod
-    def list_tiger_services(cls, project_id: str) -> list[dict]:
-        access_key = os.environ.get("TIGER_ACCESS_KEY")
-        secret_key = os.environ.get("TIGER_SECRET_KEY")
-        token = base64.b64encode(f"{access_key}:{secret_key}".encode()).decode()
-        headers = {"Authorization": f"Basic {token}", "Accept": "application/json"}
-        r = requests.get(
-            f"{TIGER_API_BASE}/projects/{project_id}/services",
-            headers=headers,
-            timeout=REQUEST_TIMEOUT,
-        )
-        if not r.ok:
-            raise Exception(f"Tiger list failed {r.status_code}: {r.text}")
         return r.json()
 
     @classmethod
@@ -303,7 +276,6 @@ class TigerToolSuite(DBToolSuite):
         r = requests.delete(
             f"{TIGER_API_BASE}/projects/{project_id}/services/{service_id}",
             headers=headers,
-            timeout=REQUEST_TIMEOUT,
         )
         if not r.ok:
             raise Exception(f"Tiger delete failed {r.status_code}: {r.text}")
@@ -319,7 +291,7 @@ class TigerToolSuite(DBToolSuite):
         parent_service_id = parent_id or self.current_service_id
 
         payload = {
-                "name": f"{self.root_name}_{branch_name}",
+                "name": branch_name,
                 "region_code": self.region_code,
                 "cpu_millis": 1000,
                 "fork_strategy": "NOW",
@@ -335,14 +307,14 @@ class TigerToolSuite(DBToolSuite):
                 )
 
         new_service_id = response["service_id"]
-        # Recorded before the wait, so a fork that never becomes ready is still deleted.
-        new_password = response.get("initial_password", self.password)
-        self._services[branch_name] = (new_service_id, new_password)
 
         # Wait for fork to be ready before returning so that callers can
         # immediately connect. Note: this wait time is included in the
         # BRANCH_CREATE timing recorded by the base class.
         self._wait_until_ready(new_service_id)
+
+        new_password = response.get("initial_password", self.password)
+        self._services[branch_name] = (new_service_id, new_password)
 
     def _connect_branch_impl(self, branch_name: str) -> None:
         if branch_name not in self._services:
@@ -365,9 +337,6 @@ class TigerToolSuite(DBToolSuite):
 
     def _get_current_branch_impl(self) -> Tuple[str, str]:
         return (self.current_service_name, self.current_service_id)
-
-    def list_branches(self) -> list[str]:
-        return list(self._services)
 
     def get_all_services(self) -> dict:
         """Returns all service IDs known to this instance, including forks."""

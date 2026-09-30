@@ -5,30 +5,14 @@ This module implements the standard database CRUD operations including
 point operations (single row) and range operations (multiple rows).
 """
 
-from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
-import psycopg
-import psycopg2.errors
-import pymysql
-
 from dblib import result_pb2 as rslt
-from dblib.db_api import SqlError
 from microbench.operations.base import Operation
 from util import db_helpers as dbh
 
 if TYPE_CHECKING:
     from microbench.runner2 import WorkerContext
-
-
-def is_duplicate_key(exc: BaseException | None) -> bool:
-    """True when a failed insert collided with an existing primary key."""
-    if isinstance(exc, (psycopg2.errors.UniqueViolation, psycopg.errors.UniqueViolation)):
-        return True  # Postgres: Neon, Tiger, Xata
-    if isinstance(exc, pymysql.err.IntegrityError):
-        return exc.args[0] == 1062  # Dolt
-    # Doltgres raises a generic internal error that carries MySQL's code.
-    return exc is not None and "(errno 1062)" in str(exc)
 
 
 class ReadOperation(Operation):
@@ -93,16 +77,8 @@ class InsertOperation(Operation):
     if there are primary key collisions.
     """
 
-    def __init__(self, table_name: str, primary_keys: Iterable[tuple] | None = None):
+    def __init__(self, table_name: str):
         self.table_name = table_name
-        # A benchmark can supply collision-free keys; those inserts never retry.
-        self.primary_keys = iter(primary_keys) if primary_keys is not None else None
-
-    def _next_row(self, context: 'WorkerContext', pk_columns: list[str]) -> dict:
-        row = context.generate_row(self.table_name)
-        if self.primary_keys is not None:
-            row.update(zip(pk_columns, next(self.primary_keys), strict=True))
-        return row
 
     def _generate_insert_data(self, context: 'WorkerContext'):
         """Shared logic: generate insert SQL and row data.
@@ -130,7 +106,7 @@ class InsertOperation(Operation):
         # Try to insert with retries for PK collisions
         inserted = False
         for attempt in range(5):
-            row_data = self._next_row(context, pk_columns)
+            row_data = context.generate_row(self.table_name)
             pk_tuple = tuple(row_data[pk] for pk in pk_columns)
 
             try:
@@ -142,10 +118,10 @@ class InsertOperation(Operation):
                 if not context.db_tools.autocommit:
                     context.db_tools.commit_changes(timed=True, message="insert")
                 break
-            except SqlError as e:
-                # Only a key collision is worth retrying with a new row.
-                if self.primary_keys is not None or attempt == 4 or not is_duplicate_key(e.__cause__):
+            except Exception as e:
+                if attempt == 4:  # Last attempt
                     raise
+                continue  # Retry with new data
 
         if not inserted:
             raise ValueError("Failed to insert row after 5 attempts")
@@ -157,7 +133,7 @@ class InsertOperation(Operation):
         # Try to insert with retries for PK collisions
         inserted = False
         for attempt in range(5):
-            row_data = self._next_row(context, pk_columns)
+            row_data = context.generate_row(self.table_name)
             pk_tuple = tuple(row_data[pk] for pk in pk_columns)
 
             try:
@@ -170,10 +146,10 @@ class InsertOperation(Operation):
                     # Note: In async mode, autocommit is required
                     pass
                 break
-            except SqlError as e:
-                # Only a key collision is worth retrying with a new row.
-                if self.primary_keys is not None or attempt == 4 or not is_duplicate_key(e.__cause__):
+            except Exception as e:
+                if attempt == 4:  # Last attempt
                     raise
+                continue  # Retry with new data
 
         if not inserted:
             raise ValueError("Failed to insert row after 5 attempts")

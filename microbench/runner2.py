@@ -361,6 +361,7 @@ class BackendManager:
                 info.default_branch_id = neon_project["branch"]["id"]
                 info.default_branch_name = neon_project["branch"]["name"]
                 print(f"Neon project ID: {info.neon_project_id}")
+                print(f"Default Neon connection URI: {info.default_uri}")
             else:
                 info.neon_project_id = config.database_setup.existing_db.neon_project_id
                 proj_branches = NeonToolSuite.get_project_branches(info.neon_project_id)
@@ -393,6 +394,7 @@ class BackendManager:
                 info.default_branch_id = tiger_service["service_id"]
                 info.default_branch_name = tiger_service["name"]
                 print(f"Tiger service ID: {info.tiger['service_id']}")
+                print(f"Default Tiger connection URI: {info.default_uri}")
             else:
                 raise NotImplementedError("Tiger with existing service not implemented")
 
@@ -409,6 +411,7 @@ class BackendManager:
                 info.default_branch_id = default_branch_id
                 info.default_branch_name = default_branch_name
                 print(f"Xata project ID: {info.xata_project_id}")
+                print(f"Default Xata connection URI: {info.default_uri}")
             else:
                 raise NotImplementedError("Xata requires database setup")
 
@@ -456,7 +459,7 @@ class BackendManager:
             root_id = info.tiger["service_id"]
             project_id = info.tiger["project_id"]
             # Delete forks first, root last
-            for sname, (sid, pw) in all_ids.items():
+            for sname, (sid, pw) in all_ids:
                 if sid != root_id:
                     try:
                         TigerToolSuite.delete_tiger_service(project_id, sid)
@@ -688,7 +691,7 @@ class SetupPhase:
         if not table_schema:
             raise ValueError(f"Could not fetch DDL for table {benchmark_table}")
 
-        ctx._table_datagen = DynamicDataGenerator(table_schema, ctx.rnd)
+        ctx._table_datagen = DynamicDataGenerator(table_schema)
         ctx._pk_columns = dbh.get_pk_column_names(
             ctx.db_tools.get_current_connection(), benchmark_table
         )
@@ -1068,7 +1071,7 @@ class WorkerContext:
         """Generate a fake data row for the table."""
         if not self._table_datagen:
             table_schema = self.db_tools.get_table_schema(table_name)
-            self._table_datagen = DynamicDataGenerator(table_schema, self.rnd)
+            self._table_datagen = DynamicDataGenerator(table_schema)
         return self._table_datagen.generate_row()
 
     def track_modified_key(self, key: Tuple) -> None:

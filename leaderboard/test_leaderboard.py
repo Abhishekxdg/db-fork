@@ -1,4 +1,4 @@
-"""Checks for the leaderboard and the harness fixes it relies on.
+"""Checks for the leaderboard.
 
 Run from the repository root: python -m unittest leaderboard.test_leaderboard
 These tests need no database server.
@@ -7,27 +7,16 @@ These tests need no database server.
 from __future__ import annotations
 
 import json
-import os
-import random
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-import psycopg2.errors
-import pymysql
-import requests
-
-from dblib.db_api import DBToolSuite
-from dblib.neon import NeonToolSuite
-from dblib.tiger import TigerToolSuite
 from leaderboard.build import build
 from leaderboard.run import SYSTEMS, RunError, clean_up, exclusive, scrub
 from leaderboard.validate import BOARD, SCHEMA_VERSION, sha256, validate
 from microbench.datagen import DynamicDataGenerator
-from microbench.operations.crud import is_duplicate_key
-from util.import_db import _split_password
 
 ITEM_DDL = """CREATE TABLE item (
     i_id INT NOT NULL,
@@ -39,57 +28,9 @@ ITEM_DDL = """CREATE TABLE item (
 );"""
 
 
-class HarnessFixes(unittest.TestCase):
-    def test_base_delete_raises(self) -> None:
-        with self.assertRaises(NotImplementedError):
-            DBToolSuite._delete_branch_impl(object(), "branch", "id")
-
-    def test_duplicate_key_on_each_driver(self) -> None:
-        doltgres = psycopg2.errors.InternalError_("duplicate primary key given: [1] (errno 1062) (sqlstate HY000)")
-        self.assertTrue(is_duplicate_key(psycopg2.errors.UniqueViolation("duplicate key")))
-        self.assertTrue(is_duplicate_key(pymysql.err.IntegrityError(1062, "duplicate primary key given: [1]")))
-        self.assertTrue(is_duplicate_key(doltgres))
-
-    def test_other_errors_are_not_duplicates(self) -> None:
-        self.assertFalse(is_duplicate_key(pymysql.err.IntegrityError(1452, "foreign key constraint fails")))
-        self.assertFalse(is_duplicate_key(psycopg2.errors.InternalError_("nothing to commit (errno 1105)")))
-        self.assertFalse(is_duplicate_key(None))
-
-    def test_seeded_generator_repeats_rows(self) -> None:
-        def rows(seed: int) -> list[dict]:
-            gen = DynamicDataGenerator(ITEM_DDL, random.Random(seed))
-            return [gen.generate_row() for _ in range(5)]
-
-        self.assertEqual(rows(7), rows(7))
-        self.assertNotEqual(rows(7), rows(8))
-
-    def test_psql_password_leaves_the_command_line(self) -> None:
-        uri, password = _split_password("postgresql://owner:p%40ss:w@host.example/db?sslmode=require")
-        self.assertEqual((uri, password), ("postgresql://owner@host.example/db?sslmode=require", "p@ss:w"))
-        self.assertEqual(_split_password("postgresql://postgres@localhost/db"), ("postgresql://postgres@localhost/db", None))
-
-    def test_neon_delete_waits_out_locks_and_its_operations(self) -> None:
-        locked = requests.Response()
-        locked.status_code = 423
-        replies = iter([requests.exceptions.HTTPError(response=locked), {"operations": [{"id": "op1"}]},
-                        {"operation": {"status": "running"}}, {"operation": {"status": "finished"}}])
-
-        def fake_request(method: str, endpoint: str, **kwargs) -> dict:
-            reply = next(replies)
-            if isinstance(reply, Exception):
-                raise reply
-            return reply
-
-        suite = NeonToolSuite.__new__(NeonToolSuite)
-        suite.project_id, suite._all_branches = "project", {"row_read": ("br-1", "")}
-        with mock.patch.object(NeonToolSuite, "_request", side_effect=fake_request), \
-                mock.patch("dblib.neon.POLL_INTERVAL", 0):
-            suite._delete_branch_impl("row_read", "")
-        self.assertEqual(list(replies), [])
-        self.assertNotIn("row_read", suite._all_branches)
-
+class RowGenerator(unittest.TestCase):
     def test_generated_item_rows_fit_the_columns(self) -> None:
-        gen = DynamicDataGenerator(ITEM_DDL, random.Random(1))
+        gen = DynamicDataGenerator(ITEM_DDL)
         for _ in range(200):
             row = gen.generate_row()
             self.assertLessEqual(row["i_price"], 999.99)
@@ -219,16 +160,6 @@ class Runner(unittest.TestCase):
     def test_errors_never_carry_a_uri_password(self) -> None:
         self.assertEqual(scrub("connect failed: postgresql://owner:hunter2@ep-1.neon.tech/db?sslmode=require"),
                          "connect failed: postgresql://owner:***@ep-1.neon.tech/db?sslmode=require")
-
-    def test_tiger_cleanup_deletes_only_the_runs_services_root_last(self) -> None:
-        listed = [{"service_id": "s1", "name": "bb_1a2b"}, {"service_id": "s2", "name": "bb_1a2b_chain_1"},
-                  {"service_id": "s3", "name": "bb_1a2bc"}, {"service_id": "s4", "name": "analytics"}]
-        deleted = []
-        with mock.patch.dict(os.environ, {"TIGER_PROJECT_ID": "project"}), \
-                mock.patch.object(TigerToolSuite, "list_tiger_services", side_effect=[listed, []]), \
-                mock.patch.object(TigerToolSuite, "delete_tiger_service", side_effect=lambda p, s: deleted.append(s)):
-            SYSTEMS["tiger"].delete("bb_1a2b")
-        self.assertEqual(deleted, ["s2", "s1"])
 
 
 if __name__ == "__main__":

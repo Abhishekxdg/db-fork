@@ -1,12 +1,10 @@
 """Recovery, provenance and deadline checks; no database or vendor account needed."""
 
-import hashlib
 import json
 import os
 import signal
 import socket
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -45,7 +43,7 @@ class Recovery(unittest.TestCase):
                 self.assertIsInstance(runner.clean_up("dolt", server), PermissionError)
             self.assertTrue(path.exists())
 
-    def test_scopes_identify_actual_targets_without_passwords(self):
+    def test_scopes_identify_actual_targets(self):
         for key, module, host in (("dolt", runner.dolt_pg, "DOLT_HOST"),
                                   ("dolt_mysql", runner.dolt_mysql, "DOLT_MYSQL_HOST")):
             server = runner.SYSTEMS[key]
@@ -54,12 +52,6 @@ class Recovery(unittest.TestCase):
                 self.assertNotEqual(server.scope(), original)
             with mock.patch.object(server, "data_dir", Path("/tmp/other-data")):
                 self.assertNotEqual(server.scope(), original)
-        with mock.patch.object(runner.neon_api, "API_KEY", "secret-token"):
-            scope = runner.SYSTEMS["neon"].scope()
-            self.assertNotIn("secret-token", json.dumps(scope))
-            self.assertEqual(scope["credential_sha256"], hashlib.sha256(b"secret-token").hexdigest())
-        with mock.patch.object(runner.xata_api, "XATA_API_BASE_URL", "https://api.xata.tech/organizations/A/"):
-            self.assertIn("/A/", runner.SYSTEMS["xata"].scope()["api"])
 
 
 class RunLifecycle(unittest.TestCase):
@@ -193,22 +185,6 @@ class RunLifecycle(unittest.TestCase):
 
 
 class Deadlines(unittest.TestCase):
-    def test_load_deadline_kills_and_reaps_its_subprocess(self):
-        with tempfile.NamedTemporaryFile(suffix=".sql") as dump:
-            process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
-                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            try:
-                with mock.patch("util.import_db.subprocess.Popen", return_value=process), \
-                        self.assertRaisesRegex(runner.RunError, "deadline"), runner.bounded(0.03, "load"):
-                    runner.load_sql_file("postgresql://localhost/test", dump.name)
-                self.assertIsNotNone(process.poll())
-                self.assertTrue(process.stdout.closed)
-                self.assertTrue(process.stderr.closed)
-            finally:
-                if process.poll() is None:
-                    process.kill()
-                    process.communicate()
-
     def test_deadline_interrupts_real_libpq_wait_and_restores_state(self):
         callback = psycopg2.extensions.get_wait_callback()
         handler = signal.getsignal(signal.SIGALRM)
