@@ -1,9 +1,57 @@
 # BranchBench leaderboard
 
 BranchBench ranks databases that support branches on branch operations and on
-point and range reads and writes. It follows ClickBench's structure: one directory per
-system, one shared runner, dated result files, a validator, a build step that
-writes `data.js`, and a static page that ranks the results.
+point and range reads and writes. It has one directory per system, one shared
+runner, dated result files, a validator, a build step that writes `data.js`, and
+a dependency-free, responsive benchmark explorer.
+
+The page shows first-query, read/write, and load rankings in tables with explicit
+rank, system, score, and time columns. The workload heatmap shows measured batch
+timings: darker mint means closer to the fastest time within that row, and a check
+marks the fastest. **First try / Best repeat** updates all workloads; load and
+provisioning remain one-time measurements. Expand **Filters** or **Scoring** for
+details. Mock previews stay separate and never affect rankings or heatmap scales.
+
+The **Dataset & workloads** summary identifies the shared CH-benCHmark seed.
+Expand it for initial table counts, the timed table, every workload's batch size
+and explanation, and the dataset path, checksum, suite, and workload seed. The run
+page shows the same dataset scope and links to this guide.
+
+Two charts complement each measured ranking: a scatter plot compares first-query
+and selected read/write scores, and an attempt chart shows all three timings for
+a chosen workload. Chart points open the full result. Charts follow the current
+filters, keep hosting groups separate, and never include mocks. Missing attempts
+leave gaps rather than being plotted as zero. The attempt chart always shows all
+tries, independently of the First try / Best repeat scoring toggle.
+
+Hover a workload label or focus/tap its **?** for an animated explanation. These
+diagrams illustrate the operation, not measured speed; reduced-motion preferences
+disable animation. Select a ranked row or system name for a result dialog with
+every attempt, setup timings, environment, and provenance. JSON remains available
+from the dialog. Machine details live here rather than in the ranking heading.
+
+**Run a benchmark** opens `run.html`: a single-page setup with database selection,
+environment fields, and a live script preview. Select one or more databases;
+changing any setting updates the script and invalidates the previous launch
+preview. Expand **Tools & credentials** for prerequisites. The shell-quoted
+commands run the selected databases sequentially, validate once, and build
+once. The sequence stops if a command fails. A workflow diagram explains setup,
+measurement, cleanup, and comparison. Detailed setup instructions remain in the
+expandable help.
+
+For **Run in Terminal** on macOS, start `python -m leaderboard.serve` from the
+repository root. The local launcher opens the wizard at
+`http://127.0.0.1:8765/run.html`. Review the full script, then click **Run in
+Terminal** to execute that exact script in a new Terminal session. It uses the
+project's `.venv/bin/python` when present, otherwise the launcher's Python.
+Missing hosted-service credentials are prompted for in Terminal with hidden
+input; the browser never receives them. A failed command stops the sequence.
+Source changes must be committed before benchmarking, as with the CLI.
+
+The launcher binds only to loopback, accepts same-origin JSON requests, and
+reconstructs scripts from validated database choices rather than accepting
+arbitrary shell commands. Static `file://` previews still offer copyable commands
+and show how to start the launcher. Nothing is published remotely by the wizard.
 
 Everything runs on one machine. The target databases are either local servers
 (Doltgres, Dolt) or hosted services (Neon, Tiger Cloud, Xata).
@@ -93,6 +141,13 @@ client in US East. Each file's `basis` says so.
 - To remove them all, delete `leaderboard/mock/` and run the build again.
 
 ## What is measured
+
+The fixed `db_setup/ch_benchmark_seed.sql` loads **21,121 initial rows across 12
+tables** using a CH-benCHmark-style retail schema. Only `item`, with **1,000
+initial rows**, is targeted by timed reads and writes; all tables are loaded and
+included in branches. This is a small branching and CRUD microbenchmark, **not
+the full CH-benCHmark, TPC-C, or TPC-H workload suite**. The dataset SHA-256 pins
+the SQL file; the workload seed fixes generated operation inputs separately.
 
 The suite in `suite.json` runs 8 rows, 3 tries each, on the `item` table:
 
