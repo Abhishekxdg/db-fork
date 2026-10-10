@@ -6,12 +6,11 @@ package microbench2;
 enum Backend {
   NEON = 0;
   DOLT = 1;
-  KPG = 2;
   XATA = 3;
   FILE_COPY = 4;
-  TIGER = 5;
-  TXN = 6;
   DOLT_MYSQL = 7;
+  SEEKDB = 8;
+  MATRIXONE = 9;
 }
 
 // Operation types for benchmarking
@@ -28,9 +27,6 @@ enum OperationType {
   BRANCH_CREATE = 10;
   BRANCH_CONNECT = 11;
   BRANCH_DELETE = 12;
-  CONNECT_FIRST = 13;
-  CONNECT_MID = 14;
-  CONNECT_LAST = 15;
 
   // DDL operations (extensible)
   DDL_ADD_INDEX = 20;
@@ -38,6 +34,16 @@ enum OperationType {
   DDL_ADD_COLUMN = 22;
   DDL_REMOVE_COLUMN = 23;
   DDL_VACUUM = 24;
+  DDL_BACKFILL = 25;
+  DDL_ADD_COLUMN_WITH_DEFAULT = 26;
+  DDL_TYPE_CHANGE = 27;
+  DDL_RENAME_COLUMN = 28;
+  DDL_RENAME_TABLE = 29;
+  DDL_ADD_FK = 30;
+  DDL_ADD_CHECK = 31;
+  DDL_SET_DEFAULT = 32;
+  DDL_SET_NOT_NULL = 33;
+  DDL_EXPAND_CONTRACT = 34;
 }
 
 // Branch tree shapes for setup phase
@@ -51,7 +57,6 @@ enum BranchShape {
 message ExistingDatabase {
   string branch_id = 1;
   string neon_project_id = 2;
-  string tiger_service_id = 3;
 }
 
 // SQL dump file for database initialization
@@ -92,6 +97,13 @@ message DdlConfig {
   string index_column_name = 1;  // For ADD_INDEX operations
   string column_name = 2;         // For ADD_COLUMN/REMOVE_COLUMN
   string column_type = 3;         // For ADD_COLUMN (e.g., "VARCHAR(100)")
+  float backfill_fraction = 4;    // For BACKFILL: fraction of the table's rows to rewrite (0.0-1.0)
+  string default_value = 5;       // For ADD_COLUMN_WITH_DEFAULT: the default value expression.
+  string new_column_name = 6;   // for RENAME_COLUMN
+  string new_table_name = 7;    // for RENAME_TABLE
+  string ref_table_name = 8;    // for ADD_FK, the table being referenced
+  string ref_column_name = 9;   // for ADD_FK, the column being referenced
+  string check_expression = 10; // for ADD_CHECK, e.g. "quantity > 0"
 }
 
 // Single operation benchmark configuration
@@ -118,15 +130,20 @@ message TaskConfig {
   // Scale factor (e.g., number of warehouses in TPCC schema)
   int32 scale_factor = 5;
 
-  bool autocommit = 6;
+  // field 6 removed (was autocommit; every statement now autocommits)
   int32 num_threads = 7;
   bool measure_storage = 8;
 
   // Async execution configuration
-  // Number of concurrent requests per connection (default 1 = synchronous)
-  // When > 1, enables async mode with that many concurrent requests
-  // Requires autocommit = true when > 1
+  // Number of concurrent requests per thread (default 1 = synchronous)
+  // When > 1, enables async mode with that many concurrent requests, each on
+  // its own connection from a per-thread pool of the same size
   int32 concurrent_requests = 10;
+
+  // Run in async mode even with concurrent_requests = 1, so a sweep over
+  // concurrent_requests uses the same runner and drivers at every point.
+  // Async mode is always used when concurrent_requests > 1.
+  bool use_async = 11;
 
   // Single operation benchmark configuration
   OperationBenchmark operation_benchmark = 9;
