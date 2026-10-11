@@ -207,6 +207,10 @@ message DevAgentParams {
     // alters, and share of backfilled rows whose c_data the branch also
     // rewrites (both create rebase conflicts).
     float key_overlap = 8;
+    // The k-th spine migration (1-based, 0 = never) adds customer.c_tier
+    // with a type different from the one the feature branch added: a
+    // schema conflict for every branch alive at that point.
+    int32 schema_conflict_migration = 9;
 }
 
 // S5 Operations agent: dense commits on the spine, a corrupting deploy,
@@ -270,9 +274,16 @@ message MacroBenchConfig {
     DatabaseSetup database_setup = 3;
     SchemaConfig schema = 4;
     Workload workload = 5;
-    // Measure storage (disk_size_before/after) around each timed operation.
+    // Measure storage (disk_size_before/after) around each timed operation
+    // (expensive: two directory walks per operation; the workflow-level
+    // storage points and the sampler below are always on).
     bool measure_storage = 6;
     // Seed for every random choice in the run (0 = 42).
     int32 seed = 7;
     Invariants invariants = 8;
+    // Seconds between background samples of the backend's storage size
+    // during the scenario (0 = the default of 5 s; the runner's
+    // --storage-sample-interval overrides it, and a negative value or
+    // --storage-sample-interval 0 turns the sampler off).
+    float storage_sample_interval_sec = 9;
 }

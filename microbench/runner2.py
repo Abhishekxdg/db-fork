@@ -20,6 +20,7 @@ Design principles:
 """
 
 import argparse
+import re
 import asyncio
 import json
 import os
@@ -42,6 +43,7 @@ from microbench import task2_pb2 as tp
 from dblib import result_pb2 as rslt
 
 # Database backend imports
+from dblib import dolt
 from dblib.dolt import DoltToolSuite, commit_dolt_schema
 from dblib import dolt_mysql
 from dblib.dolt_mysql import DoltMySQLToolSuite
@@ -51,6 +53,7 @@ from dblib import matrixone
 from dblib.matrixone import MatrixOneToolSuite
 from dblib import bauplan
 from dblib.bauplan import BauplanToolSuite
+from dblib import neon as neon_mod
 from dblib.neon import NeonToolSuite
 from dblib.file_copy import FileCopyToolSuite
 from dblib.xata import XataToolSuite
@@ -458,6 +461,10 @@ class BackendManager:
 
         elif backend == tp.Backend.NEON:
             if require_db_setup:
+                # Leftovers of interrupted runs keep billing: drop them first.
+                stale = neon_mod.delete_stale_projects()
+                if stale:
+                    print(f"Deleted stale Neon projects: {stale}")
                 neon_project = NeonToolSuite.create_neon_project(f"project_{db_name}")
                 info.neon_project_id = neon_project["project"]["id"]
                 info.default_uri = (
@@ -468,7 +475,7 @@ class BackendManager:
                 info.default_branch_id = neon_project["branch"]["id"]
                 info.default_branch_name = neon_project["branch"]["name"]
                 print(f"Neon project ID: {info.neon_project_id}")
-                print(f"Default Neon connection URI: {info.default_uri}")
+                print(f"Default Neon connection URI: {re.sub(r'://([^:/]+):[^@]*@', r'://\1:***@', info.default_uri)}")
             else:
                 info.neon_project_id = config.database_setup.existing_db.neon_project_id
                 proj_branches = NeonToolSuite.get_project_branches(info.neon_project_id)
@@ -568,6 +575,9 @@ class BackendManager:
                 print(f"Database '{db_name}' deleted successfully.")
                 cur.close()
                 conn.close()
+                if self.config.backend == tp.Backend.DOLT:
+                    # Dolt keeps dropped databases on disk until purged.
+                    dolt.purge_dropped_databases(info.default_uri)
             except Exception as e:
                 print(f"Error deleting database: {e}")
 
