@@ -348,7 +348,9 @@ class FileCopyToolSuite(PgMergeMixin, DBToolSuite):
                   "(reopened on their next use), busy ones are waited for, inside the verb",
         "commit": "_bb_commits row, then a clone of the branch database as the commit's snapshot "
                   "(two checkpoints and one reflink per data file; the branch's connections are "
-                  "parked meanwhile)",
+                  "parked meanwhile). Before any clone, tables of the template that were never "
+                  "analyzed are ANALYZEd, since the copy carries pg_statistic and kills the "
+                  "template's autovacuum worker",
         "log": "SELECT from the _bb_commits bookkeeping table",
         "diff": "per-table row hashes per key bucket on each database, differing buckets pulled "
                 "over postgres_fdw and compared on the target",
@@ -597,11 +599,33 @@ class FileCopyToolSuite(PgMergeMixin, DBToolSuite):
             self.observe("quiesce_wait_sec", waited)
             self.observe("quiesce_waits")
 
+    def _analyze_unanalyzed(self, db: str) -> None:
+        """ANALYZE the tables of ``db`` that have never been analyzed
+        (pg_class.reltuples = -1), so that the clone carries planner
+        statistics: CREATE DATABASE copies pg_statistic, and the copy
+        itself terminates any autovacuum worker on the template, so a
+        freshly loaded table could otherwise stay unanalyzed on the
+        template and on every clone of it (a nested-loop plan over an
+        unanalyzed 300k-row table ran for over ten minutes)."""
+        h = self._handle(db, fresh=True)
+        try:
+            rows = self._exec(h, "SELECT relname FROM pg_class WHERE relkind = 'r' AND reltuples < 0 "
+                                 "AND relnamespace = 'public'::regnamespace AND relname NOT LIKE %s",
+                              (META_PREFIX.replace("_", r"\_") + "%",)) or []
+            for (t,) in rows:
+                self._exec(h, f"ANALYZE {_q(t)}")
+            if rows:
+                self.observe("analyze_before_clone_tables", len(rows))
+                self.observe("analyze_before_clone")
+        finally:
+            self._release_handle(h)
+
     def _clone(self, template: str, target: str, exclusive: bool = True) -> None:
         sql = f"CREATE DATABASE {_q(target)} TEMPLATE {_q(template)} STRATEGY = {FILE_COPY_STRATEGY}"
         if not exclusive:
             self._admin(sql)
             return
+        self._analyze_unanalyzed(template)
         with self._exclusive(template):
             t0 = time.monotonic()
             attempt = 0
