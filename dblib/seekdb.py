@@ -295,6 +295,7 @@ class _State:
 
 class SeekDBToolSuite(DBToolSuite):
     BACKEND_NAME = "seekdb"
+    STORAGE_SCOPE = "server"
     SUPPORTS_COMMIT_REFS = True
     SUPPORTS_MULTI_REF_EXEC = True
     # For the report: FORK/DROP DATABASE and cross-database queries are
@@ -912,10 +913,13 @@ class SeekDBToolSuite(DBToolSuite):
                 raise RuntimeError(
                     f"schema conflict on {table}: primary keys differ between "
                     f"{ours_db} and {theirs_db}")
-            have = {c[0] for c in self._columns(ours_db, table)}
+            have = {c[0]: c[1] for c in self._columns(ours_db, table)}
             for name, ctype, nullable, default in self._columns(theirs_db, table):
                 if name not in have:
                     plan_cols.append((table, name, ctype, default))
+                elif str(ctype).lower() != str(have[name]).lower():
+                    raise RuntimeError(f"schema conflict on {table}.{name}: types differ "
+                                       f"(ours {have[name]}, theirs {ctype})")
         for table in plan_tables:
             self._execute(f"CREATE TABLE {_qt(ours_db, table)} LIKE {_qt(theirs_db, table)}")
         for table, name, ctype, default in plan_cols:

@@ -14,6 +14,12 @@ are resolved additively (ours + theirs - base). Merged branches are
 deleted.
 
 Sentinel: the batch_manifest row is invisible on the spine until the merge.
+
+Invariants: S6.1 the manifest is hidden until the merge; S6.2 a reset
+restores exactly the rows loaded up to its commit; S6.4 the merge carries
+every row the batch loaded; S6.3 after each merge the spine's daily_revenue
+and customer_summary equal the seed roll-ups plus a recomputation over the
+merged batch orders (what the additive resolver must produce).
 """
 
 import math
@@ -106,6 +112,10 @@ class DataAgentScenario(Scenario):
                 a, n, last = cust.get((w, d, c), (0.0, 0, entry))
                 cust[(w, d, c)] = (a + amount, n + 1, max(last, entry))
                 nation[(nk or 0, day)] = nation.get((nk or 0, day), 0.0) + amount
+            # Kept for the S6.3 oracle: the derived tables must equal these
+            # seed roll-ups plus the merged batches' orders.
+            self._seed_daily = {(str(day), int(w)): (round(a, 2), n) for (day, w), (a, n) in daily.items()}
+            self._seed_cust = {(int(w), int(d), int(c)): (round(a, 2), n) for (w, d, c), (a, n, _) in cust.items()}
             counts = {}
             counts["daily_revenue"] = insert_rows(
                 db, "daily_revenue", ["day", "w_id", "revenue", "orders"],
@@ -150,6 +160,15 @@ class DataAgentScenario(Scenario):
         before = manifest_on_spine()
 
         rows_per_step = max(1, math.ceil(p.batch_rows / p.steps_per_batch))
+        # The batch's order ids: step s loads ids [first + s*rows, first + (s+1)*rows).
+        first_id = ORDER_ID_BASE + b * p.steps_per_batch * rows_per_step
+        last_id = first_id + p.steps_per_batch * rows_per_step
+
+        def batch_orders_on(ref):
+            r = suite.exec([("SELECT COUNT(*) FROM orders WHERE o_id >= %s AND o_id < %s",
+                             (first_id, last_id))], refs=[ref], label="invariant")[0]
+            return int(r.rows[0][0]) if r.ok and r.rows else None
+
         committed = []   # (step, hash)
         step = 0
         loaded_by_step = {}   # a redone step replaces its earlier count
@@ -171,7 +190,7 @@ class DataAgentScenario(Scenario):
                 # Pipeline stage failed: go back to an earlier commit.
                 back_step, back_hash = rng.choice(committed)
                 if suite.supports("reset"):
-                    rs = suite.reset(branch, back_hash, label="batch_reset")
+                    rs = ctx.retry(lambda: suite.reset(branch, back_hash, label="batch_reset"))
                     ok = rs.ok
                 else:
                     nb = f"{branch}_r{resets + 1}"
@@ -180,9 +199,18 @@ class DataAgentScenario(Scenario):
                     if ok:
                         branch = nb
                         branches.append(nb)
+                # S6.2: after the reset the branch holds exactly the rows
+                # loaded up to the commit it went back to, nothing from
+                # the steps after it. A failed reset leaves the later
+                # rows in place and fails the check.
+                expected = sum(loaded_by_step.get(st, 0) for st in range(back_step + 1))
+                inv.expect(f"S6.2 batch {b} reset to step {back_step} restores its rows",
+                           batch_orders_on(branch), expected,
+                           f"reset {rs.status_name} {rs.error[:80]}".rstrip())
                 if ok:
                     resets += 1
                     committed = [c for c in committed if c[0] <= back_step]
+                    loaded_by_step = {st: n for st, n in loaded_by_step.items() if st <= back_step}
                     step = back_step + 1
                     continue
             step += 1
@@ -198,9 +226,9 @@ class DataAgentScenario(Scenario):
         # The spine load is paused while merging so its uncommitted writes
         # cannot land between the pre-merge commit and the merge.
         with self._merge_lock, self.quiesced():
-            rb = suite.rebase(branch, ctx.spine, on_conflict=additive_resolver, label="batch_rebase")
-            m = suite.merge(ctx.spine, branch, message=f"merge batch {b}",
-                            on_conflict=additive_resolver, label="batch_merge")
+            rb = ctx.retry(lambda: suite.rebase(branch, ctx.spine, on_conflict=additive_resolver, label="batch_rebase"))
+            m = ctx.retry(lambda: suite.merge(ctx.spine, branch, message=f"merge batch {b}",
+                                              on_conflict=additive_resolver, label="batch_merge"))
         if rb.ok and isinstance(rb.value, dict):
             ctx.bump_metric("rebase_conflicts", int(rb.value.get("conflicts", 0)))
         if m.ok:
@@ -218,12 +246,66 @@ class DataAgentScenario(Scenario):
             inv.check(f"S6.1 manifest hidden until merge (batch {b})",
                       before == 0 and after == 1,
                       f"before={before} after={after} (merge {m.status_name})")
+            # S6.4: the merge carried every row the batch loaded. S6.3: the
+            # derived tables on the spine equal a recomputation from the
+            # merged batch orders of every batch so far (the additive
+            # resolver's output is what this checks).
+            with self._merge_lock, self.quiesced():
+                on_spine = batch_orders_on(ctx.spine)
+                mism = self._derived_mismatches(suite, ctx.spine)
+            inv.expect(f"S6.4 batch {b} rows all on the spine after merge", on_spine, loaded,
+                       f"merge {m.status_name}")
+            inv.expect(f"S6.3 derived tables match merged batch orders (after batch {b})", mism, 0,
+                       "daily_revenue/customer_summary rows differing from the base tables")
         ctx.bump_metric("resets", resets)
         ctx.bump_metric("integrity_mismatches", mismatches)
         ctx.bump_metric("rows_loaded", loaded)
         for name in branches:
             ctx.delete(suite, name, label="batch_delete")
         return {"batch": b, "rows": loaded, "resets": resets}
+
+    def _derived_mismatches(self, suite, ref) -> int:
+        """Rows of daily_revenue and customer_summary on ``ref`` that differ
+        from the seed roll-ups plus a recomputation over the batch orders
+        (o_id >= ORDER_ID_BASE) and their order lines, for every day /
+        customer the batches touched. Amounts compared to the cent.
+        -1 when a probe failed."""
+        def q(sql):
+            r = suite.exec([sql], refs=[ref], label="invariant")[0]
+            if not r.ok:
+                self.ctx.note(f"derived-table probe failed: {r.error[:160]}")
+                return None
+            return r.rows or []
+        batch_daily = q("SELECT CAST(o.o_entry_d AS DATE), o.o_w_id, COUNT(DISTINCT o.o_id), SUM(l.ol_amount) "
+                        "FROM orders o JOIN order_line l ON l.ol_o_id = o.o_id AND l.ol_d_id = o.o_d_id AND l.ol_w_id = o.o_w_id "
+                        f"WHERE o.o_id >= {ORDER_ID_BASE} GROUP BY CAST(o.o_entry_d AS DATE), o.o_w_id")
+        batch_cust = q("SELECT o.o_w_id, o.o_d_id, o.o_c_id, COUNT(DISTINCT o.o_id), SUM(l.ol_amount) "
+                       "FROM orders o JOIN order_line l ON l.ol_o_id = o.o_id AND l.ol_d_id = o.o_d_id AND l.ol_w_id = o.o_w_id "
+                       f"WHERE o.o_id >= {ORDER_ID_BASE} GROUP BY o.o_w_id, o.o_d_id, o.o_c_id")
+        daily = q("SELECT day, w_id, revenue, orders FROM daily_revenue")
+        cust = q("SELECT c_w_id, c_d_id, c_id, total_amount, order_count FROM customer_summary")
+        if None in (batch_daily, batch_cust, daily, cust):
+            return -1
+        seed_daily = getattr(self, "_seed_daily", {})
+        seed_cust = getattr(self, "_seed_cust", {})
+        have_daily = {(str(day)[:10], int(w)): (float(rev or 0), int(n or 0)) for day, w, rev, n in daily}
+        have_cust = {(int(w), int(d), int(c)): (float(amt or 0), int(n or 0)) for w, d, c, amt, n in cust}
+        bad = 0
+        for day, w, n, amt in batch_daily:
+            key = (str(day)[:10], int(w))
+            sa, sn = seed_daily.get(key, (0.0, 0))
+            exp = (sa + float(amt or 0), sn + int(n or 0))
+            got = have_daily.get(key)
+            if got is None or got[1] != exp[1] or abs(got[0] - exp[0]) > 0.05:
+                bad += 1
+        for w, d, c, n, amt in batch_cust:
+            key = (int(w), int(d), int(c))
+            sa, sn = seed_cust.get(key, (0.0, 0))
+            exp = (sa + float(amt or 0), sn + int(n or 0))
+            got = have_cust.get(key)
+            if got is None or got[1] != exp[1] or abs(got[0] - exp[0]) > 0.05:
+                bad += 1
+        return bad
 
     def _load_step(self, b: int, step: int, rows: int, rng):
         ctx, p = self.ctx, self.params

@@ -13,6 +13,7 @@ summary, the invariant results and the scenario's own metrics.
 import argparse
 import json
 import os
+import signal
 import sys
 import threading
 import time
@@ -69,6 +70,76 @@ def _flush_to_disk(suite):
     """CHECKPOINT (Postgres; FAILED and ignored elsewhere) then sync."""
     suite.exec(["CHECKPOINT"], timed=False)
     os.sync()
+
+
+DEFAULT_STORAGE_SAMPLE_SEC = 5.0
+DEFAULT_OP_STALL_SEC = 600.0
+
+
+class StallWatchdog(threading.Thread):
+    """Cancels any single operation (a verb or an exec) that has been
+    running for longer than ``threshold``: the operation fails with a
+    note naming the stall, and the workflow goes on, so what follows
+    (later failures, invariant results) is recorded too. Checks every
+    ``interval`` seconds; the collector's ``stalls`` list what it
+    cancelled and whether each failed or completed anyway."""
+
+    def __init__(self, collector, threshold: float, interval: float = None, log=print):
+        super().__init__(daemon=True, name="stall-watchdog")
+        self.collector = collector
+        self.threshold = threshold
+        # A quarter of the threshold, between 0.5 s and 5 s.
+        self.interval = interval if interval is not None else min(5.0, max(0.5, threshold / 4.0))
+        self.log = log
+        self._stop = threading.Event()
+
+    def run(self):
+        while not self._stop.wait(self.interval):
+            for o in self.collector.stalled_ops(self.threshold):
+                if o["cancelled"]:
+                    continue
+                desc = f"{o['op']} on {o['ref'] or '?'}" + (f" ({o['label']})" if o["label"] else "")
+                note = f"stalled: cancelled after {o['elapsed_sec']:.0f}s (limit {self.threshold:.0f}s)"
+                if self.collector.cancel_op(o["token"], note):
+                    self.log(f"Stall watchdog: {desc} {note}; the operation fails and the run goes on")
+
+    def stop(self):
+        self._stop.set()
+
+
+class StorageSampler(threading.Thread):
+    """Records the backend's storage size every ``interval`` seconds while
+    the scenario runs: (wall-clock seconds, bytes) pairs, cheap enough to
+    stay on by default (one directory walk per sample) and attributable to
+    workflow phases through the operation rows' timestamps."""
+
+    def __init__(self, suite, interval: float):
+        super().__init__(daemon=True, name="storage-sampler")
+        self.suite = suite
+        self.interval = interval
+        self.samples: list = []
+        self._stop = threading.Event()
+
+    def run(self):
+        while not self._stop.is_set():
+            t = time.time()
+            self.samples.append((round(t, 3), self.suite._safe_storage()))
+            self._stop.wait(self.interval)
+
+    def stop(self):
+        self._stop.set()
+        self.join(timeout=60)
+
+
+def storage_sample_interval(config, cli_value) -> float:
+    """Seconds between samples: the CLI value if given, else the config's
+    (0 = the default); 0 or a negative value turns the sampler off."""
+    if cli_value is not None:
+        return max(0.0, float(cli_value))
+    v = float(config.storage_sample_interval_sec or 0)
+    if v == 0:
+        return DEFAULT_STORAGE_SAMPLE_SEC
+    return max(0.0, v)
 
 
 def _capabilities_for(backend) -> dict:
@@ -177,6 +248,13 @@ def main(argv=None):
                         help="Measure disk_size_before/after around each timed operation.")
     parser.add_argument("--max-runtime-sec", type=int, default=0,
                         help="Cap the scenario runtime in seconds (0 = no limit).")
+    parser.add_argument("--op-stall-sec", type=float, default=DEFAULT_OP_STALL_SEC,
+                        help="Cancel one operation (verb or exec) once it has run longer than "
+                             "this many seconds; it fails and the run goes on "
+                             f"(default {DEFAULT_OP_STALL_SEC:g}; 0 = off).")
+    parser.add_argument("--storage-sample-interval", type=float, default=None,
+                        help="Seconds between background storage samples during the "
+                             f"scenario (default {DEFAULT_STORAGE_SAMPLE_SEC:g}; 0 = off).")
     args = parser.parse_args(argv)
 
     try:
@@ -204,13 +282,20 @@ def main(argv=None):
         print("Storage measurement: enabled")
     if args.max_runtime_sec:
         print(f"Runtime cap: {args.max_runtime_sec}s")
+    if args.op_stall_sec > 0:
+        print(f"Operation stall limit: {args.op_stall_sec:g}s")
+    sample_sec = storage_sample_interval(config, args.storage_sample_interval)
+    print(f"Storage sampling: every {sample_sec:g}s" if sample_sec > 0 else "Storage sampling: off")
 
     backend_mgr = BackendManager(
         BackendSetup(backend=config.backend, database_setup=config.database_setup)
     )
     backend_info = backend_mgr.setup()
 
-    collector = rc.ResultCollector(run_id=config.run_id, output_dir=args.outdir)
+    # A long run with a spine load emits millions of rows; spill them to
+    # the parquet file as they come so the run's memory stays bounded.
+    collector = rc.ResultCollector(run_id=config.run_id, output_dir=args.outdir,
+                                   spill_rows=int(os.environ.get("MACRO_SPILL_ROWS", "200000")))
     # Per-op storage is too expensive on Neon (pg_database_size per branch).
     measure_storage = config.measure_storage and config.backend != tp.Backend.NEON
     db_name = config.database_setup.db_name
@@ -234,14 +319,21 @@ def main(argv=None):
     if config.database_setup.WhichOneof("source") != "existing_db":
         seed_stats = setup_data(config, scenario, setup_suite)
 
-    storage_before = 0
-    if measure_storage:
-        try:
-            _flush_to_disk(setup_suite)
-            storage_before = setup_suite._storage_bytes()
-            print(f"Storage before workflow: {storage_before} bytes")
-        except Exception as e:
-            print(f"Warning: could not measure storage before workflow: {e}")
+    # Workflow-level storage points (always on; a directory walk each):
+    # after setup, after the scenario (its branches deleted), after the
+    # backend's GC/flush, and after the database itself is dropped.
+    storage_points = {}
+    try:
+        _flush_to_disk(setup_suite)
+    except Exception as e:
+        print(f"Warning: flush before the workflow failed: {e}")
+    storage_points["after_setup"] = setup_suite._safe_storage()
+    storage_before = storage_points["after_setup"]
+    print(f"Storage after setup: {storage_before} bytes ({setup_suite.STORAGE_SCOPE} scope)")
+    sampler = None
+    if sample_sec > 0:
+        sampler = StorageSampler(setup_suite, sample_sec)
+        sampler.start()
 
     progress = SharedProgress(total=scenario.total_units(),
                               desc=f"{scenario.name} ({backend_name})",
@@ -263,9 +355,23 @@ def main(argv=None):
 
     deadline_timer = None
     if args.max_runtime_sec:
-        deadline_timer = threading.Timer(args.max_runtime_sec, ctx.cancel_all)
+        deadline_timer = threading.Timer(
+            args.max_runtime_sec, ctx.cancel_all, args=(f"runtime cap of {args.max_runtime_sec}s reached",))
         deadline_timer.daemon = True
         deadline_timer.start()
+    watchdog = None
+    if args.op_stall_sec > 0:
+        watchdog = StallWatchdog(collector, args.op_stall_sec, log=ctx.note)
+        watchdog.start()
+
+    # An interrupt (Ctrl-C, SIGTERM) stops the scenario the way the runtime
+    # cap does: the workers see the stop event, the run is recorded as
+    # interrupted and its rows and stats are still written.
+    def _on_signal(signum, frame):
+        name = signal.Signals(signum).name
+        print(f"\nSignal {name}: stopping the scenario...", flush=True)
+        ctx.cancel_all(f"signal {name}")
+    previous_handlers = {s: signal.signal(s, _on_signal) for s in (signal.SIGINT, signal.SIGTERM)}
 
     print(f"\nStarting scenario {scenario.name}...")
     start_time = time.time()
@@ -280,26 +386,46 @@ def main(argv=None):
         status = f"crashed: {type(e).__name__}: {e}"
         traceback.print_exc()
     finally:
+        for s, h in previous_handlers.items():
+            signal.signal(s, h)
         if deadline_timer is not None:
             deadline_timer.cancel()
+        if watchdog is not None:
+            watchdog.stop()
         if spine_load is not None:
             spine_load.stop()
         progress.close()
         elapsed = time.time() - start_time
-        timed_out = bool(args.max_runtime_sec) and ctx.stop_event.is_set()
+        stopped = ctx.stop_event.is_set()
+        timed_out = bool(args.max_runtime_sec) and stopped and elapsed >= args.max_runtime_sec
+        if status == "completed" and stopped:
+            status = "interrupted"
+        # The scenario ran to its end, but an operation the watchdog
+        # cancelled never finished: the workflow is incomplete.
+        stalled_failed = [st for st in collector.stalls if st["outcome"] == "failed"]
+        if status == "completed" and stalled_failed:
+            status = "incomplete"
         print(f"\nScenario {status} in {elapsed:.1f}s")
-        if timed_out:
-            print("Run terminated early due to runtime cap.")
+        if status == "incomplete":
+            print(f"{len(stalled_failed)} operation(s) stalled and were cancelled (see 'stalls' in the e2e stats)")
+        if stopped:
+            print(f"Run stopped early: {ctx.stop_reason or 'stop requested'}")
 
-        storage_after = 0
-        if measure_storage:
-            try:
-                _flush_to_disk(setup_suite)
-                storage_after = setup_suite._storage_bytes()
-                print(f"Storage after workflow: {storage_after} bytes "
-                      f"(delta {storage_after - storage_before})")
-            except Exception as e:
-                print(f"Warning: could not measure storage after workflow: {e}")
+        if sampler is not None:
+            sampler.stop()
+        try:
+            _flush_to_disk(setup_suite)
+        except Exception as e:
+            print(f"Warning: flush after the workflow failed: {e}")
+        storage_after = storage_points["after_workflow"] = setup_suite._safe_storage()
+        print(f"Storage after workflow: {storage_after} bytes "
+              f"(delta {storage_after - storage_before})")
+        gc_result = setup_suite.gc()
+        if gc_result.ok:
+            os.sync()
+        storage_points["after_gc"] = setup_suite._safe_storage()
+        print(f"Storage after gc ({gc_result.status_name}, {gc_result.latency:.1f}s): "
+              f"{storage_points['after_gc']} bytes")
         ctx.close_suite(setup_suite)
 
         neon_consumption = None
@@ -308,6 +434,23 @@ def main(argv=None):
                 backend_info.neon_project_id, label="after")
 
         inv = invariants.summary()
+
+        # Drop the database before the record is written so the last
+        # storage point sees the server without it.
+        for attempt in range(2):
+            try:
+                backend_mgr.cleanup()
+                break
+            except Exception as e:
+                if attempt == 0:
+                    print(f"Cleanup failed ({type(e).__name__}), retrying...")
+                    time.sleep(2)
+                else:
+                    print(f"Cleanup failed after retry: {e}")
+        os.sync()
+        storage_points["after_cleanup"] = setup_suite._safe_storage()
+        print(f"Storage after cleanup: {storage_points['after_cleanup']} bytes")
+
         e2e = {
             "run_id": config.run_id,
             "backend": backend_name,
@@ -316,6 +459,9 @@ def main(argv=None):
             "elapsed_sec": round(elapsed, 2),
             "max_runtime_sec": args.max_runtime_sec,
             "timed_out": timed_out,
+            "stop_reason": ctx.stop_reason if stopped else "",
+            "op_stall_sec": args.op_stall_sec,
+            "stalls": list(collector.stalls),
             "seed": ctx.seed,
             "schema": MessageToDict(config.schema),
             "workload": MessageToDict(config.workload),
@@ -326,13 +472,26 @@ def main(argv=None):
             "metrics": ctx.metrics,
         }
         e2e.update(collector.support_summary())
+        observed = getattr(type(setup_suite), "OBSERVED", None)
+        if observed:
+            e2e["backend_observations"] = dict(observed)
         if spine_load is not None:
             e2e["spine_load"] = {"transactions": spine_load.counts,
                                  "failures": spine_load.failures}
-        if config.measure_storage:
-            e2e["storage_before_bytes"] = storage_before
-            e2e["storage_after_bytes"] = storage_after
-            e2e["storage_delta_bytes"] = storage_after - storage_before
+        e2e["storage_before_bytes"] = storage_before
+        e2e["storage_after_bytes"] = storage_after
+        e2e["storage_delta_bytes"] = storage_after - storage_before
+        e2e["storage"] = {
+            "unit": "bytes",
+            "scope": setup_suite.STORAGE_SCOPE,
+            "points": storage_points,
+            "gc": {"status": gc_result.status_name, "latency_sec": round(gc_result.latency, 3),
+                   "error": gc_result.error},
+            "per_operation": measure_storage,
+            "sample_interval_sec": sample_sec,
+            "run_start_time": round(start_time, 3),
+            "samples": sampler.samples if sampler is not None else [],
+        }
         if neon_consumption:
             e2e["neon_metrics_count"] = neon_consumption.get("count", 0)
             e2e["neon_all_metrics"] = neon_consumption.get("all_metrics", [])
@@ -353,19 +512,12 @@ def main(argv=None):
                 print(f"  FAILED {r['name']}: {r['detail']}")
         if ctx.metrics:
             print(f"Metrics: {json.dumps(ctx.metrics, default=str)}")
+        if collector.stalls:
+            print(f"Stalled operations cancelled: {len(collector.stalls)}")
+            for st in collector.stalls:
+                print(f"  {st['op']} on {st['ref'] or '?'} ({st['label']}) after {st['elapsed_sec']}s: {st['outcome']}")
 
         collector.write_to_parquet(append=False)
-
-        for attempt in range(2):
-            try:
-                backend_mgr.cleanup()
-                break
-            except Exception as e:
-                if attempt == 0:
-                    print(f"Cleanup failed ({type(e).__name__}), retrying...")
-                    time.sleep(2)
-                else:
-                    print(f"Cleanup failed after retry: {e}")
 
 
 if __name__ == "__main__":
