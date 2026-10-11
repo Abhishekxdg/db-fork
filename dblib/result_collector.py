@@ -342,18 +342,35 @@ class ResultCollector:
         counts = {}
         for r in rows:
             name = rslt.OpType.Name(r.op_type)
-            c = counts.setdefault(name, {"ok": 0, "unsupported": 0, "failed": 0})
+            c = counts.setdefault(name, {"ok": 0, "unsupported": 0, "failed": 0, "ok_seconds": 0.0})
             if r.status == rslt.OpStatus.OK:
                 c["ok"] += 1
+                c["ok_seconds"] += r.latency
             elif r.status == rslt.OpStatus.UNSUPPORTED:
                 c["unsupported"] += 1
             else:
                 c["failed"] += 1
+        for c in counts.values():
+            c["ok_seconds"] = round(c["ok_seconds"], 6)
         return {
             "workflow_supported": not unsupported,
             "unsupported_ops": unsupported,
             "op_status_counts": counts,
+            # Rows that fell back to a branch head because a commit ref was
+            # unavailable: the history the scenario asked for was not used.
+            "commit_ref_fallbacks": sum(1 for r in rows if r.commit_ref_fallback),
         }
+
+    def failed_verbs(self) -> dict:
+        """FAILED verb and exec rows by label: the failures a scenario must
+        account for, as opposed to per-statement rows inside an exec."""
+        with self._lock:
+            rows = list(self.results)
+        out = {}
+        for r in rows:
+            if r.op_type in VERB_OP_TYPES and r.status == rslt.OpStatus.FAILED:
+                out[r.label] = out.get(r.label, 0) + 1
+        return out
 
     def write_to_parquet(self, filename: str = None, append: bool = True):
         """Write all collected rows to a parquet file, appending if it

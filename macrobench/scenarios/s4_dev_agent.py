@@ -25,6 +25,12 @@ from macrobench.datagen.ch import DISTRICTS_PER_WAREHOUSE
 
 SPINE_SENTINEL_BASE = 100_000
 REVIEW_IDLE_SEC = 0.05
+MISSING_RELATION = ("does not exist", "doesn't exist", "no such table", "table not found", "unknown table")
+
+
+def _missing_relation(error: str) -> bool:
+    """The backend said the table is not there, in any dialect's words."""
+    return any(m in (error or "").lower() for m in MISSING_RELATION)
 SPINE_COMMIT_PERIOD_SEC = 2.0
 
 # Spine migration catalog M1-M5: (name, target table, ddl(k)).
@@ -136,7 +142,7 @@ class DevAgentScenario(Scenario):
         res = ctx.branch(suite, branch, ctx.spine, label="dev_branch")
         if not res.ok:
             ctx.note(f"dev branch {branch}: {res.status_name} {res.error}")
-            ctx.tick(p.dev_phase_steps + p.review_phase_steps)
+            ctx.tick(p.dev_phase_steps + p.review_phase_steps, outcome="failed")
             return None
         # Spine sentinel: inserted on the spine after the branch exists.
         sentinel_id = SPINE_SENTINEL_BASE + i
@@ -161,19 +167,20 @@ class DevAgentScenario(Scenario):
         # Dev phase.
         for step in range(1, p.dev_phase_steps + 1):
             ctx.check_stop()
+            outcome = "succeeded"
             if step == 1:
-                w.exec(self._feature_ddl(i), branch, label="feature_ddl")
+                ok = w.exec(self._feature_ddl(i), branch, label="feature_ddl").ok
             else:
-                w.exec(self._backfill_script(i, step, chunk, rng), branch, label="backfill")
+                ok = w.exec(self._backfill_script(i, step, chunk, rng), branch, label="backfill").ok
                 chunk += ctx.statements_per_step
             committed = ctx.should_commit(step - 1, last_step=(step == p.dev_phase_steps))
             if committed:
-                w.commit(branch, f"dev {i} step {step}", label="dev_commit")
+                ok &= w.commit(branch, f"dev {i} step {step}", label="dev_commit").ok
             with self._counter_lock:
                 self._dev_steps += 1
             if step in rebase_steps:
                 if not committed:  # a rebase needs a clean working set
-                    w.commit(branch, f"dev {i} step {step} (pre-rebase)", label="dev_commit")
+                    ok &= w.commit(branch, f"dev {i} step {step} (pre-rebase)", label="dev_commit").ok
                 if rebases_done == 0:
                     inv.expect(f"S4.2a spine sentinel invisible on {branch} before rebase",
                                sentinel_visible(), 0)
@@ -185,6 +192,9 @@ class DevAgentScenario(Scenario):
                 elif rb.failed:
                     ctx.bump_metric("rebase_failed")
                     ctx.note(f"{branch} rebase: {rb.error[:120]}")
+                    ok = False
+                elif rb.unsupported:
+                    outcome = "skipped"
                 if rebases_done == 1:
                     if rb.unsupported:
                         inv.not_applicable(f"S4.2b spine sentinel visible on {branch} after rebase",
@@ -192,45 +202,53 @@ class DevAgentScenario(Scenario):
                     else:
                         inv.expect(f"S4.2b spine sentinel visible on {branch} after rebase",
                                    sentinel_visible(), 1, f"rebase {rb.status_name}")
-            ctx.tick()
+            ctx.tick(outcome=outcome if ok else "failed")
 
         # Review phase: quiet, occasional modification.
         modified = False
         for step in range(1, p.review_phase_steps + 1):
             ctx.check_stop()
+            ok = True
             if rng.random() < p.review_modification_prob:
-                w.exec([("UPDATE loyalty_tier SET min_payment = min_payment + 1 WHERE tier_id = 2", None),
-                        ("SELECT COUNT(*) FROM loyalty_event", None)],
-                       branch, label="review_edit")
+                ok = w.exec([("UPDATE loyalty_tier SET min_payment = min_payment + 1 WHERE tier_id = 2", None),
+                             ("SELECT COUNT(*) FROM loyalty_event", None)],
+                            branch, label="review_edit").ok
                 modified = True
                 if ctx.should_commit(step - 1):
-                    w.commit(branch, f"dev {i} review {step}", label="dev_commit")
+                    ok &= w.commit(branch, f"dev {i} review {step}", label="dev_commit").ok
                     modified = False
             else:
                 time.sleep(REVIEW_IDLE_SEC)
-            ctx.tick()
+            ctx.tick(outcome="succeeded" if ok else "failed")
         if modified:
             w.commit(branch, f"dev {i} review end", label="dev_commit")
 
         # Invariant: feature data never leaks into production.
         # MySQL-protocol backends list every database's tables in
         # information_schema, so count only the current one there.
+        # Untimed probes: a dialect that lacks one form is expected to fail it.
         r = suite.exec([("SELECT COUNT(*) FROM information_schema.tables "
                          "WHERE table_name = %s AND table_schema = DATABASE()",
-                         ("loyalty_tier",))], refs=[ctx.spine], label="invariant")[0]
+                         ("loyalty_tier",))], refs=[ctx.spine], timed=False)[0]
         if not r.ok:
             r = suite.exec([("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = %s",
-                             ("loyalty_tier",))], refs=[ctx.spine], label="invariant")[0]
+                             ("loyalty_tier",))], refs=[ctx.spine], timed=False)[0]
         if r.ok and r.rows:
             tables = int(r.rows[0][0])
         else:
             # No information_schema: probe the table itself (untimed, since a
-            # missing table is the expected outcome, not a failed op).
+            # missing table is the expected outcome, not a failed op). Only a
+            # missing-relation error is evidence of absence; anything else
+            # (connection lost, permission, syntax) leaves the question open.
             probe = suite.exec(["SELECT COUNT(*) FROM loyalty_tier"], refs=[ctx.spine],
                                timed=False)[0]
-            tables = 0 if probe.failed else 1
-        inv.expect(f"S4.1 loyalty_tier never on the spine (dev {i})", tables, 0,
-                   "loyalty_tier tables on the spine")
+            tables = 1 if probe.ok else 0 if _missing_relation(probe.error) else None
+        if tables is None:
+            inv.check(f"S4.1 loyalty_tier never on the spine (dev {i})", False,
+                      f"could not probe the spine: {(probe.error or probe.status_name)[:120]}")
+        else:
+            inv.expect(f"S4.1 loyalty_tier never on the spine (dev {i})", tables, 0,
+                       "loyalty_tier tables on the spine")
 
         for _ in range(max(0, ctx.branch_ops.retention_steps)):
             time.sleep(REVIEW_IDLE_SEC)

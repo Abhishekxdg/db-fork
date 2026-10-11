@@ -175,7 +175,10 @@ class FakeSuite(DBToolSuite):
             c = (self.commits[ref.commit][1] if ref.commit
                  else self.branches[ref.branch])
             cur = c.raw.cursor()
-            cur.execute("SELECT count(*) FROM t")
+            try:
+                cur.execute("SELECT count(*) FROM t")
+            except sqlite3.OperationalError:  # schemas without the probe table
+                return 0
             return cur.fetchone()[0]
         return {"rows_a": count(a), "rows_b": count(b)}
 

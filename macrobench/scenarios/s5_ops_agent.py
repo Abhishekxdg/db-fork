@@ -53,23 +53,29 @@ class OpsAgentScenario(Scenario):
             # 1. Production with dense commits; the bad deploy lands at fault_k.
             for k in range(p.spine_commits):
                 ctx.check_stop()
+                ok = True
                 if self.spine_load is None:
-                    suite.exec(lambda db: tpcc.run_transaction(
+                    # TPC-C transactions retry and may still fail: expected spine
+                    # traffic, but only while some of it succeeds (see metrics).
+                    r = suite.exec(lambda db: tpcc.run_transaction(
                         tpcc.pick_transaction(rng), db, rng, ctx.scale),
-                        refs=[ctx.spine], label="spine")
+                        refs=[ctx.spine], label="spine")[0]
+                    ctx.bump_metric("spine_attempted")
+                    if not r.ok:
+                        ctx.bump_metric("spine_failed")
                 else:
                     time.sleep(COMMIT_PERIOD_SEC)
                 with self.quiesced():
                     if k == fault_k:
-                        suite.exec(self._deploy_script(k, fault, fw, fd, bad=True),
-                                   refs=[ctx.spine], label="bad_deploy")
+                        ok = suite.exec(self._deploy_script(k, fault, fw, fd, bad=True),
+                                        refs=[ctx.spine], label="bad_deploy")[0].ok
                     elif k % 5 == 0:
-                        suite.exec(self._deploy_script(k, None, fw, fd, bad=False),
-                                   refs=[ctx.spine], label="deploy")
+                        ok = suite.exec(self._deploy_script(k, None, fw, fd, bad=False),
+                                        refs=[ctx.spine], label="deploy")[0].ok
                     c = suite.commit(ctx.spine, f"prod commit {k}", label="spine_commit")
                 commits.append((k, c.value if (c.ok and c.value) else None,
                                 datetime.now().isoformat(timespec="seconds")))
-                ctx.tick()
+                ctx.tick(outcome="succeeded" if ok and c.ok else "failed")
 
             if self.spine_load is not None and not p.load_during_investigation:
                 self.spine_load.stop()
@@ -93,6 +99,7 @@ class OpsAgentScenario(Scenario):
             if target is None:
                 inv.not_applicable("S5.2 head sentinel gone after reset", "no investigation results")
                 reset = None
+                ctx.tick(outcome="failed")
             else:
                 to = target["hash"] or target["timestamp"]
                 with self.quiesced():
@@ -112,14 +119,13 @@ class OpsAgentScenario(Scenario):
                     else:
                         inv.not_applicable("S5.2 head sentinel gone after reset",
                                            f"selected commit {target['k']} is after the bad deploy {fault_k}")
+                ctx.tick(outcome="skipped" if reset.unsupported else "succeeded" if reset.ok else "failed")
             ctx.add_metric("time_to_recovery_sec", round(time.time() - t_start, 3))
-            ctx.tick()
 
             # 4. Delete the investigation branches.
             for f in findings:
                 if isinstance(f, dict):
                     ctx.delete(suite, f["branch"], label="investigation_delete")
-                    ctx.tick()
         finally:
             ctx.close_suite(suite)
 
@@ -142,10 +148,12 @@ class OpsAgentScenario(Scenario):
         k, h, ts = commit
         branch = f"inv_{k}"
         ref = f"{ctx.spine}@{h}" if h else ctx.spine
+        if not h:  # investigating the head instead of the historical commit
+            ctx.bump_metric("history_ref_fallbacks")
         res = ctx.branch(suite, branch, ref, label="investigation_branch")
         if not res.ok:
             ctx.note(f"investigation branch {branch}: {res.status_name} {res.error}")
-            ctx.tick()
+            ctx.tick(outcome="failed")
             return None
 
         def script(db):
@@ -162,7 +170,7 @@ class OpsAgentScenario(Scenario):
         r = w.exec(script, branch, label="investigate")
         value = r.value if (r.ok and isinstance(r.value, dict)) else {"violations": {}, "bad_deploy_rows": None}
         suite.diff(ctx.spine, branch, label="investigate_diff")
-        w.commit(branch, f"findings at commit {k}", label="findings_commit")
+        c = w.commit(branch, f"findings at commit {k}", label="findings_commit")
         if k < fault_k:
             if h is None:
                 inv.not_applicable(f"S5.1 head sentinel absent on branch from commit {k}",
@@ -170,7 +178,7 @@ class OpsAgentScenario(Scenario):
             else:
                 inv.expect(f"S5.1 head sentinel absent on branch from commit {k}",
                            value["bad_deploy_rows"], 0)
-        ctx.tick()
+        ctx.tick(outcome="succeeded" if r.ok and c.ok else "failed")
         return {"k": k, "hash": h, "timestamp": ts, "branch": branch,
                 "all_hold": faults.all_hold(value["violations"]),
                 "violations": value["violations"]}

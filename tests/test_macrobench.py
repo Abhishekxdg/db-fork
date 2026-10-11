@@ -13,6 +13,7 @@ from dblib.db_api import DBToolSuite
 from macrobench import faults, schema, task_pb2 as tp
 from macrobench.datagen.ch import CHScale, CHGenerator, seed_ch
 from macrobench.intensity import apply_intensity
+from macrobench.runner import setup_outcome, timed_work_allowed
 from macrobench.scenarios.base import InvariantFailed, InvariantRecorder
 from macrobench.tpcc import Quiescer
 from tests.fake_backend import FakeSuite
@@ -239,3 +240,42 @@ def test_run_transaction_retries_then_raises(suite):
     finally:
         del tpcc.TRANSACTIONS["flaky"]
     assert not res.ok and calls["n"] == 3
+
+
+def test_timed_work_waits_for_a_complete_setup():
+    """One gate for the workflow and the background spine load: a failed setup
+    starts neither, so no timed row can come from a broken database."""
+    assert timed_work_allowed("completed")
+    for status in ("setup_failed: SetupFailed: seed commit FAILED", "crashed: KeyError: x", "interrupted", ""):
+        assert not timed_work_allowed(status)
+    source = open(__import__("macrobench.runner", fromlist=["x"]).__file__).read()
+    assert source.count("timed_work_allowed(status)") == 3, "scenario.run, the spine load and the log line share the gate"
+
+
+def test_setup_outcome_needs_positive_evidence():
+    assert setup_outcome({}) == "setup produced no schema or seed-commit evidence"
+    assert setup_outcome({"schema_failed": [("CREATE TABLE x", "boom")], "seed_commit": "OK"}) \
+        == "1 schema statements failed"
+    assert setup_outcome({"schema_failed": [], "seed_commit": "FAILED"}) == "seed commit FAILED"
+    assert setup_outcome({"schema_failed": [], "seed_commit": "OK"}) is None
+
+
+def test_support_summary_separates_failed_verbs_from_statements(suite):
+    suite.exec(["CREATE TABLE t (id INT PRIMARY KEY)"], refs=["main"], label="setup")
+    # A statement that fails inside a script the script recovers from is a FAILED
+    # statement row inside an OK exec; a verb that fails is a FAILED verb row.
+    def recovering(db):
+        try:
+            db.sql("INSERT INTO nowhere VALUES (1)")
+        except Exception:
+            pass
+        db.sql("INSERT INTO t VALUES (1)")
+    assert suite.exec(recovering, refs=["main"], label="step")[0].ok
+    assert suite.exec(["INSERT INTO nowhere VALUES (2)"], refs=["main"], label="spine")[0].failed
+    assert suite.exec(["INSERT INTO nowhere VALUES (3)"], refs=["main"], label="step")[0].failed
+    summary = suite.result_collector.support_summary()
+    assert summary["op_status_counts"]["EXEC"]["failed"] == 2
+    assert summary["op_status_counts"]["INSERT"]["failed"] == 3
+    assert summary["commit_ref_fallbacks"] == 0
+    assert summary["op_status_counts"]["EXEC"]["ok_seconds"] > 0
+    assert suite.result_collector.failed_verbs() == {"spine": 1, "step": 1}

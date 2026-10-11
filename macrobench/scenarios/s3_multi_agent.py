@@ -142,6 +142,8 @@ class MultiAgentScenario(Scenario):
         ctx, p, inv = self.ctx, self.params, self.ctx.invariants
         c = suite.commit(ctx.spine, f"checkpoint {r}", label="checkpoint")
         checkpoint = f"{ctx.spine}@{c.value}" if (c.ok and c.value) else ctx.spine
+        if checkpoint == ctx.spine:  # agents branch from the moving head, not a fixed checkpoint
+            ctx.bump_metric("history_ref_fallbacks")
         self._merge_order = []
         before = self._sentinel_status(suite)
 
@@ -225,11 +227,11 @@ class MultiAgentScenario(Scenario):
         res = ctx.branch(suite, branch, checkpoint, label="agent_branch")
         if not res.ok:
             ctx.note(f"agent {a}: branch {res.status_name} {res.error}")
-            ctx.tick()
+            ctx.tick(outcome="failed")
             return None
         sentinel_value = f"r{r}-a{a}"
-        w.exec(self._revision_script(w, r, a, sentinel_value), branch, label="revise")
-        w.commit(branch, f"agent {a} plan revision LOGSENTINEL-{r}-{a}", label="agent_commit")
+        ok = w.exec(self._revision_script(w, r, a, sentinel_value), branch, label="revise").ok
+        ok &= w.commit(branch, f"agent {a} plan revision LOGSENTINEL-{r}-{a}", label="agent_commit").ok
         # History access needed for resolution: both sides since divergence.
         suite.log(branch, limit=5, label="history")
         suite.log(ctx.spine, limit=10, label="history")
@@ -246,7 +248,7 @@ class MultiAgentScenario(Scenario):
         if not m.ok:
             ctx.note(f"agent {a} round {r}: merge {m.status_name}: {m.error[:120]}")
         ctx.delete(suite, branch, label="agent_delete")
-        ctx.tick()
+        ctx.tick(outcome="skipped" if m.unsupported else "succeeded" if ok and m.ok else "failed")
         return m.status_name
 
     def _revision_script(self, w: Worker, r: int, a: int, sentinel_value: str):

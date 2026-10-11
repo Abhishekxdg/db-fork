@@ -85,3 +85,158 @@ def test_scenario_runs_to_completion_on_fake_backend(key):
     assert summary["failed"] == 0, [r for r in summary["results"] if r["passed"] is False]
     # Every branch the scenario made was deleted again.
     assert suite.list_branches() == ["main"], suite.list_branches()
+    # Every planned unit reached exactly one terminal outcome, none escaped as an exception.
+    work = ctx.work
+    assert work["succeeded"] + work["failed"] + work["skipped"] == scenario.total_units(), work
+    assert work["failed"] == 0 and ctx.worker_errors == [], (work, ctx.worker_errors)
+    assert (work["skipped"] > 0) == (key in NEEDS_MERGE), (key, work)
+    assert collector.failed_verbs() == {}, collector.failed_verbs()
+
+
+def _run(key, **overrides):
+    cfg = _config(key)
+    for name, value in overrides.items():
+        setattr(getattr(cfg.workload, key), name, value)
+    collector = rc.ResultCollector()
+    suite = FakeSuite(collector)
+    ctx = ScenarioContext(config=cfg, suite_factory=lambda: suite, collector=collector,
+                          spine="main", invariants=InvariantRecorder(), log=lambda m: None)
+    scenario = create_scenario(ctx)
+    schema.apply_schema(suite, "main", cfg.schema, key, log=lambda m: None)
+    if cfg.schema.base == tp.BaseSchema.CH_BENCH:
+        seed_ch(suite, "main", CHScale.from_config(cfg.schema), log=lambda m: None)
+    scenario.seed(suite)
+    suite.commit("main", "seed", timed=False)
+    return ctx, scenario, suite
+
+
+def test_worker_exception_is_recorded_not_swallowed():
+    ctx, scenario, suite = _run("rl_env")
+    calls = {"n": 0}
+    original = scenario._run_task
+
+    def flaky(w, task_id):
+        calls["n"] += 1
+        if task_id == 2:
+            raise RuntimeError("agent died")
+        return original(w, task_id)
+
+    scenario._run_task = flaky
+    scenario.run()
+    assert calls["n"] == 2
+    assert [e["error"] for e in ctx.worker_errors] == ["RuntimeError: agent died"]
+    assert ctx.work["succeeded"] < scenario.total_units(), ctx.work
+    assert ctx.metrics["tasks_completed"] == 1
+
+
+class _BranchlessSuite(FakeSuite):
+    """branch() always fails: S1 can never grow a rollout leaf."""
+
+    def _branch_impl(self, name, from_ref):
+        raise RuntimeError("no branches today")
+
+
+def test_s1_rollouts_are_bounded_and_report_their_shortfall():
+    cfg = _config("rl_env")
+    collector = rc.ResultCollector()
+    suite = _BranchlessSuite(collector)
+    ctx = ScenarioContext(config=cfg, suite_factory=lambda: suite, collector=collector,
+                          spine="main", invariants=InvariantRecorder(), log=lambda m: None)
+    scenario = create_scenario(ctx)
+    schema.apply_schema(suite, "main", cfg.schema, "rl_env", log=lambda m: None)
+    seed_ch(suite, "main", CHScale.from_config(cfg.schema), log=lambda m: None)
+    suite.commit("main", "seed", timed=False)
+    scenario.run()  # terminates without a runtime cap
+    p = cfg.workload.rl_env
+    assert ctx.metrics["leaf_shortfall"] == p.tasks * p.group_size
+    assert ctx.metrics["leaves"] == 0
+    assert ctx.work["failed"] == scenario.total_units(), ctx.work
+    # Each leaf got at most two attempts, so the attempt count is fixed by config.
+    branches = collector.support_summary()["op_status_counts"]["BRANCH"]
+    assert branches["failed"] == p.tasks * (1 + 2 * p.group_size)
+    failed = collector.failed_verbs()
+    assert (failed["task_branch"], failed["rollout_branch"]) == (p.tasks, 2 * p.tasks * p.group_size)
+    assert ctx.invariants.summary()["not_applicable"] == p.tasks
+
+
+def test_history_ref_fallback_is_counted():
+    ctx, scenario, suite = _run("ops_agent")
+    original = suite._commit_impl
+    suite._commit_impl = lambda ref, message: None  # commits succeed but return no hash
+    try:
+        scenario.run()
+    finally:
+        suite._commit_impl = original
+    assert ctx.metrics["history_ref_fallbacks"] >= 1
+
+
+def test_s6_integrity_mismatch_is_a_failed_unit_and_a_failed_check():
+    """A load step whose derived revenue disagrees with the inserted order lines
+    is corrupt output: never a succeeded unit, never a passed S6.2."""
+    ctx, scenario, suite = _run("data_agent", reset_prob=0.0)
+    original = scenario._load_step
+
+    def tampered(*args, **kwargs):
+        script = original(*args, **kwargs)
+
+        def wrapped(db):
+            result = script(db)  # the real SQL runs; only the integrity verdict is forged
+            return {**result, "mismatches": 1}
+        return wrapped
+
+    scenario._load_step = tampered
+    scenario.run()
+    assert ctx.work["failed"] >= 1, ctx.work
+    summary = ctx.invariants.summary()
+    failed = [r["name"] for r in summary["results"] if r["passed"] is False]
+    assert failed and all(n.startswith("S6.2") for n in failed), summary["results"]
+    assert ctx.metrics["integrity_mismatches"] >= 1
+
+
+def test_s5_spine_traffic_that_always_fails_leaves_evidence(monkeypatch):
+    """Expected spine failures are only "recovered" while other spine transactions
+    succeed; the metrics must show that all of production failed."""
+    from macrobench import tpcc
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("production is down")
+    monkeypatch.setattr(tpcc, "run_transaction", broken)
+    ctx, scenario, suite = _run("ops_agent")
+    scenario.run()
+    assert ctx.metrics["spine_attempted"] > 0
+    assert ctx.metrics["spine_failed"] == ctx.metrics["spine_attempted"]
+    assert ctx.collector.failed_verbs().get("spine") == ctx.metrics["spine_failed"]
+
+
+class _ProbeLostSuite(FakeSuite):
+    """Every untimed probe of the spine fails with a connection error."""
+
+    def exec(self, script, refs=None, **kwargs):
+        from dblib.db_api import ExecResult, OpStatus
+        text = script if isinstance(script, str) else str(script)
+        if kwargs.get("timed") is False and ("information_schema" in text or "loyalty_tier" in text):
+            return [ExecResult(op="exec", status=OpStatus.FAILED, ref="main", refs=["main"], error="connection lost")]
+        return super().exec(script, refs, **kwargs)
+
+
+def test_s4_isolation_check_fails_when_the_spine_cannot_be_probed():
+    """Only a missing-relation error proves the table is absent. A probe that
+    fails for any other reason cannot pass S4.1."""
+    from macrobench.scenarios.s4_dev_agent import _missing_relation
+    assert _missing_relation('relation "loyalty_tier" does not exist')
+    assert _missing_relation("Table 'x.loyalty_tier' doesn't exist") and _missing_relation("no such table: loyalty_tier")
+    assert _missing_relation("table not found: loyalty_tier") and not _missing_relation("connection lost")
+    cfg = _config("dev_agent")
+    collector = rc.ResultCollector()
+    suite = _ProbeLostSuite(collector)
+    inv = InvariantRecorder()
+    ctx = ScenarioContext(config=cfg, suite_factory=lambda: suite, collector=collector,
+                          spine="main", invariants=inv, log=lambda m: None)
+    scenario = create_scenario(ctx)
+    schema.apply_schema(suite, "main", cfg.schema, "dev_agent", log=lambda m: None)
+    seed_ch(suite, "main", CHScale.from_config(cfg.schema), log=lambda m: None)
+    scenario.seed(suite)
+    suite.commit("main", "seed", timed=False)
+    scenario.run()
+    s4_1 = [r for r in inv.summary()["results"] if r["name"].startswith("S4.1")]
+    assert s4_1 and all(r["passed"] is False and "connection lost" in r["detail"] for r in s4_1), s4_1

@@ -82,7 +82,9 @@ class RlEnvScenario(Scenario):
         commit = w.commit(task_branch, f"task {task_id}: {fault.name}", label="task_commit")
         task_commit = commit.value if commit.ok else None
         task_ref = f"{task_branch}@{task_commit}" if task_commit else task_branch
-        ctx.tick()
+        if not task_commit:  # rollouts fork from the branch head, not the recorded task state
+            ctx.bump_metric("history_ref_fallbacks")
+        ctx.tick(outcome="succeeded" if res.ok and commit.ok else "failed")
 
         # 2. Rollouts. recorded = [(ref, step)] of every committed step.
         recorded = [(task_ref, 0)]
@@ -91,9 +93,12 @@ class RlEnvScenario(Scenario):
         historical = 0
         per_round = p.rollouts_per_round or p.group_size
         rollout = 0
-        while len(leaves) < p.group_size:
+        # A rollout whose branch fails does not count as a leaf; the task
+        # gets at most two attempts per leaf and then records its shortfall.
+        attempt_budget = 2 * p.group_size
+        while len(leaves) < p.group_size and rollout < attempt_budget:
             ctx.check_stop()
-            for _ in range(min(per_round, p.group_size - len(leaves))):
+            for _ in range(min(per_round, p.group_size - len(leaves), attempt_budget - rollout)):
                 rollout += 1
                 fork_ref, fork_step = recorded[0]
                 # Historical fork: any recorded step with budget left.
@@ -105,8 +110,8 @@ class RlEnvScenario(Scenario):
                 res = ctx.branch(suite, branch, fork_ref, label="rollout_branch")
                 if not res.ok:
                     ctx.note(f"[T{task_id}] rollout branch {branch}: {res.status_name} {res.error}")
-                    ctx.tick()
                     continue
+                ok = True
                 price = round(rollout * 1.25, 2)
                 budget = p.step_budget - fork_step
                 repair_at = rng.randint(1, max(1, budget)) if rng.random() < 0.5 else None
@@ -117,14 +122,19 @@ class RlEnvScenario(Scenario):
                                                fault, fw, fd, fault_state,
                                                repair=(repair_at == i + 1), rng=rng,
                                                create_audit=(fork_step == 0))
-                    w.exec(script, branch, label="rollout_step")
+                    ok &= w.exec(script, branch, label="rollout_step").ok
                     steps_total += 1
                     if ctx.should_commit(i, last_step=(i == budget - 1)):
                         c = w.commit(branch, f"rollout {rollout} step {step}", label="step_commit")
+                        ok &= c.ok
                         if c.ok and c.value:
                             recorded.append((f"{branch}@{c.value}", step))
                 leaves.append((branch, price))
-                ctx.tick()
+                ctx.tick(outcome="succeeded" if ok else "failed")
+        if shortfall := p.group_size - len(leaves):
+            ctx.note(f"[T{task_id}] {shortfall} of {p.group_size} leaves missing after {rollout} rollout attempts")
+            ctx.bump_metric("leaf_shortfall", shortfall)
+            ctx.tick(shortfall, outcome="failed")
 
         # 3. Score the group: cross-branch consistency read + diff per leaf.
         leaf_refs = [b for b, _ in leaves]

@@ -133,6 +133,28 @@ def _fetch_neon_consumption(project_id, label="", wait_min=15, max_retries=10):
     return None
 
 
+class SetupFailed(Exception):
+    """The schema or seed is incomplete; timed work would measure a broken database."""
+
+
+def setup_outcome(stats: dict) -> str | None:
+    """Why setup stats describe a failed setup, or None when they prove a
+    complete one. Missing evidence is a failure too."""
+    if "schema_failed" not in stats or "seed_commit" not in stats:
+        return "setup produced no schema or seed-commit evidence"
+    if stats["schema_failed"]:
+        return f"{len(stats['schema_failed'])} schema statements failed"
+    if stats["seed_commit"] != "OK":
+        return f"seed commit {stats['seed_commit']}"
+    return None
+
+
+def timed_work_allowed(status: str) -> bool:
+    """Only a complete setup may start timed work: the workflow and the background
+    spine load alike. Anything else would measure a broken database."""
+    return status == "completed"
+
+
 def setup_data(config, scenario, suite, log=print) -> dict:
     """Create the schema and seed data on the spine; returns stats."""
     spine = scenario.ctx.spine
@@ -231,8 +253,15 @@ def main(argv=None):
 
     setup_suite = ctx.new_suite()
     seed_stats = {}
+    status = "completed"
     if config.database_setup.WhichOneof("source") != "existing_db":
-        seed_stats = setup_data(config, scenario, setup_suite)
+        try:
+            seed_stats = setup_data(config, scenario, setup_suite)
+            if problem := setup_outcome(seed_stats):
+                raise SetupFailed(problem)
+        except Exception as e:  # recorded in the e2e stats; the workflow never starts
+            status = f"setup_failed: {type(e).__name__}: {e}"
+            traceback.print_exc()
 
     storage_before = 0
     if measure_storage:
@@ -250,7 +279,7 @@ def main(argv=None):
 
     spine_load = None
     data_ops = config.workload.data_ops
-    if data_ops.spine_clients > 0 and scenario.uses_spine_load:
+    if data_ops.spine_clients > 0 and scenario.uses_spine_load and timed_work_allowed(status):
         spine_load = SpineLoad(
             suite_factory, ctx.spine, ctx.scale, clients=data_ops.spine_clients,
             analytical_fraction=data_ops.analytical_fraction,
@@ -267,11 +296,11 @@ def main(argv=None):
         deadline_timer.daemon = True
         deadline_timer.start()
 
-    print(f"\nStarting scenario {scenario.name}...")
+    print(f"\nStarting scenario {scenario.name}..." if timed_work_allowed(status) else f"\nSkipping scenario: {status}")
     start_time = time.time()
-    status = "completed"
     try:
-        scenario.run()
+        if timed_work_allowed(status):
+            scenario.run()
     except ScenarioStopped:
         status = "interrupted"
     except InvariantFailed as e:
@@ -284,6 +313,10 @@ def main(argv=None):
             deadline_timer.cancel()
         if spine_load is not None:
             spine_load.stop()
+            # Expected spine failures are only "recovered" while other spine
+            # transactions succeed; the classifier reads these counters.
+            ctx.bump_metric("spine_attempted", sum(spine_load.counts.values()))
+            ctx.bump_metric("spine_failed", spine_load.failures)
         progress.close()
         elapsed = time.time() - start_time
         timed_out = bool(args.max_runtime_sec) and ctx.stop_event.is_set()
@@ -324,8 +357,16 @@ def main(argv=None):
             "implementation": _implementation_for(config.backend),
             "invariants": inv,
             "metrics": ctx.metrics,
+            # Logical work: what run() set out to do and what each unit came to.
+            "work": {"expected": scenario.total_units(), **ctx.work},
+            "worker_errors": ctx.worker_errors,
         }
         e2e.update(collector.support_summary())
+        failed = collector.failed_verbs()
+        e2e["failed_verbs"] = {
+            "expected": {k: v for k, v in failed.items() if k in scenario.expected_failure_labels},
+            "unexpected": {k: v for k, v in failed.items() if k not in scenario.expected_failure_labels},
+        }
         if spine_load is not None:
             e2e["spine_load"] = {"transactions": spine_load.counts,
                                  "failures": spine_load.failures}
@@ -366,7 +407,8 @@ def main(argv=None):
                     time.sleep(2)
                 else:
                     print(f"Cleanup failed after retry: {e}")
+    return status
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(0 if main() == "completed" else 2)
