@@ -94,6 +94,10 @@ _VERB_OP_TYPES = {
 }
 
 
+class OperationCancelled(RuntimeError):
+    """The operation was aborted (a stall watchdog cancelled it)."""
+
+
 class UnsupportedOperation(Exception):
     """The backend cannot perform this operation at all."""
 
@@ -294,6 +298,7 @@ class Session(_SessionBase):
         re-raises on error."""
         if timed is not None:
             saved, self.timed = self.timed, timed
+        self.suite._check_cancel()   # a stall watchdog cancelled this exec
         rows, error, status, touched = None, "", OpStatus.OK, 0
         start_wall = time.time()
         start = time.perf_counter()
@@ -391,6 +396,10 @@ class DBToolSuite(ABC):
     """
 
     BACKEND_NAME = "base"
+    # What _storage_bytes() covers: "database" (this database and its
+    # branches only) or "server" (the whole server's data directory, for
+    # backends without a per-database directory).
+    STORAGE_SCOPE = "database"
     # Can a ref name a commit ("branch@hash")?
     SUPPORTS_COMMIT_REFS = False
     # Can one SQL statement address several branches (exec mode="multi")?
@@ -513,6 +522,11 @@ class DBToolSuite(ABC):
     def _delete_impl(self, ref: Ref) -> None:
         raise self._unsupported("delete")
 
+    def _gc_impl(self) -> None:
+        """Reclaim or flush storage (Dolt's dolt_gc, a checkpoint, ...)
+        so that a storage measurement reflects what the backend keeps."""
+        raise self._unsupported("gc")
+
     def _qualified_table(self, ref: Ref, table: str) -> str:
         raise self._unsupported("multi_ref_exec")
 
@@ -554,6 +568,42 @@ class DBToolSuite(ABC):
             if cur.description is not None:
                 return cur.fetchall()
             return None
+
+    # ------------------------------------------------------------------
+    # Cancelling the operation in flight (stall watchdog)
+    # ------------------------------------------------------------------
+
+    def cancel_current_op(self) -> None:
+        """Abort the operation this suite is running: cancel the statement
+        on its connection (where the driver supports it) and make the
+        backend's wait loops raise OperationCancelled at their next check.
+        The verb or exec then fails and the workflow goes on."""
+        self._cancel_requested = True
+        conn = getattr(self, "conn", None)
+        cancel = getattr(conn, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                pass
+
+    def _check_cancel(self) -> None:
+        """Backends call this inside waits and between statements."""
+        if getattr(self, "_cancel_requested", False):
+            raise OperationCancelled("operation cancelled")
+
+    def _begin_op(self, op_name: str, ref: str, label: str) -> int:
+        self._cancel_requested = False
+        return self.result_collector.begin_op(op_name, ref, label, cancel=self.cancel_current_op)
+
+    def _end_op(self, token: int, error: str) -> str:
+        """Unregister the operation; a watchdog note is prefixed to the
+        error of a failed operation."""
+        note = self.result_collector.end_op(token, failed=bool(error))
+        self._cancel_requested = False
+        if note and error:
+            return f"{note}; {error}"
+        return error
 
     def _safe_storage(self) -> int:
         try:
@@ -598,12 +648,15 @@ class DBToolSuite(ABC):
         status, value, error, exc = OpStatus.OK, None, "", None
         start_wall = time.time()
         start = time.perf_counter()
+        token = self._begin_op(verb.upper(), str(ref) if ref else "", label)
         try:
             value = fn()
         except UnsupportedOperation as e:
             status, error, exc = OpStatus.UNSUPPORTED, e.reason or str(e), e
         except Exception as e:
             status, error, exc = OpStatus.FAILED, f"{type(e).__name__}: {e}", e
+        finally:
+            error = self._end_op(token, error)
         latency = time.perf_counter() - start if status != OpStatus.UNSUPPORTED else 0.0
         end_wall = time.time()
         after = self._safe_storage() if storage and status != OpStatus.UNSUPPORTED else 0
@@ -732,6 +785,21 @@ class DBToolSuite(ABC):
             storage=storage, label=label, raise_on_error=raise_on_error,
             fallback=fallback,
         )
+
+    def gc(self) -> OpResult:
+        """Run the backend's storage reclamation/flush (see _gc_impl). Not
+        recorded as an operation row; the result carries status and
+        latency for the run's storage summary."""
+        status, error = OpStatus.OK, ""
+        start = time.perf_counter()
+        try:
+            self._gc_impl()
+        except UnsupportedOperation as e:
+            status, error = OpStatus.UNSUPPORTED, e.reason or str(e)
+        except Exception as e:
+            status, error = OpStatus.FAILED, f"{type(e).__name__}: {e}"
+        return OpResult(op="gc", status=status, latency=time.perf_counter() - start,
+                        error=error)
 
     # ------------------------------------------------------------------
     # exec
@@ -866,12 +934,15 @@ class DBToolSuite(ABC):
         exc = None
         start_wall = time.time()
         start = time.perf_counter()
+        token = self._begin_op("EXEC", result.ref, label)
         try:
             result.value = self._run_script(script, session, params, self)
         except UnsupportedOperation as e:
             result.status, result.error, exc = OpStatus.UNSUPPORTED, e.reason or str(e), e
         except Exception as e:
             result.status, result.error, exc = OpStatus.FAILED, f"{type(e).__name__}: {e}", e
+        finally:
+            result.error = self._end_op(token, result.error)
         result.latency = time.perf_counter() - start
         result.statements = session.statements
         result.storage_after = self._safe_storage() if storage else 0

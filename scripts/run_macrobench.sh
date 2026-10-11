@@ -2,8 +2,8 @@
 # Run one macrobenchmark scenario on a backend.
 #
 # Usage:
-#   ./scripts/run_macrobench.sh [--mini] [--outdir DIR] [--max-runtime-sec N] [--measure-storage] \
-#       [--branch-intensity X] [--data-intensity Y] \
+#   ./scripts/run_macrobench.sh [--mini] [--outdir DIR] [--max-runtime-sec N] [--op-stall-sec N] \
+#       [--measure-storage] [--storage-sample-interval SEC] [--branch-intensity X] [--data-intensity Y] \
 #       <scenario> <backend> [scale_factor]
 #
 # Arguments:
@@ -17,6 +17,14 @@
 # Examples:
 #   ./scripts/run_macrobench.sh --mini rl_env dolt
 #   ./scripts/run_macrobench.sh --outdir run_stats --max-runtime-sec 7200 data_agent dolt 5
+#
+# Without --max-runtime-sec the run is capped at one hour times the largest
+# of the scale factor and the intensity multipliers (3600 s at scale 1,
+# intensity 1); a run that reaches the cap is stopped and recorded as
+# interrupted, with its rows and stats written. --max-runtime-sec 0 lifts it.
+# Independently, one operation (a verb or an exec) running for more than
+# --op-stall-sec (default 600) is cancelled: it is recorded FAILED with a
+# stall note and the run goes on (the e2e stats list the stalls).
 
 set -euo pipefail
 
@@ -25,7 +33,10 @@ MEASURE_STORAGE=false
 OUTDIR="run_stats/"
 BRANCH_INTENSITY=""
 DATA_INTENSITY=""
-MAX_RUNTIME_SEC=0
+MAX_RUNTIME_SEC=""
+DEFAULT_CAP_SEC=3600
+STORAGE_SAMPLE_INTERVAL=""
+OP_STALL_SEC=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -35,12 +46,14 @@ while [[ $# -gt 0 ]]; do
         --branch-intensity) BRANCH_INTENSITY="$2"; shift 2 ;;
         --data-intensity)   DATA_INTENSITY="$2"; shift 2 ;;
         --max-runtime-sec) MAX_RUNTIME_SEC="$2"; shift 2 ;;
+        --op-stall-sec)    OP_STALL_SEC="$2"; shift 2 ;;
+        --storage-sample-interval) STORAGE_SAMPLE_INTERVAL="$2"; shift 2 ;;
         *)                 break ;;
     esac
 done
 
 if [[ $# -lt 2 || $# -gt 3 ]]; then
-    echo "Usage: $0 [--mini] [--outdir DIR] [--max-runtime-sec N] [--measure-storage] [--branch-intensity X] [--data-intensity Y] <scenario> <backend> [scale_factor]"
+    echo "Usage: $0 [--mini] [--outdir DIR] [--max-runtime-sec N] [--op-stall-sec N] [--measure-storage] [--storage-sample-interval SEC] [--branch-intensity X] [--data-intensity Y] <scenario> <backend> [scale_factor]"
     echo "  scenario:  rl_env | context_mgmt | multi_agent | dev_agent | ops_agent | data_agent"
     echo "  backend:   dolt | dolt_mysql | seekdb | matrixone | neon | xata | file_copy"
     exit 1
@@ -90,6 +103,15 @@ if [[ -n "$BRANCH_INTENSITY" || -n "$DATA_INTENSITY" ]]; then
     sed -i -e "s|^workload {|workload {\n${INTENSITY_LINES%\\n}|" "$TMP_CONFIG"
 fi
 
+if [[ -z "$MAX_RUNTIME_SEC" ]]; then
+    # One hour at scale 1 / intensity 1, scaled by the largest multiplier.
+    MAX_RUNTIME_SEC=$(awk -v cap="$DEFAULT_CAP_SEC" -v s="${SCALE:-1}" -v b="${BRANCH_INTENSITY:-1}" -v d="${DATA_INTENSITY:-1}" \
+        'BEGIN { m = s; if (b > m) m = b; if (d > m) m = d; if (m < 1) m = 1; printf "%d", cap * m }')
+    CAP_NOTE=" (default: ${DEFAULT_CAP_SEC}s x max(scale, intensity))"
+else
+    CAP_NOTE=""
+fi
+
 echo "=== Macrobench Run ==="
 echo "  Scenario:  $SCENARIO${SUFFIX}"
 echo "  Backend:   $BACKEND_UPPER"
@@ -97,13 +119,19 @@ echo "  Scale:     ${SCALE:-config default}"
 echo "  Intensity: branch x${BRANCH_INTENSITY:-1} data x${DATA_INTENSITY:-1}"
 echo "  Run ID:    $RUN_ID"
 echo "  Output:    $OUTDIR"
-echo "  Timeout:   ${MAX_RUNTIME_SEC}s (0 = no limit)"
+echo "  Timeout:   ${MAX_RUNTIME_SEC}s (0 = no limit)${CAP_NOTE}"
 echo "  Config:    $TMP_CONFIG (patched from $BASE_CONFIG)"
 echo "======================"
 
 EXTRA_FLAGS=()
 if $MEASURE_STORAGE; then
     EXTRA_FLAGS+=(--measure-storage)
+fi
+if [[ -n "$STORAGE_SAMPLE_INTERVAL" ]]; then
+    EXTRA_FLAGS+=(--storage-sample-interval "$STORAGE_SAMPLE_INTERVAL")
+fi
+if [[ -n "$OP_STALL_SEC" ]]; then
+    EXTRA_FLAGS+=(--op-stall-sec "$OP_STALL_SEC")
 fi
 
 PYTHONUNBUFFERED=1 uv run python -m macrobench.runner \
