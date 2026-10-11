@@ -368,6 +368,69 @@ _ADOPTED: set = set()
 _ADOPT_LOCK = threading.Lock()
 
 
+class _Gates:
+    """Process-wide gate per branch. A Chronos session holds a FOR SHARE
+    lock on its branch's metadata row for every write transaction, and PG
+    lets new share lockers join ahead of a waiting UPDATE, so a fork,
+    checkpoint or delete on a branch with continuous writers (the spine
+    under load) starves. Branch management raises the branch's gate: new
+    statements on it wait, in-flight ones drain, the operation runs."""
+
+    def __init__(self):
+        self.cond = threading.Condition()
+        self.active: dict = {}
+        self.gated: dict = {}
+
+    def enter(self, branch: str, check_cancel=None) -> None:
+        with self.cond:
+            waited = False
+            while self.gated.get(branch):
+                waited = True
+                self.cond.wait(0.5)
+                if check_cancel:
+                    check_cancel()
+            self.active[branch] = self.active.get(branch, 0) + 1
+        if waited:
+            ChronosToolSuite.observe("gate_waits")
+
+    def leave(self, branch: str) -> None:
+        with self.cond:
+            self.active[branch] = max(0, self.active.get(branch, 0) - 1)
+            self.cond.notify_all()
+
+    @contextlib.contextmanager
+    def hold(self, branches, check_cancel=None):
+        branches = [b for b in dict.fromkeys(branches) if b]
+        t0 = time.perf_counter()
+        with self.cond:
+            for b in branches:
+                self.gated[b] = self.gated.get(b, 0) + 1
+            try:
+                while any(self.active.get(b) for b in branches):
+                    self.cond.wait(0.5)
+                    if check_cancel:
+                        check_cancel()
+            except BaseException:
+                for b in branches:
+                    self.gated[b] -= 1
+                self.cond.notify_all()
+                raise
+        waited = time.perf_counter() - t0
+        if waited > 0.001:
+            ChronosToolSuite.observe("gate_hold_waits")
+            ChronosToolSuite.observe("gate_hold_wait_sec", round(waited, 3))
+        try:
+            yield
+        finally:
+            with self.cond:
+                for b in branches:
+                    self.gated[b] -= 1
+                self.cond.notify_all()
+
+
+_GATES = _Gates()
+
+
 class ChronosToolSuite(DBToolSuite):
     BACKEND_NAME = "chronos"
     STORAGE_SCOPE = "database"
@@ -455,6 +518,7 @@ class ChronosToolSuite(DBToolSuite):
         self._sessions: OrderedDict = OrderedDict()
         self._session = None          # BranchSession of the current ref (None in plain mode)
         self._tx = None               # open transaction context on the current session
+        self._tx_branch = None
         self._tx_depth = 0
         self._views: dict = {}        # branch -> {view: select sql}
         self._rowid_tables: set = set()
@@ -717,16 +781,31 @@ class ChronosToolSuite(DBToolSuite):
             self._plain(cur, sql, vars)
             return
         nsql, params = _to_named(sql, params_or_none(vars))
-        if head == "INSERT":
-            cur.rowcount = self._insert(sess, nsql, params)
-        elif head == "UPDATE":
-            cur.rowcount = self._update(sess, nsql, params)
-        elif head == "DELETE":
-            cur.rowcount = self._delete(sess, nsql, params)
-        elif head in ("CREATE", "ALTER", "DROP", "TRUNCATE"):
-            cur.rowcount = self._ddl(sess, head, nsql, params)
-        else:
-            raise UnsupportedSQLError(f"chronos: statement not supported by the shim: {head}")
+        # A write outside an explicit transaction locks the branch row for
+        # its own statement: pass the branch's gate for its duration.
+        branch = self._gate_branch() if self._tx is None else None
+        if branch:
+            _GATES.enter(branch, self._check_cancel)
+        try:
+            if head == "INSERT":
+                cur.rowcount = self._insert(sess, nsql, params)
+            elif head == "UPDATE":
+                cur.rowcount = self._update(sess, nsql, params)
+            elif head == "DELETE":
+                cur.rowcount = self._delete(sess, nsql, params)
+            elif head in ("CREATE", "ALTER", "DROP", "TRUNCATE"):
+                cur.rowcount = self._ddl(sess, head, nsql, params)
+            else:
+                raise UnsupportedSQLError(f"chronos: statement not supported by the shim: {head}")
+        finally:
+            if branch:
+                _GATES.leave(branch)
+
+    def _gate_branch(self) -> Optional[str]:
+        ref = self._current_ref
+        if ref is None or ref.commit:
+            return None
+        return ref.branch
 
     def _plain(self, cur: _Cursor, sql: str, vars):
         with self._pg.cursor() as c:
@@ -739,8 +818,17 @@ class ChronosToolSuite(DBToolSuite):
         if self._tx is not None:
             self._tx_depth += 1
             return
-        self._tx = sess.transaction()
-        self._tx.__enter__()
+        branch = self._gate_branch()
+        if branch:
+            _GATES.enter(branch, self._check_cancel)
+        self._tx_branch = branch
+        try:
+            self._tx = sess.transaction()
+            self._tx.__enter__()
+        except BaseException:
+            if branch:
+                _GATES.leave(branch)
+            raise
         self._tx_depth = 1
 
     def _tx_end(self, commit: bool):
@@ -750,15 +838,20 @@ class ChronosToolSuite(DBToolSuite):
         if self._tx_depth > 0 and commit:
             return
         tx, self._tx, self._tx_depth = self._tx, None, 0
-        if commit:
-            tx.__exit__(None, None, None)
-        else:
-            exc = RuntimeError("rollback")
-            try:
-                tx.__exit__(RuntimeError, exc, None)
-            except RuntimeError as e:
-                if e is not exc:
-                    raise
+        branch, self._tx_branch = getattr(self, "_tx_branch", None), None
+        try:
+            if commit:
+                tx.__exit__(None, None, None)
+            else:
+                exc = RuntimeError("rollback")
+                try:
+                    tx.__exit__(RuntimeError, exc, None)
+                except RuntimeError as e:
+                    if e is not exc:
+                        raise
+        finally:
+            if branch:
+                _GATES.leave(branch)
 
     @staticmethod
     def _dict_rows(rows: list) -> tuple:
@@ -1144,16 +1237,25 @@ class ChronosToolSuite(DBToolSuite):
                 return st
         return None
 
+    def _cp_branch(self, checkpoint: str) -> Optional[str]:
+        try:
+            return self.ctx.get_checkpoint(checkpoint).branch_id
+        except Exception:
+            return None
+
     @contextlib.contextmanager
     def _temp_branch(self, checkpoint: str):
         self._tmp_seq += 1
         name = f"{TEMP_PREFIX}{os.getpid()}_{self._suite_id}_{self._tmp_seq}_{random.getrandbits(16):x}"
-        self._retry("fork", lambda: self.ctx.create_branch_from_checkpoint(name, checkpoint))
+        owner = self._cp_branch(checkpoint)
+        with _GATES.hold([owner], self._check_cancel):
+            self._retry("fork", lambda: self.ctx.create_branch_from_checkpoint(name, checkpoint))
         try:
             yield name
         finally:
             try:
-                self._retry("delete", lambda: self.ctx.delete_branch(name))
+                with _GATES.hold([owner], self._check_cancel):
+                    self._retry("delete", lambda: self.ctx.delete_branch(name))
             except Exception as e:
                 print(f"Warning: could not drop temporary branch {name}: {e}")
 
@@ -1379,19 +1481,21 @@ class ChronosToolSuite(DBToolSuite):
         if from_ref.commit:
             row = self._find_commit(parent, from_ref.commit)
             base_cp, max_seq = self._snapshot_of(parent, from_ref.commit), int(row["seq"])
-            self._retry("fork", lambda: self.ctx.create_branch_from_checkpoint(name, base_cp))
+            with _GATES.hold([self._cp_branch(base_cp)], self._check_cancel):
+                self._retry("fork", lambda: self.ctx.create_branch_from_checkpoint(name, base_cp))
             self._copy_log(name, parent, max_seq=max_seq)
             self._add_row(name, "fork", f"fork from {from_ref}", prev_snap=base_cp, prev_branch=parent)
         else:
             seq = time.time_ns()
             base_cp = f"bb_f{seq:x}"
-            self._retry("checkpoint", lambda: self.ctx.create_checkpoint(base_cp, parent, {"kind": "fork", "child": name}))
-            try:
-                self._retry("fork", lambda: self.ctx.create_branch_from_checkpoint(name, base_cp))
-            except BranchingError as e:
-                if "already exists" in str(e):
-                    raise ValueError(f"Cannot create branch {name}, already exists") from e
-                raise
+            with _GATES.hold([parent], self._check_cancel):
+                self._retry("checkpoint", lambda: self.ctx.create_checkpoint(base_cp, parent, {"kind": "fork", "child": name}))
+                try:
+                    self._retry("fork", lambda: self.ctx.create_branch_from_checkpoint(name, base_cp))
+                except BranchingError as e:
+                    if "already exists" in str(e):
+                        raise ValueError(f"Cannot create branch {name}, already exists") from e
+                    raise
             self._copy_log(name, parent)
             cid, seq = self._add_row(parent, "sync", f"fork point of {name}", snap=base_cp, seq=seq)
             self._add_row(name, "fork", f"fork from {from_ref}", prev_snap=base_cp, prev_branch=parent,
@@ -1406,7 +1510,8 @@ class ChronosToolSuite(DBToolSuite):
         seq = time.time_ns()
         cid = f"{seq:x}"
         cp = f"bb_c{cid}"
-        self._retry("checkpoint", lambda: self.ctx.create_checkpoint(cp, ref.branch, {"message": message or "", "id": cid}))
+        with _GATES.hold([ref.branch], self._check_cancel):
+            self._retry("checkpoint", lambda: self.ctx.create_checkpoint(cp, ref.branch, {"message": message or "", "id": cid}))
         self._add_row(ref.branch, "commit", message, snap=cp, commit_id=cid, seq=seq)
         return cid
 
@@ -1462,7 +1567,8 @@ class ChronosToolSuite(DBToolSuite):
         else:
             seq = time.time_ns()
             cp = f"bb_s{seq:x}"
-            self._retry("checkpoint", lambda: self.ctx.create_checkpoint(cp, source.branch, {"kind": "sync", "into": into.branch}))
+            with _GATES.hold([source.branch], self._check_cancel):
+                self._retry("checkpoint", lambda: self.ctx.create_checkpoint(cp, source.branch, {"kind": "sync", "into": into.branch}))
             commit_id, seq = self._add_row(source.branch, "sync", f"merged into {into.branch}", snap=cp, seq=seq)
             self._add_row(into.branch, "sync", f"merge point of {source.branch}", snap=cp, commit_id=commit_id,
                           seq=seq + 1)
@@ -1490,7 +1596,8 @@ class ChronosToolSuite(DBToolSuite):
         if not onto.commit:
             seq = time.time_ns()
             cp = f"bb_s{seq:x}"
-            self._retry("checkpoint", lambda: self.ctx.create_checkpoint(cp, onto.branch, {"kind": "sync", "rebased": ref.branch}))
+            with _GATES.hold([onto.branch], self._check_cancel):
+                self._retry("checkpoint", lambda: self.ctx.create_checkpoint(cp, onto.branch, {"kind": "sync", "rebased": ref.branch}))
             cid, seq = self._add_row(onto.branch, "sync", f"rebase point of {ref.branch}", snap=cp, seq=seq)
             self._add_row(ref.branch, "sync", f"rebased onto {onto.branch}", snap=cp, commit_id=cid, seq=seq + 1)
         self._add_row(ref.branch, "rebase", f"rebase onto {onto}", prev_branch=onto.branch)
@@ -1559,9 +1666,10 @@ class ChronosToolSuite(DBToolSuite):
         while b:
             parent = self._pgx("SELECT parent_branch_id FROM _chronos_branch_interval_branches WHERE branch_id = %s",
                                (b,))
-            self._retry("delete", lambda: self.ctx.delete_branch(b))
-            self._pgx(f"DELETE FROM {TOMBSTONES} WHERE branch = %s", (b,))
             parent = parent[0][0] if parent else None
+            with _GATES.hold([b, parent], self._check_cancel):
+                self._retry("delete", lambda: self.ctx.delete_branch(b))
+            self._pgx(f"DELETE FROM {TOMBSTONES} WHERE branch = %s", (b,))
             if not parent:
                 return
             row = self._pgx(f"SELECT t.branch FROM {TOMBSTONES} t JOIN _chronos_branch_interval_branches c "
