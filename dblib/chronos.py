@@ -1294,6 +1294,47 @@ class ChronosToolSuite(DBToolSuite):
             out[(d.table, tuple(_norm(d.key[c]) for c in sorted(d.key)))] = d
         return out
 
+    def _verify_side(self, branch: str, dmap: dict) -> None:
+        """Replace the ``after`` rows of ``dmap`` (a _diff_map of ``branch``)
+        by the rows the branch shows now; a missing row becomes a delete."""
+        if not dmap:
+            return
+        sess = self._get_session(Ref(branch))
+        metas = self._branch_tables(branch)
+        by_table = {}
+        for (table, key), d in dmap.items():
+            by_table.setdefault(table, []).append((key, d))
+        stale = 0
+        for table, entries in by_table.items():
+            meta = metas.get(table)
+            if meta is None:
+                continue
+            pk = list(meta.pk_columns)
+            for i in range(0, len(entries), _CHUNK):
+                chunk = entries[i:i + _CHUNK]
+                params, preds = {}, []
+                for j, (key, d) in enumerate(chunk):
+                    conds = []
+                    for c in pk:
+                        params[f"k{j}_{c}"] = _conv(d.key[c])
+                        conds.append(f"{_q(c)} = :k{j}_{c}")
+                    preds.append("(" + " AND ".join(conds) + ")")
+                live = {tuple(_norm(r[c]) for c in sorted(pk)): r
+                        for r in sess.query(f"SELECT * FROM {_q(table)} WHERE {' OR '.join(preds)}", params)}
+                for key, d in chunk:
+                    row = live.get(key)
+                    if row is None:
+                        if d.change != "deleted":
+                            stale += 1
+                            dmap[(table, key)] = type(d)(d.table, d.key, "deleted", d.before, None)
+                    else:
+                        if d.change == "deleted" or not _same(d.after, row):
+                            stale += 1
+                        change = d.change if d.change != "deleted" else "modified"
+                        dmap[(table, key)] = type(d)(d.table, d.key, change, d.before, dict(row))
+        if stale:
+            self.observe("diff_values_stale", stale)
+
     def _all_rows(self, branch: str, table: str) -> list:
         s = self._get_session(Ref(branch))
         return s.query(f"SELECT * FROM {_q(table)}")
@@ -1417,6 +1458,12 @@ class ChronosToolSuite(DBToolSuite):
                 d_theirs = self._diff_map(base, theirs)
                 d_ours = self._diff_map(base, ours)
         info["theirs_changes"], info["ours_changes"] = len(d_theirs), len(d_ours)
+        # Trust the diff for *which* keys changed, not for their values: the
+        # rows are re-read from each branch before they are applied (a diff
+        # value found stale is counted in backend_observations).
+        self._verify_side(theirs, d_theirs)
+        if base_cp is not None:
+            self._verify_side(ours, d_ours)
         by_table, conflicts = {}, {}
         for k, t in d_theirs.items():
             table = k[0]
@@ -1438,6 +1485,14 @@ class ChronosToolSuite(DBToolSuite):
                 ops["upsert"].append(dict(t.after))
         info["conflicts"] = sum(len(v) for v in conflicts.values())
         info["conflict_tables"] = sorted(conflicts)
+        if conflicts and os.environ.get("CHRONOS_DEBUG_CONFLICTS"):
+            for table, pairs in conflicts.items():
+                kinds = {}
+                for o, t in pairs:
+                    kinds[(o.change, t.change)] = kinds.get((o.change, t.change), 0) + 1
+                print(f"[conflicts] {table}: {len(pairs)} rows, (ours, theirs) change kinds {kinds}")
+                for o, t in pairs[:3]:
+                    print(f"   key={t.key} base={o.before} ours={o.after} theirs={t.after}")
         info["applied"] = self._apply(sess, ours, by_table)
         if conflicts and callable(on_conflict):
             rows_out = []

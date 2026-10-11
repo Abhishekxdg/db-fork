@@ -976,6 +976,44 @@ records which is which:
   SELECT, rewritten by the session for its own branch, runs on a plain
   connection.
 
+What the six-scenario sweep showed (PostgreSQL 18 on this box, CH scale 1,
+chronos-core 607418d): a fork, checkpoint or delete costs 10 to 25 ms, in
+the range of Dolt's and well below the clone-based backends, and the
+per-statement overhead of Chronos's own DML executor is 2 to 10× plain
+PostgreSQL. Three properties of the design dominate the longer scenarios:
+
+- History accumulates in the live tables. Every write after a checkpoint
+  splits the row into an old and a new version in the same physical table,
+  checkpoints pin the old versions for the run, and SELECTs carry no index
+  on the interval bounds, so analytical queries scan every version. S4
+  (spine checkpoint every 2 s under eight TPC-C clients) had four
+  order_line versions per visible row after twelve minutes, and the spine's
+  CH queries dominated its 41 minutes.
+- Branch-local DDL copies the table. `ALTER TABLE` on a branch creates a new
+  physical table with the rows visible to that branch (S4: one copy of
+  customer per dev branch, one of stock per spine migration).
+- Branch management contends with the branch's writers. Every write holds a
+  `FOR SHARE` lock on its branch's metadata row and `create_branch`,
+  `create_checkpoint` and `delete_branch` need the row exclusively (they
+  also raise `chronos_session_barrier_in_progress` instead of waiting when
+  another one is in flight). The shim retries the barrier and holds a
+  per-branch gate while the management call runs (`gate_waits`,
+  `barrier_retries_*` in `backend_observations`); without it S5's branch
+  deletes starved under the spine load until the stall watchdog cancelled
+  them.
+
+Two more things the shim guards against: the background interval-GC worker
+dies on its first error (in S1 "out of shared memory", PostgreSQL's
+`max_locks_per_transaction` exhausted by a GC transaction touching every
+physical table) and would then block the context's close forever, so the
+shim clears the flag and runs the reclamation synchronously in `gc()`
+(`gc_worker_died`); and the rows a merge applies are re-read from the
+source branch rather than taken from the diff's reported values
+(`diff_values_stale` counts disagreements). Concurrent TPC-C deliveries on
+the spine race on the tombstone of the same new_order row and fail with a
+duplicate key, which Chronos retries three times before the driver's own
+retry (`DELETE_ROWS` failures in the stats).
+
 The SQL shim: SELECTs run as Chronos rewrites them (each registered table
 replaced by its visible-version subquery; joins, CTEs, subqueries and
 window functions pass through to PostgreSQL). DML is executed by Chronos's
