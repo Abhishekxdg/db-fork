@@ -18,14 +18,15 @@ API lacks are built from what it does have:
     commit     a row in the branch's _bb_commits table plus the branch's
                pg_current_wal_flush_lsn() as the commit's point in time
     log        SELECT FROM _bb_commits
-    diff       row hashes per table on each side (local to each compute),
-               then the differing tables pulled over postgres_fdw into
-               temp tables and compared locally
+    diff       per-table, per-key-bucket row hashes on each side (local
+               to each compute); only the differing buckets are pulled over
+               postgres_fdw into temp tables and compared locally
     merge      SQL three-way merge on the target's compute: base = a
                temporary branch at the source's fork LSN (created and
                timed inside the verb), theirs = the source branch over
-               postgres_fdw, both pulled into temp tables; conflicts per
-               on_conflict as on the other backends
+               postgres_fdw; only the key buckets theirs changed are
+               pulled into temp tables; conflicts per on_conflict as on
+               the other backends
     rebase     the same three-way merge of the upstream into the branch,
                after which a rebase row moves the branch's base to the
                upstream's LSN so the merge back only sees newer changes
@@ -38,9 +39,11 @@ API lacks are built from what it does have:
                and retried once they are gone)
 
 Quotas are treated as capacity. Neon counts *active computes* per project
-(20 on the Launch plan, the default branch exempt), not branches, so a
-branch's compute is suspended when the connection moves off it and
-resumes on the next connect; both land in CONNECT. All API calls go
+(20 on the Launch plan, the default branch exempt), not branches. The
+process keeps a registry of the computes it activated and, before it
+needs one more above ``NEON_ACTIVE_BUDGET``, suspends the least recently
+used compute no connection is using; a suspended compute resumes on the
+next connect, which lands in CONNECT. All API calls go
 through one process-wide token bucket sized under the documented 700
 requests/minute, with waits recorded as API_RETRY_WAIT rows; 429/423/503
 responses are retried as the backstop.
@@ -80,8 +83,13 @@ NEON_HISTORY_RETENTION_SEC = int(os.environ.get("NEON_HISTORY_RETENTION_SEC", st
 # Scale-to-zero backstop for branch computes (0 = the plan default, 5 min on
 # Launch, which is also its minimum); the default branch never suspends.
 NEON_BRANCH_SUSPEND_TIMEOUT_SEC = int(os.environ.get("NEON_BRANCH_SUSPEND_TIMEOUT_SEC", "0"))
-# Suspend a branch's compute when the connection moves off it.
-NEON_SUSPEND_ON_SWITCH = os.environ.get("NEON_SUSPEND_ON_SWITCH", "1").lower() not in ("0", "false", "no")
+# Active computes the process keeps at most (the plan allows 20 besides the
+# default branch): when a new compute is needed above this, the least
+# recently used idle one is suspended first.
+NEON_ACTIVE_BUDGET = int(os.environ.get("NEON_ACTIVE_BUDGET", "18"))
+# Also suspend a branch's compute whenever the connection moves off it
+# (off by default: the budget above only suspends when room is needed).
+NEON_SUSPEND_ON_SWITCH = os.environ.get("NEON_SUSPEND_ON_SWITCH", "0").lower() in ("1", "true", "yes")
 # Token bucket for the API: requests per minute and burst.
 NEON_API_RATE_PER_MIN = float(os.environ.get("NEON_API_RATE_PER_MIN", "600"))
 NEON_API_BURST = int(os.environ.get("NEON_API_BURST", "20"))
@@ -164,7 +172,7 @@ class NeonAPIError(RuntimeError):
 
 
 def api_request(method: str, endpoint: str, record=None, max_retries: int = 8, **kwargs):
-    """One Neon API call through the token bucket, retrying 429/423/503
+    """One Neon API call through the token bucket, retrying 408/423/429/5xx
     (and connection errors) with Retry-After or jittered backoff.
     ``record(seconds)`` is told about every wait."""
     headers = kwargs.pop("headers", {})
@@ -190,7 +198,7 @@ def api_request(method: str, endpoint: str, record=None, max_retries: int = 8, *
             if r.status_code == 204 or not r.content:
                 return {}
             return r.json()
-        if r.status_code in (429, 423, 503) and attempt < max_retries - 1:
+        if r.status_code in (408, 423, 429, 500, 502, 503, 504) and attempt < max_retries - 1:
             retry_after = r.headers.get("Retry-After")
             try:
                 delay = float(retry_after) if retry_after else 0.5 * (2 ** attempt)
@@ -375,6 +383,11 @@ class NeonToolSuite(DBToolSuite):
     # throttling, compute-limit waits, deferred deletes.
     OBSERVED: dict = {}
     _OBS_LOCK = threading.Lock()
+    # Computes this process activated: branch id -> last use (monotonic),
+    # and how many open connections each one has. Shared by every suite.
+    _ACTIVE: dict = {}
+    _HOLDS: dict = {}
+    _ACT_LOCK = threading.Lock()
 
     @classmethod
     def observe(cls, key: str, amount=1) -> None:
@@ -502,23 +515,80 @@ class NeonToolSuite(DBToolSuite):
         ep = self._endpoint_id(branch_id)
         if not ep:
             return
+        with type(self)._ACT_LOCK:
+            type(self)._ACTIVE.pop(branch_id, None)
         try:
             self._api("POST", f"projects/{self.project_id}/endpoints/{ep}/suspend")
         except NeonAPIError as e:
             if e.status not in (409, 422, 423):   # already suspended / in transition
                 raise
 
+    def _make_room(self, target: str) -> None:
+        """Keep the process under NEON_ACTIVE_BUDGET active computes: before
+        ``target`` is (re)activated, suspend least-recently-used computes
+        that no connection holds. The default branch is exempt."""
+        default_id = self._branches[self.default_branch]["id"]
+        if target == default_id:
+            return
+        cls = type(self)
+        with cls._ACT_LOCK:
+            if target in cls._ACTIVE:
+                cls._ACTIVE[target] = time.monotonic()
+                return
+            victims = []
+            now = time.monotonic()
+            while len(cls._ACTIVE) + 1 > NEON_ACTIVE_BUDGET:
+                # Only computes nobody holds and nobody touched recently: a
+                # worker switching branches releases one for a moment.
+                idle = [b for b in cls._ACTIVE if cls._HOLDS.get(b, 0) <= 0 and b != default_id
+                        and now - cls._ACTIVE[b] > 20.0]
+                if not idle:
+                    break
+                lru = min(idle, key=lambda b: cls._ACTIVE[b])
+                del cls._ACTIVE[lru]
+                victims.append(lru)
+            cls._ACTIVE[target] = time.monotonic()
+        for b in victims:
+            try:
+                self._suspend(b)
+                self.observe("lru_suspends")
+            except Exception as e:
+                print(f"Warning: could not suspend compute of {b}: {e}")
+
+    def _reserve(self, branch_id: str, n: int = 1) -> None:
+        """Hold (or release, n=-1) a compute without a connection, so the
+        LRU never suspends it mid-verb."""
+        cls = type(self)
+        with cls._ACT_LOCK:
+            cls._HOLDS[branch_id] = max(0, cls._HOLDS.get(branch_id, 0) + n)
+
+    def _close(self, conn) -> None:
+        """Close a connection opened by _open and release its hold."""
+        if conn is None:
+            return
+        bid = getattr(self, "_conn_owner", {}).pop(id(conn), None)
+        try:
+            conn.close()
+        except Exception:
+            pass
+        if bid:
+            with type(self)._ACT_LOCK:
+                type(self)._HOLDS[bid] = max(0, type(self)._HOLDS.get(bid, 0) - 1)
+
     def _open(self, branch_id: str, max_wait: float = 300.0):
-        """A new autocommit connection to the branch's compute; a compute
-        refused for the active-compute limit is retried (waits recorded)."""
+        """A new autocommit connection to the branch's compute, counted in
+        the process's active-compute registry; a connect refused for the
+        active-compute limit (or failing while the compute changes state)
+        is retried, with the waits recorded."""
         uri = self._uri(branch_id)
+        self._make_room(branch_id)
         t0 = time.perf_counter()
         attempt = 0
         while True:
             try:
                 conn = psycopg2.connect(uri, connect_timeout=30)
                 conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
-                return conn
+                break
             except psycopg2.OperationalError as e:
                 msg = str(e)
                 attempt += 1
@@ -527,10 +597,22 @@ class NeonToolSuite(DBToolSuite):
                 if _ACTIVE_LIMIT_MSG in msg:
                     self.observe("active_compute_limit_hits")
                     delay = 2.0 + random.random()
+                    label = "compute_wait"
                 else:
-                    delay = min(5.0, 0.5 * attempt)
-                self._wait_row(delay, "compute_wait")
+                    delay = min(3.0, 0.5 * attempt)
+                    label = "connect_retry"
+                    self.observe("connect_error: " + " ".join(msg.split())[:70])
+                self._wait_row(delay, label)
                 time.sleep(delay)
+        cls = type(self)
+        with cls._ACT_LOCK:
+            if branch_id != self._branches[self.default_branch]["id"]:
+                cls._ACTIVE[branch_id] = time.monotonic()
+            cls._HOLDS[branch_id] = cls._HOLDS.get(branch_id, 0) + 1
+        if not hasattr(self, "_conn_owner"):
+            self._conn_owner = {}
+        self._conn_owner[id(conn)] = branch_id
+        return conn
 
     def list_branches(self) -> list:
         self._refresh_branches()
@@ -547,10 +629,7 @@ class NeonToolSuite(DBToolSuite):
             target = self._branch_id(ref.branch)
         previous = self._conn_branch_id
         if self.conn:
-            try:
-                self.conn.close()
-            except Exception:
-                pass
+            self._close(self.conn)
             self.conn = None
         if NEON_SUSPEND_ON_SWITCH and previous and previous != target:
             try:
@@ -560,8 +639,20 @@ class NeonToolSuite(DBToolSuite):
         self.conn = self._open(target)
         self._conn_branch_id = target
 
+    def _connect(self, ref: Ref, exec_id: int, timed: bool, label: str, fallback: bool):
+        """A branch restore or a compute restart closes existing
+        connections; a dead connection is reopened on the next exec and
+        recorded as a CONNECT like any other switch."""
+        if self.conn is not None and getattr(self.conn, "closed", 0):
+            self._current_ref = None
+            self._conn_branch_id = None
+        return super()._connect(ref, exec_id, timed, label, fallback)
+
     def _on(self, ref: Ref) -> str:
         """Point self.conn at the branch head; returns its id."""
+        if self.conn is not None and getattr(self.conn, "closed", 0):
+            self._current_ref = None
+            self._conn_branch_id = None
         if self._current_ref != Ref(ref.branch) or self.conn is None:
             self._connect_impl(Ref(ref.branch))
             self._current_ref = Ref(ref.branch)
@@ -611,7 +702,7 @@ class NeonToolSuite(DBToolSuite):
             if not n:
                 self._add_commit(conn, self._branch_id(branch), "root", "initial state")
         finally:
-            conn.close()
+            self._close(conn)
 
     def _add_commit(self, conn, branch_id: str, kind: str, message: str, commit_id: str = None,
                     prev_lsn: str = None, prev_branch_id: str = None, lsn: str = None,
@@ -682,10 +773,7 @@ class NeonToolSuite(DBToolSuite):
 
     def _release(self, conn) -> None:
         if conn is not None and conn is not self.conn:
-            try:
-                conn.close()
-            except Exception:
-                pass
+            self._close(conn)
 
     # ------------------------------------------------------------------
     # Table metadata (Postgres)
@@ -715,6 +803,36 @@ class NeonToolSuite(DBToolSuite):
         rows = self._exec(conn, f'SELECT COUNT(*), COALESCE(SUM(hashtext(t::text)::bigint), 0) FROM {_q(table)} t')
         return (int(rows[0][0]), int(rows[0][1]))
 
+    _NB = 256  # hash buckets per table for change detection and partial pulls
+
+    def _bucket_expr(self, conn, table: str, pk: list, alias: str = None) -> str:
+        """SQL for a row's bucket (0..255) from its integer primary-key
+        columns, or None when the key has none. Built from immutable
+        functions only, so postgres_fdw ships the predicate to the remote
+        compute and only matching rows travel."""
+        types = {c[0]: c[1] for c in self._columns(conn, table)}
+        parts = []
+        for c in pk:
+            col = f"{alias}.{_q(c)}" if alias else _q(c)
+            t = types.get(c)
+            if t in ("integer", "smallint"):
+                parts.append(f"hashint4({col}::int)")
+            elif t == "bigint":
+                parts.append(f"hashint8({col})")
+        if not parts:
+            return None
+        return "((" + " # ".join(parts) + f") & {self._NB - 1})"
+
+    def _bucket_hashes(self, conn, table: str, bexpr: str) -> dict:
+        """{bucket: (rows, hash)} computed where the table lives."""
+        rows = self._exec(conn, f"SELECT {bexpr} AS b, COUNT(*), COALESCE(SUM(hashtext(t::text)::bigint), 0) "
+                                f"FROM {_q(table)} t GROUP BY 1") or []
+        return {int(b): (int(n), int(h)) for b, n, h in rows}
+
+    @staticmethod
+    def _changed_buckets(a: dict, b: dict) -> list:
+        return sorted(k for k in set(a) | set(b) if a.get(k, (0, 0)) != b.get(k, (0, 0)))
+
     @staticmethod
     def _type_sql(col) -> str:
         name, dtype, char_len, prec, scale, nullable, default = col
@@ -740,7 +858,8 @@ class NeonToolSuite(DBToolSuite):
         schema = f"bb_{remote_branch_id.replace('-', '_')}"
         self._exec(conn, f"CREATE SERVER IF NOT EXISTS {_q(srv)} FOREIGN DATA WRAPPER postgres_fdw "
                          f"OPTIONS (host '{pr.hostname}', dbname '{self.db_name}', port '5432', "
-                         f"sslmode 'require', fetch_size '10000')")
+                         f"sslmode 'require', fetch_size '10000', "
+                         f"options '-c idle_in_transaction_session_timeout=0 -c statement_timeout=0')")
         self._exec(conn, f"CREATE USER MAPPING IF NOT EXISTS FOR CURRENT_USER SERVER {_q(srv)} "
                          f"OPTIONS (user '{pr.username}', password '{pr.password}')")
         self._exec(conn, f"DROP SCHEMA IF EXISTS {_q(schema)} CASCADE")
@@ -781,7 +900,7 @@ class NeonToolSuite(DBToolSuite):
         return out
 
     def _pull(self, conn, schema: str, table: str, local_name: str, cols: list, available=None,
-              types: dict = None) -> None:
+              types: dict = None, where: str = None) -> None:
         """Copy a foreign table into a local temp table with exactly ``cols``;
         columns the remote table lacks (``available`` lists what it has)
         come out NULL, cast to the local column's type (``types``)."""
@@ -791,7 +910,8 @@ class NeonToolSuite(DBToolSuite):
             return f"NULL::{types[c]} AS {_q(c)}" if types and c in types else f"NULL AS {_q(c)}"
         select = ", ".join(col(c) for c in cols)
         self._exec(conn, f"DROP TABLE IF EXISTS {_q(local_name)}")
-        self._exec(conn, f"CREATE TEMP TABLE {_q(local_name)} AS SELECT {select} FROM {_q(schema)}.{_q(table)}")
+        self._exec(conn, f"CREATE TEMP TABLE {_q(local_name)} AS SELECT {select} FROM {_q(schema)}.{_q(table)}"
+                         + (f" WHERE {where}" if where else ""))
 
     # ------------------------------------------------------------------
     # SQL fragments (Postgres)
@@ -835,15 +955,17 @@ class NeonToolSuite(DBToolSuite):
         project's synthetic_storage_size lag by more than a run, so they
         cannot feed the sampler). Branch computes are not touched, so this
         is the spine's logical size, not the project's billed storage."""
+        if getattr(self, "_closed", False):
+            return 0  # the run's project is gone (after cleanup)
         for attempt in range(2):
             try:
                 if getattr(self, "_size_conn", None) is None:
-                    self._size_conn = self._open(self._branch_id(self.default_branch), max_wait=60)
+                    self._size_conn = self._open(self._branch_id(self.default_branch), max_wait=15)
                 return int(self._exec(self._size_conn, "SELECT pg_database_size(current_database())")[0][0])
             except Exception:
                 try:
                     if getattr(self, "_size_conn", None) is not None:
-                        self._size_conn.close()
+                        self._close(self._size_conn)
                 except Exception:
                     pass
                 self._size_conn = None
@@ -876,7 +998,7 @@ class NeonToolSuite(DBToolSuite):
             self._add_commit(conn, b["id"], "fork", f"fork from {from_ref}",
                              prev_lsn=b.get("parent_lsn") or st.lsn, prev_branch_id=st.branch_id)
         finally:
-            conn.close()
+            self._close(conn)
         if NEON_SUSPEND_ON_SWITCH:
             self._suspend(b["id"])
 
@@ -926,48 +1048,52 @@ class NeonToolSuite(DBToolSuite):
                 return {"tables": [], "rows_added": 0, "rows_deleted": 0, "rows_modified": 0}
             ta, tb = set(self._tables(ca)), set(self._tables(cb))
             out = []
-            changed = []
+            changed = {}
             for t in sorted(ta | tb):
                 if t in ta and t not in tb:
                     out.append({"table_name": t, "rows_added": 0, "rows_deleted": self._table_hash(ca, t)[0], "rows_modified": 0})
                 elif t in tb and t not in ta:
                     out.append({"table_name": t, "rows_added": self._table_hash(cb, t)[0], "rows_deleted": 0, "rows_modified": 0})
-                elif self._table_hash(ca, t) != self._table_hash(cb, t):
-                    changed.append(t)
+                else:
+                    pk0 = self._pk(cb, t)
+                    bexpr = self._bucket_expr(cb, t, pk0) if pk0 else None
+                    if bexpr is None:
+                        if self._table_hash(ca, t) != self._table_hash(cb, t):
+                            changed[t] = None
+                    else:
+                        diffb = self._changed_buckets(self._bucket_hashes(ca, t, bexpr), self._bucket_hashes(cb, t, bexpr))
+                        if diffb:
+                            changed[t] = f"{bexpr} IN ({', '.join(str(b) for b in diffb)})"
             if changed:
                 changed_fdw = True
-                schema = self._fdw_schema(cb, b_id, a_id, changed)
-                for t in changed:
+                schema = self._fdw_schema(cb, b_id, a_id, list(changed))
+                for t, where in changed.items():
                     cols_b = [c[0] for c in self._columns(cb, t)]
                     cols_a = {c[0] for c in self._columns(ca, t)}
                     cols = [c for c in cols_b if c in cols_a]
                     pk = [c for c in self._pk(cb, t) if c in cols] or cols
                     rest = [c for c in cols if c not in pk]
                     self._pull(cb, schema, t, "_bb_a", cols, available=cols_a,
-                               types={c[0]: self._type_sql(c) for c in self._columns(cb, t)})
-                    B = _q(t)
+                               types={c[0]: self._type_sql(c) for c in self._columns(cb, t)}, where=where)
+                    self._exec(cb, 'DROP TABLE IF EXISTS "_bb_bsub"')
+                    self._exec(cb, f'CREATE TEMP TABLE "_bb_bsub" AS SELECT {", ".join(_q(c) for c in cols)} FROM {_q(t)}'
+                                   + (f" WHERE {where}" if where else ""))
+                    B = '"_bb_bsub"'
                     added = self._exec(cb, f'SELECT COUNT(*) FROM {B} y LEFT JOIN "_bb_a" x ON {self._join("x", "y", pk)} WHERE x.{_q(pk[0])} IS NULL')[0][0]
                     deleted = self._exec(cb, f'SELECT COUNT(*) FROM "_bb_a" x LEFT JOIN {B} y ON {self._join("x", "y", pk)} WHERE y.{_q(pk[0])} IS NULL')[0][0]
                     modified = 0
                     if rest:
                         modified = self._exec(cb, f'SELECT COUNT(*) FROM "_bb_a" x JOIN {B} y ON {self._join("x", "y", pk)} WHERE NOT ({self._same("x", "y", rest)})')[0][0]
                     out.append({"table_name": t, "rows_added": int(added), "rows_deleted": int(deleted), "rows_modified": int(modified)})
-                    self._exec(cb, 'DROP TABLE IF EXISTS "_bb_a"')
+                    self._exec(cb, 'DROP TABLE IF EXISTS "_bb_a"; DROP TABLE IF EXISTS "_bb_bsub"')
             return {"tables": out, "rows_added": sum(x["rows_added"] for x in out),
                     "rows_deleted": sum(x["rows_deleted"] for x in out),
                     "rows_modified": sum(x["rows_modified"] for x in out)}
         finally:
-            ca.close()
             if cb is not None and changed_fdw:
                 self._fdw_cleanup(cb, a_id)
+            self._close(ca)
             self._release(cb)
-            if NEON_SUSPEND_ON_SWITCH:
-                for bid in (a_id, b_id):
-                    if bid and self._current_ref is not None and bid != self._branch_id(self._current_ref.branch):
-                        try:
-                            self._suspend(bid)
-                        except Exception:
-                            pass
 
     # -- three-way merge -----------------------------------------------------
 
@@ -1016,8 +1142,28 @@ class NeonToolSuite(DBToolSuite):
         want_rows = callable(on_conflict)
         base_tables = set(self._tables(base_conn))
         tables = sorted((set(self._tables(ours)) & set(self._tables(theirs_conn))) - set(new_tables))
-        changed = [t for t in tables if t not in base_tables
-                   or self._table_hash(theirs_conn, t) != self._table_hash(base_conn, t)]
+        # Change detection per hash bucket of the key, each side hashing
+        # its own rows locally; only buckets theirs changed are pulled.
+        buckets = {}   # table -> (bexpr, theirs-changed buckets, ours-changed buckets) or None
+        changed = []
+        for t in tables:
+            pk = self._pk(ours, t)
+            bexpr = self._bucket_expr(ours, t, pk) if pk else None
+            if bexpr is None:
+                if t not in base_tables or self._table_hash(theirs_conn, t) != self._table_hash(base_conn, t):
+                    changed.append(t)
+                    buckets[t] = None
+                continue
+            h_t = self._bucket_hashes(theirs_conn, t, bexpr)
+            h_b = self._bucket_hashes(base_conn, t, bexpr) if t in base_tables else {}
+            tb = self._changed_buckets(h_t, h_b)
+            if not tb:
+                continue
+            h_o = self._bucket_hashes(ours, t, bexpr)
+            ob = self._changed_buckets(h_o, h_b)
+            info["ours_changes"] += len(ob)
+            changed.append(t)
+            buckets[t] = (bexpr, tb, ob)
         if not changed:
             return info, conflicts
         changed = self._fk_order(ours, changed)
@@ -1034,19 +1180,26 @@ class NeonToolSuite(DBToolSuite):
                 cols_t = {c[0] for c in self._columns(theirs_conn, t)}
                 cols = [c for c in cols_o if c in cols_t]
                 pk = [c for c in self._pk(ours, t) if c in cols]
-                T, B = f"_bb_t{i}", f"_bb_b{i}"
-                temps += [T, B]
-                self._pull(ours, s_t, t, T, cols)
+                T, B, OS = f"_bb_t{i}", f"_bb_b{i}", f"_bb_o{i}"
+                temps += [T, B, OS]
+                where = None
+                if buckets.get(t):
+                    bexpr, tb, _ = buckets[t]
+                    where = f"{bexpr} IN ({', '.join(str(b) for b in tb)})"
+                self._pull(ours, s_t, t, T, cols, where=where)
                 if t in base_tables:
-                    self._pull(ours, s_b, t, B, cols, available={c[0] for c in self._columns(base_conn, t)}, types=types)
+                    self._pull(ours, s_b, t, B, cols, available={c[0] for c in self._columns(base_conn, t)}, types=types, where=where)
                 else:
                     self._exec(ours, f'CREATE TEMP TABLE {_q(B)} AS SELECT {", ".join(_q(c) for c in cols)} FROM {_q(T)} WHERE FALSE')
-                plans[t] = {"cols": cols, "pk": pk, "T": _q(T), "B": _q(B), "O": _q(t)}
+                # Our rows in the same buckets (the only ones theirs can conflict with).
+                self._exec(ours, f'CREATE TEMP TABLE {_q(OS)} AS SELECT {", ".join(_q(c) for c in cols)} FROM {_q(t)}'
+                                 + (f" WHERE {where}" if where else ""))
+                plans[t] = {"cols": cols, "pk": pk, "T": _q(T), "B": _q(B), "O": _q(t), "OS": _q(OS)}
                 if not pk:
                     continue
                 rest = [c for c in cols if c not in pk]
                 kt, ko, kb = self._key("t", pk), self._key("o", pk), self._key("b", pk)
-                O, Tq, Bq = _q(t), _q(T), _q(B)
+                O, Tq, Bq = _q(OS), _q(T), _q(B)
                 d_tb = f"b.{_q(pk[0])} IS NULL" + (f" OR NOT ({self._same('t', 'b', rest)})" if rest else "")
                 d_ob = f"b.{_q(pk[0])} IS NULL" + (f" OR NOT ({self._same('o', 'b', rest)})" if rest else "")
                 TK, OK, CK = f"_bb_tk{i}", f"_bb_ok{i}", f"_bb_ck{i}"
@@ -1059,7 +1212,8 @@ class NeonToolSuite(DBToolSuite):
                 n_t = int(self._exec(ours, f'SELECT COUNT(*) FROM {_q(TK)}')[0][0])
                 n_o = int(self._exec(ours, f'SELECT COUNT(*) FROM {_q(OK)}')[0][0])
                 info["theirs_changes"] += n_t
-                info["ours_changes"] += n_o
+                if not buckets.get(t):
+                    info["ours_changes"] += n_o
                 same_ot = self._same("o", "t", rest) if rest else "TRUE"
                 self._exec(ours, f'CREATE TEMP TABLE {_q(CK)} AS SELECT a.k FROM {_q(TK)} a JOIN {_q(OK)} b ON b.k = a.k '
                                  f'LEFT JOIN {O} o ON {ko} = a.k LEFT JOIN {Tq} t ON {kt} = a.k '
@@ -1096,7 +1250,7 @@ class NeonToolSuite(DBToolSuite):
                     info["conflicts"] += pl["n_c"]
                     info["conflict_tables"].append(t)
                     if want_rows:
-                        conflicts.append({"table": t, "rows": self._conflict_rows(ours, pl["O"], pl["T"], pl["B"], pl["CK"], cols, pk)})
+                        conflicts.append({"table": t, "rows": self._conflict_rows(ours, pl["OS"], pl["T"], pl["B"], pl["CK"], cols, pk)})
             self._exec(ours, "COMMIT")
         except BaseException:
             try:
@@ -1157,12 +1311,19 @@ class NeonToolSuite(DBToolSuite):
                              seq=int(r["seq"]))
 
     def _merge_impl(self, into: Ref, source: Ref, message: str, on_conflict="ours") -> dict:
-        ours_id = self._on(into)
-        ours = self.conn
         src = self._state(source)
         theirs_id = self._reading_branch(src)
-        if theirs_id == ours_id:
-            raise ValueError(f"Cannot merge branch '{source.branch}' into itself")
+        self._reserve(theirs_id)
+        try:
+            ours_id = self._on(into)
+            if theirs_id == ours_id:
+                raise ValueError(f"Cannot merge branch '{source.branch}' into itself")
+            return self._merge_reserved(into, source, message, on_conflict, src, theirs_id, ours_id)
+        finally:
+            self._reserve(theirs_id, -1)
+
+    def _merge_reserved(self, into, source, message, on_conflict, src, theirs_id, ours_id) -> dict:
+        ours = self.conn
         theirs_conn = self._open(theirs_id)
         base_conn, base_id = None, None
         try:
@@ -1212,19 +1373,12 @@ class NeonToolSuite(DBToolSuite):
             info["schema_changes"] = schema
             return info
         finally:
-            theirs_conn.close()
+            self._close(theirs_conn)
             if base_conn is not None:
-                base_conn.close()
+                self._close(base_conn)
             for bid in {theirs_id, base_id}:
                 if bid:
                     self._fdw_cleanup(ours, bid)
-            if NEON_SUSPEND_ON_SWITCH:
-                for bid in {theirs_id, base_id}:
-                    if bid and bid != ours_id:
-                        try:
-                            self._suspend(bid)
-                        except Exception:
-                            pass
 
     def _rebase_impl(self, ref: Ref, onto: Ref, on_conflict="ours") -> dict:
         ours_id = self._on(ref)
@@ -1234,20 +1388,25 @@ class NeonToolSuite(DBToolSuite):
             raise ValueError(f"Cannot rebase branch '{ref.branch}' onto itself")
         up_conn = self._open(up.branch_id)
         base_conn, base_id = None, None
+        theirs_conn, theirs_id = None, None
         try:
-            # Read the upstream at one point: its LSN now becomes the new base.
+            # Read the upstream at one point (a temporary branch at its LSN,
+            # since a spine under load keeps moving): that LSN becomes the
+            # branch's new base.
             up_lsn = up.lsn or self._flush_lsn(up_conn)
+            theirs_id = self._temp_branch(_State(up.branch, up.branch_id, up_lsn))
+            theirs_conn = self._open(theirs_id)
             base = self._merge_base(ours_id, up_conn, up.branch_id, ours)
             if base is None:
                 print(f"Warning: {ref.branch} and {onto.branch} share no fork point: upstream conflicts not detected")
             info = {"up_to_date": False}
             base_id = self._reading_branch(base) if base is not None else None
             base_conn = self._open(base_id) if base_id else None
-            schema = self._reconcile_schema(ours, up_conn, up.branch_id)
+            schema = self._reconcile_schema(ours, theirs_conn, theirs_id)
             # git: "ours" is the upstream, "theirs" the branch's own commits.
             keep_branch = (on_conflict == "theirs")
             if base_conn is not None:
-                tw_info, conflicts = self._three_way(ours, ours_id, up_conn, up.branch_id, base_conn, base_id,
+                tw_info, conflicts = self._three_way(ours, ours_id, theirs_conn, theirs_id, base_conn, base_id,
                                                      on_conflict, ref, schema["added_tables"], keep_ours=keep_branch or callable(on_conflict))
             else:
                 tw_info, conflicts = {"conflicts": 0, "conflict_tables": [], "ours_changes": 0, "theirs_changes": 0,
@@ -1272,19 +1431,14 @@ class NeonToolSuite(DBToolSuite):
             info["schema_changes"] = schema
             return info
         finally:
-            up_conn.close()
+            self._close(up_conn)
+            if theirs_conn is not None:
+                self._close(theirs_conn)
             if base_conn is not None:
-                base_conn.close()
-            for bid in {up.branch_id, base_id}:
+                self._close(base_conn)
+            for bid in {theirs_id, base_id}:
                 if bid:
                     self._fdw_cleanup(ours, bid)
-            if NEON_SUSPEND_ON_SWITCH:
-                for bid in {up.branch_id, base_id}:
-                    if bid and bid != ours_id and bid != self._branch_id(self.default_branch):
-                        try:
-                            self._suspend(bid)
-                        except Exception:
-                            pass
 
     # -- reset / revert ------------------------------------------------------
 
@@ -1301,6 +1455,9 @@ class NeonToolSuite(DBToolSuite):
         self._wait(resp.get("operations"))
         self._refresh_branches()
         # The compute restarts: reconnect, then cut the log at the commit.
+        if self.conn is not None:
+            self._close(self.conn)
+            self.conn = None
         self._current_ref = None
         self._conn_branch_id = None
         self._on(ref)
@@ -1365,23 +1522,32 @@ class NeonToolSuite(DBToolSuite):
             head = self._log_rows(ours, limit=1)[0]
             self._add_commit(ours, bid, "commit", f"revert {commit}", prev_lsn=head["lsn"], prev_branch_id=head["branch_id"])
         finally:
-            ca.close()
-            cb.close()
+            self._close(ca)
+            self._close(cb)
             for x in {a_id, b_id}:
                 self._fdw_cleanup(ours, x)
-            if NEON_SUSPEND_ON_SWITCH:
-                for x in {a_id, b_id}:
-                    if x != bid:
-                        try:
-                            self._suspend(x)
-                        except Exception:
-                            pass
 
     # -- delete --------------------------------------------------------------
 
     def _delete_branch(self, branch_id: str) -> None:
         resp = self._api("DELETE", f"projects/{self.project_id}/branches/{branch_id}")
-        self._wait(resp.get("operations"))
+        try:
+            self._wait(resp.get("operations"))
+        except RuntimeError as e:
+            # A compute suspend that failed alongside the delete is harmless
+            # once the branch is gone.
+            try:
+                self._api("GET", f"projects/{self.project_id}/branches/{branch_id}")
+            except NeonAPIError as g:
+                if g.status == 404:
+                    print(f"Warning: delete of {branch_id}: {e} (branch is gone)")
+                else:
+                    raise e
+            else:
+                raise
+        with type(self)._ACT_LOCK:
+            type(self)._ACTIVE.pop(branch_id, None)
+            type(self)._HOLDS.pop(branch_id, None)
 
     def _flush_deferred(self) -> None:
         still = []
@@ -1400,10 +1566,7 @@ class NeonToolSuite(DBToolSuite):
         bid = self._branch_id(ref.branch)
         if self._current_ref and self._current_ref.branch == ref.branch:
             if self.conn:
-                try:
-                    self.conn.close()
-                except Exception:
-                    pass
+                self._close(self.conn)
                 self.conn = None
             self._current_ref = None
             self._conn_branch_id = None
@@ -1428,9 +1591,10 @@ class NeonToolSuite(DBToolSuite):
                                 "cross-branch reads run once per branch")
 
     def close_connection(self) -> None:
+        self._closed = True
         if getattr(self, "_size_conn", None) is not None:
             try:
-                self._size_conn.close()
+                self._close(self._size_conn)
             except Exception:
                 pass
             self._size_conn = None
@@ -1442,6 +1606,9 @@ class NeonToolSuite(DBToolSuite):
         self._temp.clear()
         if self._deferred_deletes:
             self._flush_deferred()
+        if self.conn is not None:
+            self._close(self.conn)
+            self.conn = None
         super().close_connection()
 
     # ------------------------------------------------------------------
