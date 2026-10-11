@@ -79,11 +79,14 @@ class InvariantRecorder:
 
 
 def is_retryable_error(msg: str) -> bool:
-    """Neon/Xata rate- and resource-limit errors worth waiting out."""
+    """Neon/Xata rate- and resource-limit errors, and Bauplan catalog
+    races, worth waiting out."""
     msg = (msg or "").lower()
     return any(p in msg for p in (
         "429", "too many", "running operations", "branches limit",
         "endpoints limit", "limit reached",
+        # Bauplan: the branch moved while the operation ran.
+        "branch_head_changed",
     ))
 
 
