@@ -493,6 +493,24 @@ class ChronosToolSuite(DBToolSuite):
     def cancel_current_op(self) -> None:
         super().cancel_current_op()
 
+    def _unstick_gc(self) -> Optional[BaseException]:
+        """Chronos's background interval-GC thread exits on its first error
+        and a later delete re-flags GC as pending with nobody to run it, so
+        ``close()`` and ``wait_for_background_work()`` would wait forever.
+        Clear the flags when the worker is gone; return its error."""
+        be = getattr(self._ctx, "_backend", None)
+        th = getattr(be, "_interval_gc_thread", None)
+        if th is None or th.is_alive():
+            return None
+        with be._interval_gc_condition:
+            be._interval_gc_pending = False
+            be._interval_gc_running = False
+            err = be._interval_gc_error
+        if err is not None:
+            self.observe("gc_worker_died")
+            print(f"Warning: Chronos interval GC worker died: {type(err).__name__}: {str(err)[:200]}")
+        return err
+
     def close_connection(self) -> None:
         for s in list(self._sessions.values()):
             try:
@@ -503,6 +521,7 @@ class ChronosToolSuite(DBToolSuite):
         self._session = None
         if self._ctx is not None:
             try:
+                self._unstick_gc()
                 self._ctx.close()
             except Exception:
                 pass
@@ -1553,8 +1572,18 @@ class ChronosToolSuite(DBToolSuite):
             b = parent
 
     def _gc_impl(self) -> None:
+        """Chronos's version reclamation (synchronously, so a dead background
+        worker does not leave garbage behind) then VACUUM."""
         if self._ctx is not None:
-            self._ctx.wait_for_background_work()
+            self._unstick_gc()
+            try:
+                self._ctx.wait_for_background_work()
+            except BranchingError as e:
+                print(f"Warning: {e}")
+            store = getattr(self._ctx._backend, "_native_branch_store", None)
+            if store is not None:
+                reclaimed = store.collect_interval_garbage()
+                self.observe("gc_segments_reclaimed", int(reclaimed or 0))
         self._pgx("VACUUM")
 
     def _storage_bytes(self) -> int:
