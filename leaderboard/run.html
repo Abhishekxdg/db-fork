@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="theme-color" content="#e3ecf5">
+<meta name="theme-color" content="#eceff1">
 <title>Run a benchmark — BranchBench</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='10' fill='%23428c80'/%3E%3Cpath d='M13 10v20m0-10h7q7 0 7-7v-3' fill='none' stroke='white' stroke-width='3'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="styles.css">
@@ -13,62 +13,75 @@
 <a class="skip-link" href="#wizard">Skip to benchmark setup</a>
 <div class="dashboard">
 <header class="site-header shell">
-    <a class="brand" href="index.html" aria-label="BranchBench home"><svg class="brand-mark" width="38" height="38" viewBox="0 0 38 38" aria-hidden="true"><rect width="38" height="38" rx="10" fill="currentColor"/><path d="M12 9v20m0-10h7q7 0 7-7V9" stroke="white" stroke-width="2" fill="none"/><g fill="white"><circle cx="12" cy="9" r="3"/><circle cx="12" cy="29" r="3"/><circle cx="26" cy="9" r="3"/></g></svg><span class="brand-name">BranchBench<span class="brand-period">.</span></span></a>
+    <a class="brand" href="index.html" aria-label="BranchBench home"><svg class="brand-mark" width="38" height="38" viewBox="0 0 38 38" aria-hidden="true"><rect width="38" height="38" rx="10" fill="currentColor"/><path d="M12 9v20m0-10h7q7 0 7-7V9"/><g><circle cx="12" cy="9" r="3"/><circle cx="12" cy="29" r="3"/><circle cx="26" cy="9" r="3"/></g></svg><span class="brand-name">BranchBench<span class="brand-period">.</span></span></a>
     <nav class="header-nav" aria-label="Main navigation"><a class="nav-link" href="index.html">Leaderboard</a><a class="nav-link nav-active" href="run.html" aria-current="page">Run a benchmark</a><a class="nav-link" href="README.md">Methodology ↗</a></nav>
     <a class="button source-link" href="https://github.com/elaineang/db-fork">GitHub ↗</a>
 </header>
 <main class="shell wizard-shell" id="wizard">
     <div class="page-intro"><div><div class="eyebrow">Contribute a result</div><h1>Make your next run count.</h1><p class="section-description">Choose your databases. Set up one machine. Compare reproducible results.</p></div><a class="text-link" href="index.html">← Back to leaderboard</a></div>
-    <aside class="dataset-run-summary" aria-label="Dataset for this run"><div><p class="eyebrow">Fixed dataset · same for every selected database</p><strong>CH-benCHmark seed</strong><p id="run-dataset-scope"></p></div><a class="text-link" href="index.html#dataset">Dataset &amp; workload guide ↗</a></aside>
+    <aside class="dataset-run-summary" aria-label="Dataset for this run"><div><p class="eyebrow" id="run-dataset-kicker">Fixed dataset · same for every selected database</p><strong id="run-dataset-title">CH-benCHmark seed</strong><p id="run-dataset-scope"></p></div><a class="text-link" id="run-dataset-link" href="index.html#dataset">Dataset &amp; workload guide ↗</a></aside>
     <form id="run-form" class="wizard-layout">
         <fieldset id="run-config" class="wizard-card wizard-config">
             <legend class="sr-only">Benchmark configuration</legend>
+                <section class="wizard-section" aria-labelledby="suite-title">
+                    <p class="eyebrow">Configure your run</p><h2 id="suite-title">Suite</h2>
+                    <fieldset class="suite-options"><legend class="sr-only">Suite</legend>
+                        <label class="suite-choice"><input id="suite-micro" type="radio" name="suite" value="micro" checked><strong>Microbench</strong><span>8 branch and read/write workloads, 3 tries each, on the shared seed.</span></label>
+                        <label class="suite-choice"><input id="suite-macro" type="radio" name="suite" value="macro"><strong>Agent workflows</strong><span>Main's S1–S6 scenarios on generated data, one attempt each, frozen presets.</span></label>
+                    </fieldset>
+                </section>
                 <section class="wizard-section" aria-labelledby="databases-title">
-                    <p class="eyebrow">Configure your run</p><h2 id="databases-title">Databases</h2><p class="wizard-description">Select one or more. Each gets the same suite in a separate run.</p>
+                    <h2 id="databases-title">Databases</h2><p class="wizard-description">Dolt and Doltgres are runnable. Each gets the same suite in a separate run; the other systems are preview-only until connectors are added.</p>
                     <fieldset class="database-options" aria-describedby="database-selection"><legend class="sr-only">Databases</legend>
                         <label class="database-choice"><input id="database-dolt" type="checkbox" name="database" value="dolt_mysql" checked><span class="system-icon" data-system="dolt">D</span><strong>Dolt</strong><span>MySQL protocol</span><small>Self-hosted</small></label>
                         <label class="database-choice"><input id="database-doltgres" type="checkbox" name="database" value="dolt"><span class="system-icon" data-system="doltgres">D</span><strong>Doltgres</strong><span>Postgres protocol</span><small>Self-hosted</small></label>
-                        <label class="database-choice"><input id="database-neon" type="checkbox" name="database" value="neon"><span class="system-icon" data-system="neon">N</span><strong>Neon</strong><span>Serverless Postgres</span><small>Managed service</small></label>
-                        <label class="database-choice"><input id="database-tiger" type="checkbox" name="database" value="tiger"><span class="system-icon" data-system="tiger-cloud">T</span><strong>Tiger Cloud</strong><span>Postgres service forks</span><small>Managed service</small></label>
-                        <label class="database-choice"><input id="database-xata" type="checkbox" name="database" value="xata"><span class="system-icon" data-system="xata">X</span><strong>Xata</strong><span>Branching Postgres</span><small>Managed service</small></label>
+                        <label class="database-choice"><input id="database-neon" type="checkbox" name="database" value="neon" disabled><span class="system-icon" data-system="neon">N</span><strong>Neon</strong><span>Serverless Postgres</span><small>Preview only · no connector</small></label>
+                        <label class="database-choice"><input id="database-tiger" type="checkbox" name="database" value="tiger" disabled><span class="system-icon" data-system="tiger-cloud">T</span><strong>Tiger Cloud</strong><span>Postgres service forks</span><small>Preview only · no connector</small></label>
+                        <label class="database-choice"><input id="database-xata" type="checkbox" name="database" value="xata" disabled><span class="system-icon" data-system="xata">X</span><strong>Xata</strong><span>Branching Postgres</span><small>Preview only · no connector</small></label>
                     </fieldset>
                     <p id="database-selection" class="database-selection" role="status">1 database selected</p>
+                </section>
+                <section class="wizard-section" id="macro-section" aria-labelledby="macro-title" hidden>
+                    <h2 id="macro-title">Workflows</h2><p class="wizard-description">Every run covers all six workflows and starts only from a committed tree: the runner validates first and runs nothing if validation fails. Quick runs the upstream <code>_mini</code> workloads in minutes and stays on this machine. Full runs the paper-size workloads, can take hours per database and is the only kind that is published.</p>
+                    <fieldset class="suite-options"><legend class="sr-only">Workload</legend>
+                        <label class="suite-choice"><input id="preset-mini" type="radio" name="preset" value="mini" checked><strong>Quick</strong><span>Mini workloads · minutes · stays on this machine</span></label>
+                        <label class="suite-choice"><input id="preset-full" type="radio" name="preset" value="full"><strong>Full</strong><span>Paper-size workloads · hours · publishable</span></label>
+                    </fieldset>
+                    <p id="macro-selection" class="database-selection" role="status"></p>
                 </section>
                 <section class="wizard-section" aria-labelledby="environment-title">
                     <h2 id="environment-title">Environment</h2><p class="wizard-description">Use the same benchmark machine for every selected database.</p>
                     <div class="wizard-fields"><label for="machine">Machine name<input id="machine" name="machine" required maxlength="64" pattern="[a-z0-9][a-z0-9._\-]{0,63}" placeholder="e.g. workstation-01" autocomplete="off" spellcheck="false" aria-describedby="machine-hint"><span id="machine-hint">Lowercase letters, numbers, dots, underscores, and hyphens.</span></label>
                     <label id="client-field" for="client-location" hidden>Client location<input id="client-location" name="client-location" maxlength="120" placeholder="e.g. US East" autocomplete="off"><span>Where the benchmark machine runs, not the database region.</span></label></div>
-                    <details class="wizard-requirements"><summary>Tools &amp; credentials</summary><ul id="database-requirements" class="database-requirements"></ul><div id="credential-requirements" hidden><p>Set these variables in Terminal, or enter them when prompted.</p><a class="text-link" href="README.md#hosted-systems">Credential setup ↗</a></div></details>
-                    <details class="wizard-setup"><summary>First run? Set up the runner</summary><p>Use Python 3.13 and the database tools listed above.</p><pre><code>python3.13 -m venv .venv
-source .venv/bin/activate
-pip install -r leaderboard/requirements.lock
-pip install -e . --no-deps
-python build_protos.py</code></pre><p>On macOS, libpq’s tools may need adding to your PATH. <a class="text-link" href="README.md#quick-start">Full setup instructions ↗</a></p></details>
+                    <details class="wizard-requirements"><summary>Tools &amp; credentials</summary><ul id="database-requirements" class="database-requirements"></ul><div id="credential-requirements" hidden><p>Set these variables in Terminal, or enter them when prompted.</p><a class="text-link" href="README.md#hosted-connectors-not-implemented">Credential setup ↗</a></div></details>
+                    <details class="wizard-setup"><summary>First run? Set up the runner</summary><p>Install uv, protoc, and the database tools listed above.</p><pre><code>uv sync --frozen
+uv run --frozen python build_protos.py
+source .venv/bin/activate</code></pre><p>On macOS, libpq’s tools may need adding to your PATH. <a class="text-link" href="README.md#quick-start">Full setup instructions ↗</a></p></details>
                 </section>
         </fieldset>
         <section class="wizard-card" aria-labelledby="script-title">
             <div class="wizard-section">
                 <p class="eyebrow">Live script preview</p><h2 id="script-title">Review &amp; run</h2><p class="wizard-description">Your settings update the script automatically. Nothing runs until you click Run in Terminal.</p>
-                <div class="command-card"><div><span>Bash · Run → validate → build</span><button id="copy-command" type="button" disabled>Copy script</button></div><pre tabindex="0" role="region" aria-label="Benchmark script"><code id="run-command"># Enter your machine name to preview the script.</code></pre></div>
+                <div class="command-card"><div><span>Bash · Run, then rebuild the development site</span><button id="copy-command" type="button" disabled>Copy script</button></div><pre tabindex="0" role="region" aria-label="Benchmark script"><code id="run-command"># Enter your machine name to preview the script.</code></pre></div>
                 <p class="copy-status" id="copy-status" role="status" aria-live="polite"></p>
                 <p id="launch-status" class="launch-status" role="status" aria-live="polite"></p>
-                <details id="launcher-setup" class="wizard-setup" open hidden><summary>Enable one-click runs</summary><p>Start the local launcher once from the repository root, then use the page it opens.</p><pre><code>python -m leaderboard.serve</code></pre><p>A file preview can show scripts, but cannot open Terminal on its own.</p></details>
-                <p class="wizard-run-note">Runs are sequential and stop on a failed command. Commit source changes first. Terminal prompts for missing service credentials with input hidden.</p>
+                <details id="launcher-setup" class="wizard-setup" open hidden><summary>Enable one-click runs</summary><p>Start the local development server once from the repository root, then open the wizard it serves. The default production phase has no wizard or launcher.</p><pre><code>python -m leaderboard.serve --phase local</code></pre><p>A file preview can show scripts, but cannot open Terminal on its own.</p></details>
+                <p class="wizard-run-note" id="run-note">Runs are sequential and stop on a failed command. Commit source changes first. Terminal prompts for missing service credentials with input hidden.</p>
             </div>
             <footer class="wizard-actions"><a class="text-link" href="index.html">View leaderboard ↗</a><button id="run-benchmark" class="button button-primary" type="button" disabled>Run in Terminal ↗</button></footer>
         </section>
     </form>
         <section class="wizard-workflow" aria-labelledby="workflow-title">
             <div class="workflow-header"><div><p class="eyebrow">Same suite. Every database.</p><h2 id="workflow-title">How a run works.</h2></div>
-            <div class="wizard-suite"><div><strong id="wizard-workloads">8</strong><span>workloads / database</span></div><div><strong id="wizard-tries">3</strong><span>tries each</span></div></div>
+            <div class="wizard-suite"><div><strong id="wizard-workloads">8</strong><span id="wizard-workloads-label">workloads / database</span></div><div><strong id="wizard-tries">3</strong><span id="wizard-tries-label">tries each</span></div></div>
             </div>
             <ol class="run-outline" aria-label="Benchmark workflow">
                 <li><span aria-hidden="true">01</span><div><strong>Prepare &amp; load</strong><p>Create a temporary database and load the shared dataset.</p></div></li>
                 <li><span aria-hidden="true">02</span><div><strong>Measure</strong><p>Time branch, read, and write workloads with identical settings.</p></div></li>
                 <li><span aria-hidden="true">03</span><div><strong>Clean up &amp; save</strong><p>Remove run resources and save timings and run details as JSON.</p></div></li>
-                <li><span aria-hidden="true">04</span><div><strong>Validate &amp; compare</strong><p>Check the result files and rebuild the leaderboard’s data.</p></div></li>
+                <li><span aria-hidden="true">04</span><div><strong>Validate &amp; compare</strong><p>Rebuild from valid current-suite results; exclude incompatible history.</p></div></li>
             </ol>
-            <details class="wizard-setup"><summary>How results reach the leaderboard</summary><p>The runner saves a JSON result for each database: timing attempts, load and setup times, and environment details. The validator checks it; the build generates <code>data.js</code>, which <code>index.html</code> reads to display the rankings.</p><p>Results currently stay on your machine. Future official rankings will use standardized benchmark workers, with server-side validation and publishing. Local runs remain for development; cloud execution isn’t implemented yet.</p></details>
+            <details class="wizard-setup"><summary>How results reach the leaderboard</summary><p>The runner saves a JSON result for each database: timing attempts, load and setup times, and environment details. <code>python -m leaderboard.site --phase local</code> validates every result on this machine, excludes incompatible or failed runs with their reasons, and generates the development site under <code>leaderboard/.site/local/</code>. Historical result files are kept.</p><p>Results stay on your machine. The production site is assembled separately from the records named in <code>leaderboard/publish.json</code>; nothing run from this wizard is published by it.</p></details>
         </section>
     <footer class="site-footer"><span>BranchBench · Open benchmarks, transparent results.</span><a href="README.md">Full methodology ↗</a></footer>
 </main>
@@ -77,19 +90,24 @@ python build_protos.py</code></pre><p>On macOS, libpq’s tools may need adding 
 const SYSTEMS = {
     dolt_mysql: {name: 'Dolt', requirement: 'Dolt CLI on PATH.', keys: []},
     dolt: {name: 'Doltgres', requirement: 'Doltgres and psql (libpq) on PATH.', keys: []},
-    neon: {name: 'Neon', requirement: 'Neon organization and psql (libpq).', keys: ['NEON_API_KEY_ORG']},
-    tiger: {name: 'Tiger Cloud', requirement: 'Tiger Cloud project and psql (libpq).', keys: ['TIGER_ACCESS_KEY', 'TIGER_SECRET_KEY', 'TIGER_PROJECT_ID']},
-    xata: {name: 'Xata', requirement: 'Xata organization and psql (libpq).', keys: ['XATA_API_KEY', 'XATA_ORGANIZATION_ID']},
 };
+const SCENARIOS = ['rl_env', 'context_mgmt', 'multi_agent', 'dev_agent', 'ops_agent', 'data_agent'];
 function shellQuote(value) { return "'" + value.replaceAll("'", "'\\''") + "'"; }
-function commandsFor(systems, machine, location) {
+function commandsFor(systems, machine, location, macro = null) {
     if (!systems.length || systems.some(system => !Object.hasOwn(SYSTEMS, system))) throw new Error('Choose at least one supported database.');
     if (!machine) throw new Error('Enter a machine name to preview the script.');
     if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(machine)) throw new Error('Use a valid machine name.');
     const hosted = systems.some(system => SYSTEMS[system].keys.length > 0);
+    if (macro) {
+        if (hosted) throw new Error('Agent workflows run only on local databases.');
+        if (!['mini', 'full'].includes(macro.preset)) throw new Error('Choose the Quick or Full workload.');
+        // A failed run still rebuilds the development site; the script keeps the FIRST failure's exit status, a build failure only when every run passed.
+        const runs = systems.map(system => `python -m leaderboard.run_macro ${system} --preset ${macro.preset} --machine ${shellQuote(machine)} || keep $?`);
+        return ['status=0', 'keep() { [ "$status" -ne 0 ] || status=$1; }', ...runs, 'python -m leaderboard.site --phase local || keep $?', 'exit "$status"'].join('\n');
+    }
     if (hosted && (!location.trim() || location.length > 120 || /[\x00-\x1f\x7f]/.test(location))) throw new Error('Enter a valid client location for managed databases.');
     const commands = systems.map(system => `python -m leaderboard.run ${system} --machine ${shellQuote(machine)}${SYSTEMS[system].keys.length ? ` --client-location ${shellQuote(location.trim())}` : ''}`);
-    return [...commands, 'python -m leaderboard.validate', 'python -m leaderboard.build'].join(' &&\n');
+    return [...commands, 'python -m leaderboard.site --phase local'].join(' &&\n');
 }
 const form = document.getElementById('run-form');
 const el = id => document.getElementById(id);
@@ -102,6 +120,10 @@ function refreshPreview() {
     preparedRun = null;
     const systems = [...form.querySelectorAll('input[name="database"]:checked')].map(input => input.value);
     const selected = systems.map(system => SYSTEMS[system]), hosted = selected.some(system => system.keys.length > 0);
+    const macro = el('suite-macro').checked ? {preset: el('preset-full').checked ? 'full' : 'mini'} : null;
+    el('macro-section').hidden = !macro;
+    for (const input of form.querySelectorAll('input[name="preset"]')) input.disabled = !macro;
+    describeSuite(macro);
     const selectionError = systems.length ? '' : 'Select at least one database.';
     el('database-dolt').setCustomValidity(selectionError);
     el('database-selection').textContent = selectionError || `${systems.length} database${systems.length === 1 ? '' : 's'} selected`;
@@ -120,9 +142,10 @@ function refreshPreview() {
     el('copy-status').textContent = ''; el('copy-command').textContent = 'Copy script'; el('copy-command').disabled = true;
     el('run-benchmark').disabled = true; el('run-benchmark').textContent = 'Run in Terminal ↗';
     el('launcher-setup').hidden = localLauncher;
-    const config = {systems, machine: el('machine').value, location: hosted ? el('client-location').value.trim() : ''};
+    const config = {systems, machine: el('machine').value, location: hosted ? el('client-location').value.trim() : '',
+        ...(macro ? {suite: 'macro', preset: macro.preset} : {})};
     try {
-        el('run-command').textContent = commandsFor(systems, config.machine, config.location);
+        el('run-command').textContent = commandsFor(systems, config.machine, config.location, macro);
     } catch (error) {
         el('run-command').textContent = `# ${error.message}`;
         el('launch-status').textContent = error.message;
@@ -132,8 +155,24 @@ function refreshPreview() {
     el('launch-status').textContent = localLauncher ? 'Updating the script for this machine…' : 'Start the local launcher below to enable Run in Terminal.';
     if (localLauncher) previewTimer = setTimeout(() => prepareRun(config, version), 200);
 }
+function describeSuite(macro) {
+    el('wizard-workloads').textContent = macro ? SCENARIOS.length : suite.rows.length; el('wizard-workloads-label').textContent = macro ? 'workflows / database' : 'workloads / database';
+    el('wizard-tries').textContent = macro ? 1 : suite.tries; el('wizard-tries-label').textContent = macro ? 'attempt each' : 'tries each';
+    el('run-dataset-kicker').textContent = macro ? 'Generated per workflow · frozen upstream workloads' : 'Fixed dataset · same for every selected database';
+    el('run-dataset-title').textContent = macro ? `${macro.preset === 'full' ? 'Full' : 'Quick'} workloads: CH-benCHmark schema, scenario-generated data` : 'CH-benCHmark seed';
+    el('run-dataset-link').href = macro ? 'index.html#agent-workflows' : 'index.html#dataset';
+    el('run-dataset-scope').textContent = macro
+        ? `Each workflow runs in its own bb_<id> database that main's runner creates, seeds and the wrapper deletes. Attempts are written to leaderboard/<system>/macro/<date>/. ${macro.preset === 'full' ? 'Full runs can be published.' : 'Quick runs stay on this machine; only Full runs are published.'}`
+        : `${Object.values(suite.dataset.row_counts).reduce((total, count) => total + count, 0).toLocaleString()} rows loaded across ${Object.keys(suite.dataset.row_counts).length} tables. Reads and writes target ${suite.table}, initially ${suite.dataset.row_counts[suite.table].toLocaleString()} rows.`;
+    el('run-note').textContent = macro
+        ? 'Commit source changes first: a run from uncommitted sources fails validation and does not start. Runs are sequential; the page is rebuilt even when a run fails. Opened Terminal means the launch was accepted, not that a workflow started or succeeded.'
+        : 'Runs are sequential and stop on a failed command. Commit source changes first. Terminal prompts for missing service credentials with input hidden.';
+    if (!macro) { el('macro-selection').textContent = ''; return; }
+    el('macro-selection').textContent = `All ${SCENARIOS.length} workflows · ${macro.preset === 'full' ? 'Full' : 'Quick'} workloads`;
+}
 form.addEventListener('submit', event => event.preventDefault());
 form.addEventListener('input', refreshPreview);
+if (location.hash === '#agent-workflows') el('suite-macro').checked = true;
 async function prepareRun(config, version) {
     try {
         const response = await fetch('/api/preview', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(config), signal: AbortSignal.timeout(5000)});
@@ -181,9 +220,6 @@ el('copy-command').addEventListener('click', async () => {
         el('copy-status').textContent = 'Commands selected. Press Ctrl+C or ⌘C to copy.';
     }
 });
-el('wizard-workloads').textContent = suite.rows.length;
-el('wizard-tries').textContent = suite.tries;
-el('run-dataset-scope').textContent = `${Object.values(suite.dataset.row_counts).reduce((total, count) => total + count, 0).toLocaleString()} rows loaded across ${Object.keys(suite.dataset.row_counts).length} tables. Reads and writes target ${suite.table}, initially ${suite.dataset.row_counts[suite.table].toLocaleString()} rows.`;
 refreshPreview();
 </script>
 </body>

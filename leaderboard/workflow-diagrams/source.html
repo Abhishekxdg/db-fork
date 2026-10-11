@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Agent workflow branch histories (build input)</title>
+<!-- Build input for the six PNG diagrams next to this file. Each <section> is one capture
+     target at a 900px logical width; render it in a browser at device scale 2 and save the
+     element screenshot as <id>.png. Pure HTML and CSS: no script, no SVG, no images, no
+     remote resources. Each section is a git-style branch history of one scenario's shape,
+     drawn from the scenario's source, never from an attempt: commit spacing and counts are
+     illustrative, not measured. The full description of each history is the image's alt
+     text in index.html.
+
+     Vocabulary: lanes are branches (y set per section as custom properties); .c is a commit;
+     .fork and .join are quarter-ellipse connectors drawn with two borders and one rounded
+     corner; .arr is a straight dashed arrow; .hop is a dashed half-ellipse arrow for a ref
+     moving backwards along one branch; .fade marks history the scenario leaves behind. -->
+<style>
+    :root { color-scheme: light; font-family: "Avenir Next", "Segoe UI", Arial, sans-serif; font-synthesis: none; -webkit-font-smoothing: antialiased; color: #17221f; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 24px; background: #eceff1; display: flex; flex-direction: column; gap: 24px; align-items: flex-start; }
+    section { position: relative; width: 900px; overflow: hidden; background: #fff; font-size: 16px; line-height: 1.3; }
+    section > * { position: absolute; }
+    .k-main { color: #17221f; } .k-a { color: #1f5a50; } .k-b { color: #327b99; } .k-c { color: #8a3b24; } .fade { color: #b7c1bf; } .k-muted { color: #4c5c5a; }
+    .name { left: 18px; transform: translateY(-50%); font-weight: 600; line-height: 1.2; white-space: nowrap; }
+    .name small { display: block; font-size: 16px; font-weight: 400; color: #4c5c5a; }
+    .lane { height: 3px; margin-top: -1.5px; background: currentColor; }
+    .c { z-index: 1; width: 18px; height: 18px; margin: -9px 0 0 -9px; border: 3px solid currentColor; border-radius: 50%; background: #fff; }
+    .c.fill { background: currentColor; }
+    .fork, .join { border: 0 solid currentColor; margin-top: -1.5px; }
+    .fork.up { margin-left: -1.5px; border-left-width: 3px; border-top-width: 3px; border-top-left-radius: 100%; }
+    .fork.down { margin-left: -1.5px; border-left-width: 3px; border-bottom-width: 3px; border-bottom-left-radius: 100%; }
+    .join.down { border-top-width: 3px; border-right-width: 3px; border-top-right-radius: 100%; }
+    .join.up { border-bottom-width: 3px; border-right-width: 3px; border-bottom-right-radius: 100%; }
+    .arr { height: 0; margin-top: -1.5px; border-top: 3px dashed currentColor; transform-origin: 0 1.5px; }
+    .arr::after, .head { content: ""; position: absolute; width: 12px; height: 12px; border-top: 3px solid currentColor; border-right: 3px solid currentColor; }
+    .arr::after { right: -3px; top: -7px; transform: rotate(45deg); }
+    .head { margin: -6px 0 0 -6px; transform: rotate(135deg); }  /* points down */
+    .hop { margin-top: -1.5px; border: 3px dashed currentColor; border-bottom: 0; border-radius: 50% 50% 0 0 / 100% 100% 0 0; }
+    .tag { color: #2d4441; white-space: nowrap; text-align: center; transform: translate(-50%, 15px); }
+    .tag.above { transform: translate(-50%, calc(-100% - 15px)); }
+    .tag.lead { text-align: right; transform: translate(calc(-100% - 6px), 15px); }
+    .tag.trail { text-align: left; transform: translate(14px, 15px); }
+    .tag.trail.above { transform: translate(14px, calc(-100% - 15px)); }
+    .ref { padding: 1px 8px; border: 2px solid currentColor; border-radius: 6px; background: #fff; font-weight: 600; white-space: nowrap; transform: translate(-50%, calc(-100% - 15px)); }
+    .ref.trail { transform: translate(16px, -50%); }
+    .ref.dash { border-style: dashed; font-weight: 400; }
+    .note { left: 140px; width: 736px; margin: 0; color: #4c5c5a; line-height: 1.4; }
+</style>
+</head>
+<body>
+
+<section id="rl_env" style="--m: 64px; --t: 140px; --a: 212px; --b: 284px; height: 360px">
+    <span class="name k-main" style="top: var(--m)">main<small>database</small></span>
+    <span class="name k-a" style="top: var(--t)">task<small>temporary</small></span>
+    <span class="name k-b" style="top: var(--a)">repair A<small>temporary</small></span>
+    <span class="name k-c" style="top: var(--b)">repair B<small>temporary</small></span>
+
+    <i class="lane k-main" style="top: var(--m); left: 140px; width: 736px"></i>
+    <i class="c k-main" style="left: 180px; top: var(--m)"></i>
+    <i class="c k-main" style="left: 250px; top: var(--m)"></i><span class="tag above" style="left: 250px; top: var(--m)">seeded state</span>
+    <span class="tag above" style="left: 760px; top: var(--m)">main unchanged</span>
+
+    <i class="fork down k-a" style="left: 250px; width: 80px; top: var(--m); height: calc(var(--t) - var(--m) + 2px)"></i>
+    <i class="c k-a" style="left: 330px; top: var(--t)"></i><span class="tag trail above" style="left: 330px; top: var(--t)">inject fault, commit</span>
+
+    <i class="fork down k-b" style="left: 330px; width: 90px; top: var(--t); height: calc(var(--a) - var(--t) + 2px)"></i>
+    <i class="fork down k-c" style="left: 330px; width: 90px; top: var(--t); height: calc(var(--b) - var(--t) + 2px)"></i>
+
+    <i class="lane k-b" style="top: var(--a); left: 420px; width: 160px"></i>
+    <i class="c k-b" style="left: 420px; top: var(--a)"></i>
+    <i class="c k-b" style="left: 500px; top: var(--a)"></i>
+    <i class="c k-b" style="left: 580px; top: var(--a)"></i><span class="tag" style="left: 500px; top: var(--a)">repair checkpoints</span>
+
+    <i class="lane k-c" style="top: var(--b); left: 420px; width: 80px"></i>
+    <i class="c k-c" style="left: 420px; top: var(--b)"></i>
+    <i class="c k-c" style="left: 500px; top: var(--b)"></i><span class="tag" style="left: 460px; top: var(--b)">repair checkpoints</span>
+
+    <div class="note" style="left: 636px; top: 190px; width: 240px; padding: 10px 12px; border: 2px dashed #5f8d84; border-radius: 10px; color: #2d4441"><b>Cross-branch checks + diff</b><br>of each repair tip against the task commit</div>
+    <p class="note" style="top: 320px">Delete task and repair refs; nothing is merged into main.</p>
+</section>
+
+<section id="context_mgmt" style="--a: 84px; --m: 176px; --b: 268px; height: 400px">
+    <span class="name k-a" style="top: var(--a)">retained<small>candidate A</small></span>
+    <span class="name k-main" style="top: var(--m)">main<small>database</small></span>
+    <span class="name k-b" style="top: var(--b)">selected<small>candidate B</small></span>
+
+    <i class="lane k-main" style="top: var(--m); left: 140px; width: 170px"></i>
+    <i class="c k-main" style="left: 180px; top: var(--m)"></i>
+    <i class="c k-main" style="left: 240px; top: var(--m)"></i><span class="tag above" style="left: 210px; top: var(--m)">interactions</span>
+    <i class="c k-main" style="left: 310px; top: var(--m)"></i><span class="tag lead" style="left: 310px; top: var(--m)">checkpoint</span>
+
+    <i class="fork up k-a" style="left: 310px; width: 90px; top: var(--a); height: calc(var(--m) - var(--a) + 2px)"></i>
+    <i class="fork down k-b" style="left: 310px; width: 90px; top: var(--m); height: calc(var(--b) - var(--m) + 2px)"></i>
+
+    <i class="lane k-a" style="top: var(--a); left: 400px; width: 320px"></i>
+    <i class="c k-a" style="left: 400px; top: var(--a)"></i><span class="tag trail" style="left: 400px; top: var(--a)">compaction A</span>
+    <i class="c k-a" style="left: 640px; top: var(--a)"></i>
+    <i class="c k-a" style="left: 720px; top: var(--a)"></i><span class="ref trail k-main" style="left: 720px; top: var(--a)">main</span>
+    <span class="tag above" style="left: 680px; top: var(--a)">replayed work (rebase)</span>
+
+    <i class="lane fade" style="top: var(--b); left: 400px; width: 240px"></i>
+    <i class="c k-b" style="left: 400px; top: var(--b)"></i><span class="tag lead" style="left: 400px; top: var(--b)">compaction B<br>main fast-forwards here</span>
+    <i class="c fade" style="left: 470px; top: var(--b)"></i>
+    <i class="c fade" style="left: 540px; top: var(--b)"></i><span class="tag" style="left: 505px; top: var(--b)">later work</span>
+    <i class="c fade" style="left: 640px; top: var(--b)"></i><span class="tag trail" style="left: 640px; top: var(--b)">revert B (new commit)</span>
+    <span class="ref trail dash k-muted" style="left: 640px; top: var(--b)">main, before rebase</span>
+
+    <i class="arr k-a" style="left: 470px; top: var(--b); width: 238px; transform: rotate(-47.3deg)"></i>
+    <i class="arr k-a" style="left: 540px; top: var(--b); width: 244px; transform: rotate(-45.6deg)"></i>
+
+    <p class="note" style="top: 338px">Rebase main onto A; the final adopt call adds no merge commit. Candidate refs are deleted after their retention window.</p>
+</section>
+
+<section id="multi_agent" style="--a: 76px; --m: 168px; --b: 260px; height: 352px">
+    <span class="name k-a" style="top: var(--a)">agent A<small>temporary</small></span>
+    <span class="name k-main" style="top: var(--m)">main<small>database</small></span>
+    <span class="name k-b" style="top: var(--b)">agent B<small>temporary</small></span>
+
+    <i class="lane k-main" style="top: var(--m); left: 140px; width: 736px"></i>
+    <i class="c k-main" style="left: 180px; top: var(--m)"></i>
+    <i class="c k-main" style="left: 260px; top: var(--m)"></i><span class="tag lead" style="left: 260px; top: var(--m)">shared checkpoint</span>
+    <span class="tag above" style="left: 650px; top: var(--m)">uncommitted task updates</span>
+    <i class="c k-main" style="left: 520px; top: var(--m)"></i><span class="tag" style="left: 520px; top: var(--m)">merge agent A</span>
+    <i class="c k-main" style="left: 700px; top: var(--m)"></i><span class="tag trail" style="left: 700px; top: var(--m)">merge agent B</span>
+
+    <i class="fork up k-a" style="left: 260px; width: 100px; top: var(--a); height: calc(var(--m) - var(--a) + 2px)"></i>
+    <i class="fork down k-b" style="left: 260px; width: 100px; top: var(--m); height: calc(var(--b) - var(--m) + 2px)"></i>
+    <i class="c k-a" style="left: 360px; top: var(--a)"></i><span class="tag above" style="left: 360px; top: var(--a)">revise + commit</span>
+    <i class="c k-b" style="left: 360px; top: var(--b)"></i><span class="tag" style="left: 360px; top: var(--b)">revise + commit</span>
+    <i class="join down k-a" style="left: 360px; width: 160px; top: var(--a); height: calc(var(--m) - var(--a) + 2px)"></i>
+    <i class="join up k-b" style="left: 360px; width: 340px; top: var(--m); height: calc(var(--b) - var(--m) + 2px)"></i>
+
+    <p class="note" style="top: 296px">Serial merges; A then B is a representative order. Conflict policy fixed; agent refs deleted after integration.</p>
+</section>
+
+<section id="dev_agent" style="--f: 72px; --r: 150px; --p: 244px; height: 352px">
+    <span class="name k-a" style="top: var(--f)">feature<small>before rebase</small></span>
+    <span class="name k-a" style="top: var(--r)">feature<small>rebased</small></span>
+    <span class="name k-main" style="top: var(--p)">production<small>database</small></span>
+
+    <i class="lane k-main" style="top: var(--p); left: 140px; width: 736px"></i>
+    <i class="c k-main" style="left: 180px; top: var(--p)"></i>
+    <i class="c k-main" style="left: 250px; top: var(--p)"></i><span class="tag" style="left: 250px; top: var(--p)">base</span>
+    <i class="c k-main" style="left: 380px; top: var(--p)"></i><span class="tag" style="left: 380px; top: var(--p)">migration</span>
+    <i class="c k-main" style="left: 470px; top: var(--p)"></i>
+    <i class="c k-main" style="left: 560px; top: var(--p)"></i><span class="tag" style="left: 560px; top: var(--p)">new base</span>
+    <i class="c k-main" style="left: 800px; top: var(--p)"></i>
+
+    <i class="fork up fade" style="left: 250px; width: 80px; top: var(--f); height: calc(var(--p) - var(--f) + 2px)"></i>
+    <i class="lane fade" style="top: var(--f); left: 330px; width: 160px"></i>
+    <i class="c fade" style="left: 330px; top: var(--f)"></i>
+    <i class="c fade" style="left: 410px; top: var(--f)"></i>
+    <i class="c fade" style="left: 490px; top: var(--f)"></i><span class="tag above" style="left: 410px; top: var(--f)">schema + backfill</span>
+
+    <i class="arr k-a" style="left: 330px; top: var(--f); width: 287px; transform: rotate(14.7deg)"></i>
+    <i class="arr k-a" style="left: 410px; top: var(--f); width: 268px; transform: rotate(15.7deg)"></i>
+    <i class="arr k-a" style="left: 490px; top: var(--f); width: 248px; transform: rotate(16.9deg)"></i>
+
+    <i class="fork up k-a" style="left: 560px; width: 60px; top: var(--r); height: calc(var(--p) - var(--r) + 2px)"></i>
+    <i class="lane k-a" style="top: var(--r); left: 620px; width: 200px"></i>
+    <i class="c k-a" style="left: 620px; top: var(--r)"></i>
+    <i class="c k-a" style="left: 680px; top: var(--r)"></i>
+    <i class="c k-a" style="left: 740px; top: var(--r)"></i><span class="tag trail" style="left: 640px; top: var(--r)">replayed commits</span>
+    <i class="c k-a" style="left: 820px; top: var(--r)"></i><span class="tag above" style="left: 820px; top: var(--r)">review</span>
+
+    <p class="note" style="top: 296px">Rebase onto newer production; review, then delete the feature ref. Never merged into production.</p>
+</section>
+
+<section id="ops_agent" style="--p: 108px; --a: 196px; --b: 272px; height: 376px">
+    <span class="name k-main" style="top: var(--p)">production<small>database</small></span>
+    <span class="name k-a" style="top: var(--a)">investigation A<small>temporary</small></span>
+    <span class="name k-b" style="top: var(--b)">investigation B<small>temporary</small></span>
+
+    <i class="lane k-main" style="top: var(--p); left: 140px; width: 180px"></i>
+    <i class="lane fade" style="top: var(--p); left: 320px; width: 360px"></i>
+    <i class="c k-main" style="left: 180px; top: var(--p)"></i>
+    <i class="c k-main" style="left: 250px; top: var(--p)"></i><span class="tag" style="left: 215px; top: var(--p)">checkpoints under load</span>
+    <i class="c k-main" style="left: 320px; top: var(--p)"></i><span class="ref k-main" style="left: 312px; top: calc(var(--p) - 6px); transform: translate(-100%, calc(-100% - 15px))">production (after reset)</span>
+    <i class="c fade" style="left: 390px; top: var(--p)"></i>
+    <i class="c fade" style="left: 460px; top: var(--p)"></i>
+    <i class="c fade fill" style="left: 540px; top: var(--p)"></i><span class="tag trail" style="left: 540px; top: var(--p)">bad deployment</span>
+    <i class="c fade" style="left: 610px; top: var(--p)"></i>
+    <i class="c fade" style="left: 680px; top: var(--p)"></i><span class="tag trail" style="left: 680px; top: var(--p)">corrupted head</span>
+
+    <i class="hop k-main" style="left: 320px; width: 360px; top: calc(var(--p) - 62px); height: 50px"></i>
+    <i class="head k-main" style="left: 320px; top: calc(var(--p) - 20px)"></i>
+    <span class="tag" style="left: 500px; top: 10px">reset production ref, no new commit</span>
+
+    <i class="fork down k-a" style="left: 320px; width: 80px; top: var(--p); height: calc(var(--a) - var(--p) + 2px)"></i>
+    <i class="c k-a" style="left: 400px; top: var(--a)"></i><span class="tag lead" style="left: 400px; top: var(--a)">check + diff,<br>commit findings</span>
+    <i class="fork down k-b" style="left: 460px; width: 80px; top: var(--p); height: calc(var(--b) - var(--p) + 2px)"></i>
+    <i class="c k-b" style="left: 540px; top: var(--b)"></i><span class="tag trail" style="left: 540px; top: var(--b)">check + diff, commit findings</span>
+
+    <p class="note" style="top: 320px">Reset targets an original production checkpoint, not the findings commit. Delete investigation refs.</p>
+</section>
+
+<section id="data_agent" style="--o: 96px; --r: 178px; --w: 292px; height: 400px">
+    <span class="name k-a" style="top: var(--o)">batch<small>before rebase</small></span>
+    <span class="name k-a" style="top: var(--r)">batch<small>rebased</small></span>
+    <span class="name k-main" style="top: var(--w)">warehouse<small>database</small></span>
+
+    <i class="lane k-main" style="top: var(--w); left: 140px; width: 420px"></i>
+    <i class="c k-main" style="left: 180px; top: var(--w)"></i>
+    <i class="c k-main" style="left: 250px; top: var(--w)"></i><span class="tag" style="left: 250px; top: var(--w)">base</span>
+    <i class="c k-main" style="left: 410px; top: var(--w)"></i><span class="tag" style="left: 410px; top: var(--w)">other batch</span>
+    <i class="c k-main" style="left: 560px; top: var(--w)"></i><span class="tag" style="left: 560px; top: var(--w)">latest warehouse</span>
+
+    <i class="fork up fade" style="left: 250px; width: 80px; top: var(--o); height: calc(var(--w) - var(--o) + 2px)"></i>
+    <i class="lane fade" style="top: var(--o); left: 330px; width: 140px"></i>
+    <i class="c fade" style="left: 330px; top: var(--o)"></i><span class="tag lead" style="left: 312px; top: var(--o)">ingest + validate</span>
+    <i class="c fade" style="left: 400px; top: var(--o)"></i>
+    <i class="c fade" style="left: 470px; top: var(--o)"></i>
+    <i class="hop k-muted" style="left: 330px; width: 70px; top: calc(var(--o) - 46px); height: 34px"></i>
+    <i class="head k-muted" style="left: 330px; top: calc(var(--o) - 20px)"></i>
+    <span class="tag" style="left: 480px; top: 14px">optional retry: reset or re-fork, redo the batch</span>
+
+    <i class="arr k-a" style="left: 330px; top: var(--o); width: 288px; transform: rotate(15.8deg)"></i>
+    <i class="arr k-a" style="left: 400px; top: var(--o); width: 278px; transform: rotate(16.4deg)"></i>
+    <i class="arr k-a" style="left: 470px; top: var(--o); width: 269px; transform: rotate(16.9deg)"></i>
+
+    <i class="fork up k-a" style="left: 560px; width: 60px; top: var(--r); height: calc(var(--w) - var(--r) + 2px)"></i>
+    <i class="lane k-a" style="top: var(--r); left: 620px; width: 120px"></i>
+    <i class="c k-a" style="left: 620px; top: var(--r)"></i>
+    <i class="c k-a" style="left: 680px; top: var(--r)"></i>
+    <i class="c k-a" style="left: 740px; top: var(--r)"></i><span class="ref trail k-main" style="left: 740px; top: var(--r)">warehouse</span>
+    <span class="tag trail" style="left: 640px; top: var(--r)">replayed batch</span>
+
+    <p class="note" style="top: 344px">Pause analytical load for rebase + merge. Fast-forward shown; a three-way merge is possible. Delete batch ref.</p>
+</section>
+
+</body>
+</html>

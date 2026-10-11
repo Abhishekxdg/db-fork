@@ -44,6 +44,14 @@ class Connector(ABC):
     def delete(self, db: str) -> None:
         """Delete everything named after db."""
 
+    @abstractmethod
+    def exists(self, db: str) -> bool:
+        """Whether anything named after db is still on the server or its disk."""
+
+    @abstractmethod
+    def version(self) -> str:
+        """The running server's version, from version_sql."""
+
     def preflight(self) -> None:
         """A hosted connector checks that its keys reach the account before anything is created."""
 

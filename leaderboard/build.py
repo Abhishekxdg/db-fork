@@ -1,8 +1,7 @@
-"""Collect the newest result per system and machine into data.js for the page.
+"""Collect the newest result per system and machine for the page.
 
-From the repository root:
-    python -m leaderboard.build
-The page loads data.js with a script tag, so it also works when opened from disk.
+leaderboard.site writes the result as data.js into the phase's generated directory;
+`python -m leaderboard.build` delegates to it and builds the development site.
 
 A system with no result file yet is shown from leaderboard/mock/<system>.json, if
 one exists. Mock entries carry "mock": true, and the page labels them as mock.
@@ -11,16 +10,19 @@ one exists. Mock entries carry "mock": true, and the page labels them as mock.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 from leaderboard.validate import BOARD, validate
 
 
-def newest(board: Path) -> list[Path]:
-    """For each system and machine, the file in the newest date directory."""
+def newest(board: Path, sources: set[str] | None = None) -> list[Path]:
+    """For each system and machine, the file in the newest date directory, among
+    every result file or only the given board-relative sources."""
     found: dict[tuple[str, str], Path] = {}
     for path in sorted(board.glob("*/results/*/*.json")):  # YYYYMMDD directories sort by date
-        found[path.parts[-4], path.stem] = path
+        if sources is None or path.relative_to(board).as_posix() in sources:
+            found[path.parts[-4], path.stem] = path
     return list(found.values())
 
 
@@ -31,11 +33,12 @@ def mocks(board: Path, measured: set[str]) -> list[dict]:
             for path in sorted((board / "mock").glob("*.json")) if path.stem not in measured]
 
 
-def build(board: Path = BOARD) -> tuple[list[dict], list[dict]]:
+def build(board: Path = BOARD, sources: set[str] | None = None) -> tuple[list[dict], list[dict]]:
     """Entries to rank, and excluded entries with their reasons. A newest file that
-    is an error or invalid excludes its system and machine; no older file stands in."""
+    is an error or invalid excludes its system and machine; no older file stands in.
+    With sources, only those files compete and no mock stands in for anything."""
     entries, excluded, measured = [], [], set()
-    for path in newest(board):
+    for path in newest(board, sources):
         measured.add(path.parts[-4])
         source = path.relative_to(board).as_posix()
         if problems := validate(path, board):
@@ -46,18 +49,15 @@ def build(board: Path = BOARD) -> tuple[list[dict], list[dict]]:
             entries.append({**data, "source": source})
             continue
         excluded.append({"system": path.parts[-4], "machine": path.stem, "source": source, "reason": reason})
-    return entries + mocks(board, measured), excluded
+    return entries + ([] if sources is not None else mocks(board, measured)), excluded
 
 
-def main() -> None:
-    entries, excluded = build()
-    suite = json.loads((BOARD / "suite.json").read_text())
-    (BOARD / "data.js").write_text("".join(
-        f"const {name} = {json.dumps(value, indent=1)};\n"
-        for name, value in (("suite", suite), ("data", entries), ("excluded", excluded))))
-    mock = sum(1 for e in entries if e.get("mock"))
-    print(f"data.js: {len(entries) - mock} entries, {mock} mock, {len(excluded)} excluded")
+def main() -> int:
+    """The historical entry point builds the development site through the assembler."""
+    from leaderboard import site  # the assembler imports this module
+    print("leaderboard.build: assembling the development site (python -m leaderboard.site --phase local)", file=sys.stderr)
+    return site.main(["--phase", "local"])
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

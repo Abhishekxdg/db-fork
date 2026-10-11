@@ -40,6 +40,7 @@ from pathlib import Path
 import psycopg2
 
 import dblib.result_collector as rc
+from dblib import result_pb2 as rslt
 from leaderboard.connector import Connector, connector_names, load_connector
 from leaderboard.validate import BOARD, MACHINE_RE, SCHEMA_VERSION, sha256
 from microbench import task2_pb2 as tp
@@ -61,9 +62,12 @@ from microbench.runner2 import (
 ROOT = BOARD.parent
 RUNS = BOARD / ".runs"
 # What a run imports or reads. A change here, tracked or not, makes the run dirty.
-# Results and data.js are outputs, so a new, uncommitted result never does.
-CODE_PATHS = ["dblib", "microbench", "util", "leaderboard", "db_setup", "pyproject.toml",
-              ":!leaderboard/*/results/*", ":!leaderboard/data.js"]
+# Results, macro attempts, the generated site, the legacy generated data files and
+# the publication manifest are outputs or website configuration that no run reads,
+# so none of them ever does.
+CODE_PATHS = ["dblib", "microbench", "util", "leaderboard", "db_setup", "pyproject.toml", "uv.lock", "build_protos.py",
+              ":!leaderboard/*/results/*", ":!leaderboard/*/macro/*", ":!leaderboard/.site/*", ":!leaderboard/publish.json",
+              ":!leaderboard/data.js", ":!leaderboard/macro-data.js"]
 POINT_OPS = {"read": ReadOperation, "insert": InsertOperation, "update": UpdateOperation}
 RANGE_OPS = {"range_read": RangeReadOperation, "range_update": RangeUpdateOperation}
 SCRIPT_TIMEOUT = 900  # seconds for an install, start, or check script
@@ -169,12 +173,12 @@ def clean_up(system: str, server: Connector) -> Exception | None:
 
 
 def scrub(text: str) -> str:
-    """Mask the password of any connection URI, so no message or record carries one."""
-    return re.sub(r"(://[^:/@\s]+):[^@/\s]+@", r"\1:***@", text)
+    """Mask the password of any connection URI, even an empty one, so no message or record carries one."""
+    return re.sub(r"(://[^:/@\s]+):[^@/\s]*@", r"\1:***@", text)
 
 
 def task_config(backend: int, db: str, suite: dict) -> BenchmarkConfig:
-    task = tp.TaskConfig(run_id=db, backend=backend, table_name=suite["table"], autocommit=True, num_threads=1)
+    task = tp.TaskConfig(run_id=db, backend=backend, table_name=suite["table"], num_threads=1)
     task.database_setup.db_name = db
     # Validation wants one operation; every row brings its own operation and batch.
     task.operation_benchmark.operation = tp.OperationType.READ
@@ -184,76 +188,77 @@ def task_config(backend: int, db: str, suite: dict) -> BenchmarkConfig:
 
 
 def root(ctx: WorkerContext) -> str:
-    """The branch a run starts on: main, a default branch, or Tiger's root service."""
+    """The branch a run starts on: main or the backend's default branch."""
     return ctx.backend_info.default_branch_name
 
 
-def count_rows(tools, tables: dict[str, int]) -> dict[str, int]:
-    return {t: tools.execute_sql(f"SELECT count(*) FROM {t}")[0][0] for t in tables}
+def count_rows(ctx: WorkerContext, tables: dict[str, int]) -> dict[str, int]:
+    return {t: ctx.run_sql(f"SELECT count(*) FROM {t}", timed=False)[0][0] for t in tables}
 
 
-def round_trip_ms(tools) -> float:
+def round_trip_ms(ctx: WorkerContext) -> float:
     """The median of 20 SELECT 1 round trips: the network cost every hosted operation pays."""
     times = []
     for _ in range(20):
         start = time.perf_counter()
-        tools.execute_sql("SELECT 1")
+        ctx.run_sql("SELECT 1", timed=False)
         times.append(time.perf_counter() - start)
     return round(statistics.median(times) * 1000, 3)
 
 
 def drop_branch(ctx: WorkerContext, name: str) -> None:
     """Delete a branch from the root, whether or not the step that made it finished."""
-    ctx.db_tools.connect_branch(root(ctx), timed=False)
+    ctx.connect(root(ctx), timed=False)
     if name in ctx.db_tools.list_branches():
-        ctx.db_tools.delete_branch(name, timed=False)
+        ctx.db_tools.delete(name, timed=False, raise_on_error=True)
 
 
-def verify(ctx: WorkerContext, expected: dict[str, int], root_id: str) -> None:
+def verify(ctx: WorkerContext, expected: dict[str, int], root_ref: str) -> None:
     """Row counts on the root and on a new branch must match the frozen dump."""
-    tools = ctx.db_tools
-    if (on_root := count_rows(tools, expected)) != expected:
+    if (on_root := count_rows(ctx, expected)) != expected:
         raise RunError(f"row counts on the root differ from the dump: {on_root}")
-    tools.create_branch("probe", parent_id=root_id, timed=False)
-    tools.connect_branch("probe", timed=False)
-    on_probe = count_rows(tools, expected)
+    ctx.db_tools.branch("probe", from_ref=root_ref, timed=False, raise_on_error=True)
+    ctx.connect("probe", timed=False)
+    on_probe = count_rows(ctx, expected)
     drop_branch(ctx, "probe")
     if on_probe != expected:
         raise RunError(f"a new branch does not inherit the loaded data: {on_probe}")
 
 
-def build_chain(ctx: WorkerContext, length: int, root_id: str) -> list[tuple[str, str]]:
+def build_chain(ctx: WorkerContext, length: int, root_ref: str) -> list[str]:
     """A chain of branches, each created untimed from the one before."""
-    tools, chain, parent = ctx.db_tools, [], root_id
+    chain, parent = [], root_ref
     for i in range(1, length + 1):
         name = f"chain_{i}"
-        tools.create_branch(name, parent_id=parent, timed=False)
-        tools.connect_branch(name, timed=False)
-        _, parent = tools.get_current_branch()
-        chain.append((name, parent))
-    tools.connect_branch(root(ctx), timed=False)
+        ctx.db_tools.branch(name, from_ref=parent, timed=False, raise_on_error=True)
+        ctx.connect(name, timed=False)
+        parent = name
+        chain.append(name)
+    ctx.connect(root(ctx), timed=False)
     return chain
 
 
-def batch_total(collector: rc.ResultCollector, expected: int) -> float | None:
+def batch_total(collector: rc.ResultCollector, expected: int, op_type: int) -> float | None:
     """A try's cell: the summed timed calls, or None unless every call succeeded."""
-    if collector.failed_operations or len(collector.results) != expected:
+    if collector.failed_operations or any(r.status != rslt.OpStatus.OK for r in collector.results):
         return None
-    return round(sum(r.latency for r in collector.results), 6)
+    rows = [r for r in collector.results if r.op_type == op_type]
+    if len(rows) != expected:
+        return None
+    return round(sum(r.latency for r in rows), 6)
 
 
 # Each cell function below turns any failure into a null cell. That is the
 # recovery: the try is recorded as failed, and its branch is removed.
 
 
-def first_query(ctx: WorkerContext, name: str, tip_id: str, table: str) -> float | None:
+def first_query(ctx: WorkerContext, name: str, tip_ref: str, table: str) -> float | None:
     """Create, connect, and read one row, as one span."""
-    tools = ctx.db_tools
     try:
         start = time.perf_counter()
-        tools.create_branch(name, parent_id=tip_id, timed=False)
-        tools.connect_branch(name, timed=False)
-        tools.execute_sql(f"SELECT * FROM {table} LIMIT 1", timed=False)
+        ctx.db_tools.branch(name, from_ref=tip_ref, timed=False, raise_on_error=True)
+        ctx.connect(name, timed=False)
+        ctx.run_sql(f"SELECT * FROM {table} LIMIT 1", timed=False)
         return round(time.perf_counter() - start, 6)
     except Exception:
         return None
@@ -261,34 +266,34 @@ def first_query(ctx: WorkerContext, name: str, tip_id: str, table: str) -> float
         drop_branch(ctx, name)
 
 
-def timed_create(ctx: WorkerContext, name: str, tip_id: str) -> float | None:
+def timed_create(ctx: WorkerContext, name: str, tip_ref: str) -> float | None:
     ctx.result_collector.reset()
     try:
-        ctx.db_tools.create_branch(name, parent_id=tip_id, timed=True)
-        return batch_total(ctx.result_collector, 1)
+        ctx.db_tools.branch(name, from_ref=tip_ref, timed=True, raise_on_error=True)
+        return batch_total(ctx.result_collector, 1, rslt.OpType.BRANCH)
     except Exception:
         return None
     finally:
         drop_branch(ctx, name)
 
 
-def timed_connects(ctx: WorkerContext, chain: list[tuple[str, str]], batch: int) -> float | None:
+def timed_connects(ctx: WorkerContext, chain: list[str], batch: int) -> float | None:
     ctx.result_collector.reset()
     try:
         for k in range(batch):
-            ctx.db_tools.connect_branch(chain[k % len(chain)][0], timed=True)
-        return batch_total(ctx.result_collector, batch)
+            ctx.connect(chain[k % len(chain)], timed=True)
+        return batch_total(ctx.result_collector, batch, rslt.OpType.CONNECT)
     except Exception:
         return None
     finally:
-        ctx.db_tools.connect_branch(root(ctx), timed=False)
+        ctx.connect(root(ctx), timed=False)
 
 
-def data_row(ctx: WorkerContext, operation, name: str, tip_id: str, batch: int, tries: int) -> list[float | None]:
+def data_row(ctx: WorkerContext, operation, name: str, tip_ref: str, batch: int, tries: int) -> list[float | None]:
     """All tries of one data operation, on one fresh branch off the tip."""
-    ctx.db_tools.create_branch(name, parent_id=tip_id, timed=False)
+    ctx.db_tools.branch(name, from_ref=tip_ref, timed=False, raise_on_error=True)
     try:
-        ctx.db_tools.connect_branch(name, timed=False)
+        ctx.connect(name, timed=False)
         ctx.clear_pk_cache()
         cells = []
         for trial in range(tries):
@@ -299,7 +304,7 @@ def data_row(ctx: WorkerContext, operation, name: str, tip_id: str, batch: int, 
             try:
                 for _ in range(batch):
                     operation.execute(ctx)
-                cells.append(batch_total(ctx.result_collector, batch))
+                cells.append(batch_total(ctx.result_collector, batch, operation.get_operation_type()))
             except Exception:
                 cells.append(None)
         return cells
@@ -308,19 +313,19 @@ def data_row(ctx: WorkerContext, operation, name: str, tip_id: str, batch: int, 
 
 
 def run_row(ctx: WorkerContext, row: dict, chain: list, suite: dict, max_batch: int | None) -> list[float | None]:
-    op, tries, tip_id = row["op"], suite["tries"], chain[-1][1]
+    op, tries, tip_ref = row["op"], suite["tries"], chain[-1]
     batch = min(row["batch"], max_batch) if max_batch else row["batch"]
     if op == "time_to_first_query":
-        return [first_query(ctx, f"ttfq_{t}", tip_id, suite["table"]) for t in range(1, tries + 1)]
+        return [first_query(ctx, f"ttfq_{t}", tip_ref, suite["table"]) for t in range(1, tries + 1)]
     if op == "branch_create":
-        return [timed_create(ctx, f"create_{t}", tip_id) for t in range(1, tries + 1)]
+        return [timed_create(ctx, f"create_{t}", tip_ref) for t in range(1, tries + 1)]
     if op == "branch_connect":
         return [timed_connects(ctx, chain, batch) for _ in range(tries)]
     if op in POINT_OPS:
         operation = POINT_OPS[op](suite["table"])
     else:
         operation = RANGE_OPS[op](suite["table"], suite["range_size"])
-    return data_row(ctx, operation, f"row_{op}", tip_id, batch, tries)
+    return data_row(ctx, operation, f"row_{op}", tip_ref, batch, tries)
 
 
 def measure(server: Connector, info: BackendInfo, db: str, suite: dict, max_batch: int | None,
@@ -333,23 +338,23 @@ def measure(server: Connector, info: BackendInfo, db: str, suite: dict, max_batc
                         SharedBranchManager(), None, [])
     with ctx:
         tools = ctx.db_tools
-        version = str(tools.execute_sql(server.version_sql)[0][0])
-        rtt_ms = round_trip_ms(tools)
-        _, root_id = tools.get_current_branch()
+        version = str(ctx.run_sql(server.version_sql, timed=False)[0][0])
+        rtt_ms = round_trip_ms(ctx)
+        root_ref = ctx.current_branch
         expected = suite["dataset"]["row_counts"]
-        verify(ctx, expected, root_id)
-        chain = build_chain(ctx, suite["chain_length"], root_id)
+        verify(ctx, expected, root_ref)
+        chain = build_chain(ctx, suite["chain_length"], root_ref)
         cells = []
         for row in suite["rows"]:
             if time.monotonic() > deadline:
                 raise RunError("the run passed its deadline")
             cells.append(run_row(ctx, row, chain, suite, max_batch))
-        tools.connect_branch(chain[-1][0], timed=False)
-        if (on_tip := count_rows(tools, expected)) != expected:
+        ctx.connect(chain[-1], timed=False)
+        if (on_tip := count_rows(ctx, expected)) != expected:
             raise RunError(f"row writes reached the chain's tip: {on_tip}")
-        tools.connect_branch(root(ctx), timed=False)
-        for name, _ in reversed(chain):  # leaf first
-            tools.delete_branch(name, timed=False)
+        ctx.connect(root(ctx), timed=False)
+        for name in reversed(chain):  # leaf first
+            tools.delete(name, timed=False, raise_on_error=True)
     return version, rtt_ms, cells
 
 
@@ -374,16 +379,16 @@ def publish(out: Path, system: str, machine: str, day: dt.date, payload: dict) -
     return path
 
 
-def source_snapshot(dump: Path) -> dict:
+def source_snapshot(code_paths: list[str], *extra: Path) -> dict:
     """Capture effective inputs, including edits to an already-dirty working tree."""
     def git(*args: str) -> str:
         return subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True,
                               check=True, timeout=30).stdout
 
-    files = git("ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", *CODE_PATHS)
-    paths = {ROOT / name for name in files.split("\0") if name} | {dump}
+    files = git("ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", *code_paths)
+    paths = {ROOT / name for name in files.split("\0") if name} | set(extra)
     return {"commit": git("rev-parse", "HEAD").strip(),
-            "status": git("status", "--porcelain", "--", *CODE_PATHS),
+            "status": git("status", "--porcelain", "--", *code_paths),
             "files": {str(p): sha256(p) if p.is_file() else None for p in paths}}
 
 
@@ -404,7 +409,7 @@ def run(system: str, machine: str, out: Path, max_batch: int | None, allow_dirty
     suite_bytes = suite_path.read_bytes()
     suite = json.loads(suite_bytes)
     dump = ROOT / suite["dataset"]["path"]
-    snapshot = source_snapshot(dump)
+    snapshot = source_snapshot(CODE_PATHS, dump)
     digests = snapshot["files"]
     if (digests[str(suite_path)] != hashlib.sha256(suite_bytes).hexdigest()
             or digests[str(meta_path)] != hashlib.sha256(meta_bytes).hexdigest()):
@@ -469,7 +474,7 @@ def run(system: str, machine: str, out: Path, max_batch: int | None, allow_dirty
 
     if failure is None:
         try:
-            if source_snapshot(dump) != snapshot:
+            if source_snapshot(CODE_PATHS, dump) != snapshot:
                 raise RunError("source, dataset, or Git HEAD changed during the run; results were not published")
         except Exception as e:
             failure = e
@@ -496,7 +501,7 @@ def run(system: str, machine: str, out: Path, max_batch: int | None, allow_dirty
         "dirty": dirty,
         "dataset_sha256": suite["dataset"]["sha256"],
         "python": platform.python_version(),
-        "lock_sha256": digests[str(BOARD / "requirements.lock")],
+        "lock_sha256": digests[str(ROOT / "uv.lock")],
         "provision_time": round(provision_time, 6),
         "load_time": round(load_time, 6),
     }

@@ -3,570 +3,151 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="theme-color" content="#e3ecf5">
-<meta name="description" content="An open, reproducible benchmark for database branching. Compare branches, reads, writes, and loading across local and hosted systems.">
-<title>BranchBench — Leaderboard</title>
+<meta name="theme-color" content="#eceff1">
+<meta name="description" content="An open, reproducible benchmark for database branching. Agent workflows end to end, and branch, read, write and load operations, across self-hosted and managed-service systems.">
+<title>BranchBench leaderboard</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='10' fill='%23428c80'/%3E%3Cpath d='M13 10v20m0-10h7q7 0 7-7v-3' fill='none' stroke='white' stroke-width='3'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="styles.css">
 <script src="data.js"></script>
+<script src="macro-data.js"></script>
 </head>
 <body>
-<a class="skip-link" href="#leaderboard">Skip to benchmarks</a>
+<a class="skip-link" href="#main-content">Skip to content</a>
 <div class="dashboard">
 <header class="site-header shell">
-    <a class="brand" href="#" aria-label="BranchBench home">
-        <svg class="brand-mark" width="38" height="38" viewBox="0 0 38 38" aria-hidden="true"><rect width="38" height="38" rx="10" fill="currentColor"/><path d="M12 9v20m0-10h7q7 0 7-7V9" stroke="white" stroke-width="2" fill="none"/><g fill="white"><circle cx="12" cy="9" r="3"/><circle cx="12" cy="29" r="3"/><circle cx="26" cy="9" r="3"/></g></svg>
+    <a class="brand" href="#leaderboard" aria-label="BranchBench home">
+        <svg class="brand-mark" width="38" height="38" viewBox="0 0 38 38" aria-hidden="true"><rect width="38" height="38" rx="10" fill="currentColor"/><path d="M12 9v20m0-10h7q7 0 7-7V9"/><g><circle cx="12" cy="9" r="3"/><circle cx="12" cy="29" r="3"/><circle cx="26" cy="9" r="3"/></g></svg>
         <span class="brand-name">BranchBench<span class="brand-period">.</span></span>
     </a>
-    <nav class="header-nav" aria-label="Main navigation"><a class="nav-link nav-active" href="#leaderboard" aria-current="page">Leaderboard</a><a class="nav-link" href="#methodology">Scoring</a><a class="nav-link" href="README.md">Methodology <span aria-hidden="true">↗</span></a></nav>
+    <nav class="header-nav" aria-label="Main navigation"><a class="nav-link" id="nav-board" href="#agent-workflows">Leaderboard</a><a class="nav-link" id="nav-workflows" href="#workflows">Workflows</a><a class="nav-link" id="nav-operations" href="#dataset">Operations</a><a class="nav-link" id="doc-nav" href="README.md">Methodology <span aria-hidden="true">↗</span></a><a class="nav-link" id="nav-run" href="run.html">Run a benchmark</a></nav>
     <a class="button source-link" href="https://github.com/elaineang/db-fork">GitHub <span aria-hidden="true">↗</span></a>
 </header>
-<main class="shell">
-    <section class="workspace" id="leaderboard" aria-labelledby="leaderboard-title">
-        <div class="page-intro">
-            <div><div class="eyebrow">Database performance <span aria-hidden="true">/</span> Open benchmarks</div><h1 id="leaderboard-title">Leaderboard</h1><p class="section-description">Branch, query, compare. Reproducible performance, down to the workload.</p></div>
-            <a class="button button-primary" href="run.html">Run a benchmark <span aria-hidden="true">↗</span></a>
+<main class="shell" id="main-content">
+<section id="leaderboard" aria-labelledby="leaderboard-title">
+    <h1 class="page-title" id="leaderboard-title">Leaderboard</h1>
+    <div class="board-card">
+        <div class="suite-tabs" id="selectors-suite" role="tablist" aria-label="Benchmark suite"></div>
+        <div class="suite-view" id="macro-view" role="tabpanel" aria-labelledby="tab-macro">
+            <div class="filter-bar" id="macro-filters">
+                <label class="chip chip-select" for="macro-rank"><span class="chip-label">Rank by</span><select id="macro-rank"></select></label>
+            </div>
+            <div id="macro-groups"></div>
         </div>
-        <details class="method-section dataset-guide" id="dataset">
-            <summary><span class="dataset-summary"><span class="eyebrow">Dataset &amp; workloads</span><strong>CH-benCHmark seed</strong><span class="dataset-size" id="dataset-size"></span></span><span class="suite-facts" aria-label="Current benchmark suite"><span><strong id="stat-workloads">—</strong> workloads</span><span><strong id="stat-tries">—</strong> tries each</span><span><strong id="stat-rows">—</strong> <span id="stat-table-label">initial rows</span></span></span></summary>
-            <div class="method-content">
-                <p>A small, seeded retail dataset with a CH-benCHmark-style schema. These are branching and read/write microbenchmarks, <strong>not the full CH-benCHmark, TPC-C, or TPC-H workload suites.</strong></p>
-                <div class="dataset-grid">
-                    <section aria-labelledby="dataset-tables-title"><h3 id="dataset-tables-title">What gets loaded</h3><p id="dataset-scope"></p><table class="dataset-table" aria-labelledby="dataset-tables-title"><thead><tr><th scope="col">Table</th><th scope="col">Initial rows</th></tr></thead><tbody id="dataset-tables"></tbody></table></section>
-                    <section aria-labelledby="workload-guide-title"><h3 id="workload-guide-title">What gets timed</h3><p id="workload-protocol"></p><dl class="workload-guide" id="workload-guide"></dl><p>Load measures the SQL import once. Provisioning is recorded separately and is not ranked. Hosted timings include network round trips.</p></section>
+        <div class="suite-view" id="micro-view" role="tabpanel" aria-labelledby="tab-micro" hidden>
+            <div class="filter-bar">
+                <div class="segmented" role="group" aria-label="Try selection"><div id="selectors-mode"></div></div>
+                <label class="chip chip-select" for="sort-metric"><span class="chip-label">Rank by</span><select id="sort-metric"></select></label>
+                <details class="chip" id="chip-hosted"><summary><span class="chip-label">Hosting</span> <span class="chip-value" id="value-hosted"></span></summary><div class="chip-menu" id="selectors-hosted" role="group" aria-label="Hosting"></div></details>
+                <details class="chip" id="chip-system"><summary><span class="chip-label">Systems</span> <span class="chip-value" id="value-system"></span></summary><div class="chip-menu" id="selectors-system" role="group" aria-label="Systems"></div></details>
+                <details class="chip" id="chip-machine"><summary><span class="chip-label">Machine</span> <span class="chip-value" id="value-machine"></span></summary><div class="chip-menu" id="selectors-machine" role="group" aria-label="Machine"></div></details>
+                <details class="chip" id="chip-tag"><summary><span class="chip-label">Capabilities</span> <span class="chip-value" id="value-tag"></span></summary><div class="chip-menu" id="selectors-tag" role="group" aria-label="Capabilities"></div></details>
+                <button class="chip-reset" id="reset-filters" type="button" hidden>Reset filters</button>
+                <p class="filter-meta"><span id="shown" aria-live="polite"></span> · Last run <span id="updated"></span></p>
+            </div>
+            <div class="empty-state" id="empty-state" hidden><div><h2 class="empty-title" id="empty-title"></h2><p class="empty-description" id="empty-description"></p></div><button class="button" id="clear-empty-filters" type="button" hidden>Reset filters</button></div>
+            <div id="groups"></div>
+        </div>
+    </div>
+
+    <div class="suite-more" id="macro-more">
+        <section class="explorer-section" id="workflows" aria-labelledby="workflows-title">
+            <div class="section-head"><h2 id="workflows-title">The workflows</h2><p>Jobs an AI agent runs against a branching database. Pick one to watch its branch history.</p></div>
+            <div class="explorer">
+                <div class="explorer-list" id="selectors-workflow" role="group" aria-label="Workflow"></div>
+                <article class="explorer-stage" aria-labelledby="workflow-name">
+                    <div class="stage-head"><h3 id="workflow-name"></h3><span class="stage-id" id="workflow-id"></span></div>
+                    <p class="stage-caption" id="workflow-caption"></p>
+                    <figure class="stage-figure"><div class="scene" id="workflow-scene"></div><figcaption class="diagram-disclaimer">Illustrative branch history, not a trace of any attempt: commit spacing and counts are not measured.</figcaption></figure>
+                    <div class="stage-facts">
+                        <div id="workflow-ops-block"><h4>Branch operations</h4><ul class="op-chips" id="workflow-ops"></ul></div>
+                        <div><h4>Completion time</h4><div id="workflow-results"></div></div>
+                    </div>
+                    <details class="inline-more" id="workflow-text"><summary>Read the history as text</summary><p id="workflow-alt"></p></details>
+                </article>
+            </div>
+        </section>
+        <details class="disclosure" id="macro-guide">
+            <summary>How workflows are timed and judged</summary>
+            <div class="disclosure-body">
+                <dl class="rule-list">
+                    <div><dt>Completion time</dt><dd>Starts once the schema and seed data are in place. Stops when the last workflow step has finished and any background traffic has stopped. Setup and database cleanup are recorded separately.</dd></div>
+                    <div><dt>On the board</dt><dd>A run starts only after validation: committed sources, all six workflows, a runnable system and a free port. A finished run is shown only if it also validates: sources unchanged, server stopped, every database cleaned up and every attempt's evidence readable. Anything else is listed below the board with its reason.</dd></div>
+                    <div><dt>Rank</dt><dd>By one workflow's completion time at a time, among systems run with the same workload, benchmark revision, runtime and machine. Tied times share a rank. There is no overall score.</dd></div>
+                    <div><dt>Shading</dt><dd>A darker cell is closer to the fastest time in its column; the check marks the fastest.</dd></div>
+                </dl>
+                <dl class="status-rules" id="status-rules"></dl>
+                <p class="fine"><a class="text-link" id="doc-macro" href="README.md#agent-workflows">Full methodology ↗</a></p>
+            </div>
+        </details>
+        <div id="macro-excluded"></div>
+    </div>
+
+    <div class="suite-more" id="micro-more" hidden>
+        <div id="breakdowns"></div>
+        <div id="excluded"></div>
+        <section class="explorer-section" id="dataset" aria-labelledby="dataset-title">
+            <div class="section-head"><h2 id="dataset-title">The operations</h2><p>Branch, read and write operations on a small CH-benCHmark-style seed, not the full benchmark suites. Pick one to watch what is timed.</p></div>
+            <div class="explorer">
+                <div class="explorer-list" id="selectors-operation" role="group" aria-label="Operation"></div>
+                <article class="explorer-stage" aria-labelledby="operation-name">
+                    <div class="stage-head"><h3 id="operation-name"></h3><span class="stage-id" id="operation-id"></span></div>
+                    <p class="stage-caption" id="operation-caption"></p>
+                    <figure class="stage-figure"><div class="scene" id="operation-scene"></div><figcaption class="diagram-disclaimer">Illustrative: beads are commits, open circles are new branch heads, rings are reads and squares are writes. Animation speed is not a result.</figcaption></figure>
+                    <div class="stage-facts">
+                        <div><h4>What is timed</h4><ul class="op-chips" id="operation-facts"></ul></div>
+                        <div><h4>Batch time</h4><div id="operation-results"></div></div>
+                    </div>
+                </article>
+            </div>
+            <dl class="fact-line">
+                <div><dt>Dataset</dt><dd id="dataset-size"></dd></div>
+                <div><dt>Timed table</dt><dd id="dataset-target"></dd></div>
+                <div><dt>Protocol</dt><dd id="workload-protocol"></dd></div>
+            </dl>
+            <details class="disclosure" id="dataset-details">
+                <summary>Tables, checksum and seed</summary>
+                <div class="disclosure-body dataset-grid">
+                    <table class="dataset-table" aria-label="Initial rows per table"><thead><tr><th scope="col">Table</th><th scope="col">Initial rows</th></tr></thead><tbody id="dataset-tables"></tbody></table>
+                    <div>
+                        <dl class="rule-list"><div><dt>SQL seed file</dt><dd><code id="dataset-path"></code></dd></div><div><dt>Dataset SHA-256</dt><dd><code id="dataset-hash"></code></dd></div><div><dt>Suite / workload seed</dt><dd id="dataset-version"></dd></div></dl>
+                        <p class="fine">The checksum identifies the exact loaded dataset. The workload seed fixes which keys each try targets; it does not generate the SQL dump. Load runs once; provisioning is recorded separately and never ranked. Hosted timings include network round trips.</p>
+                    </div>
                 </div>
-                <details class="dataset-provenance"><summary>Source &amp; reproducibility</summary><dl class="scoring-rules"><dt>SQL seed file</dt><dd><code id="dataset-path"></code></dd><dt>Dataset SHA-256</dt><dd><code id="dataset-hash"></code></dd><dt>Suite / workload seed</dt><dd id="dataset-version"></dd></dl><p>The file checksum identifies the exact loaded dataset. The workload seed fixes which keys each try targets, not generated values; it does not generate the SQL dump. Compare runs with the same suite, dataset, and controlled environment.</p></details>
-            </div>
-        </details>
-        <div class="workspace-toolbar"><div class="segmented" id="try-row" role="group" aria-label="Try selection"><div id="selectors-mode"></div></div>
-        <div class="toolbar-meta"><p id="shown" aria-live="polite"></p><span class="updated-label">Last run <span id="updated"></span></span></div>
-        <details class="filters-panel">
-            <summary><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M3 5h14M3 10h14M3 15h14"/><path d="M7 3v4m6 1v4m-6 1v4" stroke-width="3"/></svg>Filters <span class="filter-count" id="filter-count" hidden></span></summary>
-            <div class="filters-grid">
-                <div class="filter-group"><span class="filter-label" id="label-hosted">Hosting</span><div id="selectors-hosted" role="group" aria-labelledby="label-hosted"></div></div>
-                <div class="filter-group"><span class="filter-label" id="label-system">Systems</span><div id="selectors-system" role="group" aria-labelledby="label-system"></div></div>
-                <div class="filter-group"><span class="filter-label" id="label-machine">Machine</span><div id="selectors-machine" role="group" aria-labelledby="label-machine"></div></div>
-                <div class="filter-group"><span class="filter-label" id="label-tag">Capabilities</span><div id="selectors-tag" role="group" aria-labelledby="label-tag"></div></div>
-                <div class="filter-group" id="data-row"><span class="filter-label" id="label-kind">Data source</span><div id="selectors-kind" role="group" aria-labelledby="label-kind"></div></div>
-                <div class="filter-group filter-reset"><button class="button button-secondary" id="reset-filters" type="button">Reset filters <span aria-hidden="true">↺</span></button></div>
-            </div>
-        </details>
-        </div>
-        <div class="empty-state" id="empty-state" hidden><div class="empty-copy"><h2 class="empty-title" id="empty-title"></h2><p class="empty-description" id="empty-description"></p></div><a class="button button-secondary" id="empty-guide" href="run.html">Run a benchmark ↗</a><button class="button button-secondary" id="clear-empty-filters" type="button" hidden>Reset filters</button></div>
-        <div id="groups"></div><div id="excluded"></div>
-        <noscript><p>Enable JavaScript to view results. <a href="README.md">Methodology ↗</a></p></noscript>
-    </section>
-    <details class="method-section" id="methodology">
-        <summary id="method-title">Scoring</summary>
-        <div class="method-content"><p>Suite <span id="suite-badge"></span></p><p id="method"></p>
-        <dl class="scoring-rules"><dt>Branches</dt><dd>Time to first query.</dd><dt>Reads &amp; writes</dt><dd>Geometric mean of selected ratios. None selected = all.</dd><dt>Load</dt><dd>Load time only; provisioning excluded.</dd><dt>Best repeat</dt><dd>min(try 2, try 3); both must succeed.</dd><dt>Timing heatmap</dt><dd>Darker mint means closer to the fastest time in that row. Cells show batch totals, not per-query averages; a check marks the fastest.</dd></dl>
-        <code class="method-equation">ratio = (time + 10 ms) / (best + 10 ms)</code>
-        <p>Load uses no shift. Local and hosted rankings stay separate. Ranks use unrounded scores.</p>
-        <a class="text-link" href="README.md">Full methodology ↗</a></div>
-    </details>
-    <footer class="site-footer"><span>BranchBench <span aria-hidden="true">·</span> Open benchmarks, transparent results.</span><a href="README.md#what-is-measured">How we measure <span aria-hidden="true">↗</span></a></footer>
+            </details>
+            <details class="disclosure" id="methodology">
+                <summary id="methodology-summary">How scores work</summary>
+                <div class="disclosure-body">
+                    <dl class="rule-list">
+                        <div><dt>First query</dt><dd>Time to first query on a new branch.</dd></div>
+                        <div><dt>Reads &amp; writes</dt><dd>Geometric mean of the selected workloads' ratios. None selected means all.</dd></div>
+                        <div><dt>Load</dt><dd>Load time only; provisioning is excluded.</dd></div>
+                        <div><dt>Best repeat</dt><dd>The faster of tries 2 and 3; both must succeed.</dd></div>
+                        <div><dt>Rank</dt><dd>By the chosen score only. Tied scores share a rank. There is no overall score.</dd></div>
+                    </dl>
+                    <code class="method-equation">ratio = (time + 10 ms) / (fastest + 10 ms)</code>
+                    <p class="fine">Load uses no shift. Self-hosted and managed-service rankings stay separate. Ranks use unrounded scores. Suite <span id="suite-badge"></span> · <span id="method"></span>. <a class="text-link" id="doc-scoring" href="README.md">Full methodology ↗</a></p>
+                </div>
+            </details>
+        </section>
+    </div>
+    <noscript><p>Enable JavaScript to view results. <a href="https://github.com/elaineang/db-fork/blob/main/leaderboard/README.md">Methodology ↗</a></p></noscript>
+</section>
 </main>
+<footer class="site-footer shell"><span>BranchBench <span aria-hidden="true">·</span> Open benchmarks, every attempt published.</span><a id="doc-footer" href="README.md#what-is-measured">How we measure <span aria-hidden="true">↗</span></a></footer>
 </div>
-<div id="benchmark-help" class="benchmark-help" popover="auto" role="tooltip"></div>
-<dialog id="run-dialog" class="run-dialog" aria-labelledby="run-title" aria-describedby="run-subtitle">
-    <header class="run-header">
-        <div><p class="eyebrow">Behind the benchmark</p><h2 id="run-title"></h2><p id="run-subtitle"></p></div>
-        <button class="close-run" id="close-run" type="button" aria-label="Close result details" autofocus>×</button>
+<dialog id="run-dialog" class="dialog" aria-labelledby="run-title" aria-describedby="run-subtitle">
+    <header class="dialog-head">
+        <div class="dialog-title"><h2 id="run-title"></h2><p id="run-subtitle"></p></div>
+        <button class="close-run" id="close-run" type="button" aria-label="Close details"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8m0-8l-8 8"/></svg></button>
     </header>
-    <div class="run-body" id="run-body"></div>
-    <footer class="run-footer"><span>Every attempt. Nothing hidden.</span><a class="button" id="run-source" target="_blank" rel="noopener">View raw JSON <span aria-hidden="true">↗</span></a></footer>
+    <div class="dialog-body" id="run-body" tabindex="0" role="region" aria-label="Result details"></div>
+    <footer class="dialog-foot"><span>Every attempt, nothing hidden.</span><a class="text-link" id="run-source" target="_blank" rel="noopener">Raw summary JSON ↗</a></footer>
 </dialog>
-<script>
-const el = id => document.getElementById(id);
-function node(tag, className = '', text) {
-    const element = document.createElement(tag);
-    element.className = className;
-    if (text !== undefined) element.textContent = text;
-    return element;
-}
-if (typeof suite === 'undefined') {
-    el('groups').textContent = 'data.js is missing. From the repository root, run: python -m leaderboard.build';
-    throw new Error('data.js is missing');
-}
-const SHIFT = 0.01;
-const NAMES = {time_to_first_query: 'Time to first query', branch_create: 'Branch create', branch_connect: 'Branch connect', read: 'Point read', range_read: 'Range read', insert: 'Insert', update: 'Point update', range_update: 'Range update'};
-const DESCRIPTIONS = {
-    time_to_first_query: 'Create a child branch, connect to it, and read one row. The timer spans all three steps: how soon can a new branch answer a query?',
-    branch_create: 'Create one child branch from the tip of the existing chain. This measures creation only, without connecting or querying.', branch_connect: `Connect to each existing branch in a chain of ${suite.chain_length}, cycling through them for the batch. No new branches are created.`,
-    read: 'Look up one row by its primary key and return it.', range_read: `Read a consecutive range of ${suite.range_size} keys in one operation. The batch repeats that range read, not individual point reads.`,
-    insert: 'Generate and insert one new row with a unique primary key. Writes run on a dedicated child branch.', update: 'Find one row by its primary key and update its values on a dedicated child branch.', range_update: `Update a consecutive range of ${suite.range_size} keys in one operation, on a dedicated child branch.`,
-};
-function pick(tries, mode) {
-    if (mode === 'first') return tries[0];
-    return tries[1] !== null && tries[2] !== null ? Math.min(tries[1], tries[2]) : null;
-}
-const suiteRows = suite.rows.map((row, i) => ({...row, label: NAMES[row.op] || row.op, title: DESCRIPTIONS[row.op], shift: SHIFT, value: e => pick(e.result[i], state.mode)}));
-const loadRow = {op: 'load', label: 'Load', title: 'Load the SQL dump into the newly provisioned database. This is measured once, before the workload trials.', shift: 0, value: e => e.load_time};
-const provisionRow = {op: 'provision', label: 'Provisioning', title: 'Create the empty database or hosted service before loading data. Recorded separately and never included in the ranking.', shift: 0, value: e => e.provision_time};
-const allRows = [...suiteRows, loadRow, provisionRow];
-const VIEWS = {
-    branch: {label: 'First query', description: 'Create a branch, connect, read.', rows: suiteRows.slice(0, 3), ranked: rows => rows.slice(0, 1)},
-    data: {label: 'Reads & writes', description: 'One score for your selected workloads.', rows: suiteRows.slice(3), ranked: rows => {
-        const ticked = rows.filter(r => state.ticked.has(r)); return ticked.length ? ticked : rows;
-    }},
-    load: {label: 'Load', description: 'From an empty database to ready.', rows: [loadRow, provisionRow], ranked: rows => rows.slice(0, 1)},
-};
-const uniq = values => [...new Set(values)].sort((a, b) => a.localeCompare(b, undefined, {numeric: true}));
-const allOn = values => Object.fromEntries(values.map(v => [v, true]));
-const state = {
-    mode: 'first', chartRow: 0, ticked: new Set(suiteRows), hosted: allOn(['no', 'yes']),
-    system: allOn(uniq(data.map(e => e.system))), machine: allOn(uniq(data.map(e => e.machine))),
-    tag: allOn(uniq(data.flatMap(e => e.tags))), kind: allOn(['measured', 'mock']),
-};
-const FILTERS = {
-    hosting: e => state.hosted[e.hosted], system: e => state.system[e.system], machine: e => state.machine[e.machine],
-    tags: e => Object.values(state.tag).every(Boolean) || e.tags.some(t => state.tag[t]), data: e => state.kind[e.mock ? 'mock' : 'measured'],
-};
-const label = e => `${e.system} (${e.mock ? 'mock' : e.machine})`;
-const seconds = value => value === null ? 'Failed' : `${value.toLocaleString('en-US', {minimumFractionDigits: 3, maximumFractionDigits: 6, useGrouping: false})}s`;
-function selector(text, active, onclick, id) {
-    const button = node('button', 'selector' + (active ? ' selector-active' : ''), text);
-    button.type = 'button'; button.id = id; button.setAttribute('aria-pressed', String(active));
-    button.addEventListener('click', () => { onclick(); render(); el(id).focus(); });
-    return button;
-}
-function toggles(container, map, name = k => k) {
-    const every = Object.values(map).every(Boolean);
-    container.replaceChildren(selector('All', every, () => { for (const k in map) map[k] = !every; }, `${container.id}-all`),
-        ...Object.keys(map).map((k, i) => selector(name(k), map[k], () => { map[k] = !map[k]; }, `${container.id}-${i}`)));
-}
-function choice(container, options, key) {
-    container.replaceChildren(...Object.entries(options).map(([k, title]) => selector(title, state[key] === k, () => { state[key] = k; }, `choice-${key}-${k}`)));
-}
-function resetFilters() {
-    for (const key of ['hosted', 'system', 'machine', 'tag', 'kind']) for (const value in state[key]) state[key][value] = true;
-    render();
-}
-el('reset-filters').addEventListener('click', resetFilters);
-el('clear-empty-filters').addEventListener('click', () => { resetFilters(); el('choice-mode-' + state.mode).focus(); });
-const HELP_STEPS = {
-    time_to_first_query: ['Create branch', 'Connect', 'Read 1 row'],
-    branch_create: ['Chain tip', 'Create child', 'Branch ready'],
-    branch_connect: ['Pick branch', 'Connect', 'Next branch'],
-    read: ['Primary key', 'Find 1 row', 'Return row'],
-    range_read: ['Start key', `${suite.range_size} keys`, 'Return rows'],
-    insert: ['Generate row', 'Unique key', 'Insert row'],
-    update: ['Primary key', 'Find 1 row', 'Write values'],
-    range_update: ['Key range', `${suite.range_size} keys`, 'Write values'],
-    load: ['SQL dump', 'Load tables', 'Data ready'],
-    provision: ['Request', 'Create database', 'Empty & ready'],
-    data: ['Select workloads', 'Compare times', 'Combine ratios'],
-};
-const helpBubble = el('benchmark-help'), runDialog = el('run-dialog');
-let helpAnchor = null, helpTimer = null, runOpener = null;
-function closeHelp() {
-    clearTimeout(helpTimer);
-    if (helpAnchor) {
-        helpAnchor.removeAttribute('aria-describedby'); helpAnchor = null;
-        if (helpBubble.matches(':popover-open')) helpBubble.hidePopover();
-    }
-}
-function deferHelpClose() {
-    clearTimeout(helpTimer);
-    helpTimer = setTimeout(() => {
-        if (!helpBubble.matches(':hover') && document.activeElement !== helpAnchor) closeHelp();
-    }, 180);
-}
-helpBubble.addEventListener('pointerenter', () => clearTimeout(helpTimer));
-helpBubble.addEventListener('pointerleave', deferHelpClose);
-helpBubble.addEventListener('beforetoggle', event => {
-    if (event.newState === 'closed') {
-        clearTimeout(helpTimer);
-        if (helpAnchor) helpAnchor.removeAttribute('aria-describedby');
-        helpAnchor = null;
-    }
-});
-window.addEventListener('resize', closeHelp);
-document.addEventListener('scroll', event => { if (!helpBubble.contains(event.target)) positionHelp(); }, true);
-function positionHelp() {
-    if (!helpAnchor) return;
-    const anchor = helpAnchor.getBoundingClientRect(), box = helpBubble.getBoundingClientRect();
-    const clip = helpAnchor.closest('.run-body')?.getBoundingClientRect();
-    if (anchor.bottom < (clip?.top || 0) || anchor.top > (clip?.bottom || window.innerHeight)) { closeHelp(); return; }
-    const left = Math.max(12, Math.min(anchor.left, window.innerWidth - box.width - 12));
-    const top = anchor.bottom + box.height + 12 <= window.innerHeight ? anchor.bottom + 8 : Math.max(12, anchor.top - box.height - 8);
-    helpBubble.style.left = `${left}px`; helpBubble.style.top = `${top}px`;
-}
-function operationArt(row) {
-    const art = node('div', 'operation-art'); art.setAttribute('data-operation', row.op); art.setAttribute('aria-hidden', 'true');
-    if (['time_to_first_query', 'branch_create', 'branch_connect'].includes(row.op)) {
-        const chain = node('div', 'op-chain');
-        const labels = row.op === 'branch_connect' ? Array.from({length: suite.chain_length}, (_, i) => String(i + 1)) : ['Tip', 'Child'];
-        labels.forEach((text, i) => { const branch = node('span', 'op-branch', text); branch.style.setProperty('--step', i); chain.append(branch); });
-        art.append(chain);
-    } else {
-        const source = node('div', 'op-source', {insert: '+ row', load: '.sql', provision: '+ DB', data: '× score', update: 'key =', range_update: 'range =', range_read: 'keys'}[row.op] || 'key');
-        const flow = node('div', 'op-transfer'), records = node('div', 'op-records');
-        for (let i = 0; i < 6; i++) { const record = node('span', 'op-record'); record.style.setProperty('--step', i); records.append(record); }
-        art.append(source, flow, records);
-    }
-    return art;
-}
-function showHelp(row, button) {
-    clearTimeout(helpTimer);
-    if (helpAnchor === button && helpBubble.matches(':popover-open')) return;
-    closeHelp(); helpAnchor = button;
-    (button.closest('dialog') || document.body).append(helpBubble);
-    const steps = node('ol', 'help-steps');
-    (HELP_STEPS[row.op] || ['Prepare', 'Execute', 'Measure']).forEach((text, i) => {
-        const step = node('li', '', text); step.style.setProperty('--step', i); steps.append(step);
-    });
-    const scope = row.batch ? `${row.batch.toLocaleString()} operation${row.batch === 1 ? '' : 's'} per batch · ${suite.tries} tries` : row.op === 'data' ? 'Geometric mean · lower is better' : 'One-time setup measurement';
-    helpBubble.replaceChildren(node('p', 'help-kicker', 'The workload, explained'), node('h3', '', row.label), node('p', 'help-description', row.title), operationArt(row), steps, node('p', 'help-scope', scope), node('p', 'help-caption', 'Illustration only · animation speed is not a result'));
-    button.setAttribute('aria-describedby', 'benchmark-help');
-    helpBubble.showPopover();
-    positionHelp();
-}
-function helpButton(row, hoverTarget) {
-    const button = node('button', 'help-trigger', '?'); button.type = 'button'; button.setAttribute('aria-label', `About ${row.label}`);
-    button.addEventListener('focus', () => showHelp(row, button));
-    button.addEventListener('blur', deferHelpClose);
-    button.addEventListener('click', () => showHelp(row, button));
-    (hoverTarget || button).addEventListener('pointerenter', event => { if (event.pointerType !== 'touch') showHelp(row, button); });
-    (hoverTarget || button).addEventListener('pointerleave', deferHelpClose);
-    return button;
-}
-function resultButton(e, text = e.system) {
-    const button = node('button', 'system-name', text); button.type = 'button'; button.setAttribute('aria-haspopup', 'dialog');
-    button.setAttribute('aria-label', `View ${text} ${e.mock ? 'preview' : 'run'} details`);
-    button.addEventListener('click', () => showRun(e, button)); return button;
-}
-function showRun(e, opener) {
-    closeHelp(); runOpener = opener;
-    el('run-title').textContent = e.system;
-    el('run-subtitle').textContent = e.mock ? 'Mock preview · illustrative, never ranked' : `${e.hosted === 'yes' ? 'Hosted' : 'Self-hosted'} · ${e.date} · ${e.version ? `v${e.version}` : 'Version not recorded'}`;
-    el('run-source').href = e.source;
-    const body = el('run-body'); body.replaceChildren();
-    if (e.mock) body.append(node('p', 'run-mock-note', e.basis || 'Illustrative data, not a measured run.'));
-    const highlights = node('div', 'run-highlights');
-    for (const row of [suiteRows[0], loadRow, provisionRow]) {
-        const card = node('div', 'run-highlight');
-        card.append(node('span', 'run-metric-label', row.label), node('strong', '', seconds(row.value(e))), node('span', 'run-metric-note', row.batch ? (state.mode === 'first' ? 'First try' : 'Best repeat') : 'One-time setup'));
-        highlights.append(card);
-    }
-    body.append(highlights);
-    const heading = node('div', 'run-section-heading'); heading.append(node('h3', '', 'Every attempt'), node('span', '', 'Batch totals · seconds'));
-    body.append(heading, node('p', 'table-note', 'Best repeat is the faster of tries 2 and 3; both must succeed. The shaded column is your current leaderboard selection.'));
-    const table = node('table', 'run-timings'); table.setAttribute('aria-label', `${e.system} timings for all attempts`);
-    const head = table.createTHead().insertRow();
-    for (const text of ['Workload', ...Array.from({length: suite.tries}, (_, i) => `Try ${i + 1}`), 'Best repeat']) {
-        const th = node('th', text === (state.mode === 'first' ? 'Try 1' : 'Best repeat') ? 'selected-attempt' : '', text); th.scope = 'col'; head.append(th);
-    }
-    const rows = table.createTBody();
-    suiteRows.forEach((row, i) => {
-        const tr = rows.insertRow(), th = node('th'); th.scope = 'row';
-        const name = node('div', 'workload-name'); name.append(node('span', '', row.label), helpButton(row, name));
-        th.append(name, node('span', 'system-meta', `${row.batch.toLocaleString()} operation${row.batch === 1 ? '' : 's'}`)); tr.append(th);
-        [...e.result[i], pick(e.result[i], 'best')].forEach((value, index) => {
-            const td = tr.insertCell(); td.className = index === (state.mode === 'first' ? 0 : suite.tries) ? 'selected-attempt' : '';
-            td.append(node('span', value === null ? 'cell-missing' : 'metric-value', seconds(value)));
-        });
-    });
-    body.append(scrolling(table));
-    const environment = node('section', 'run-environment'); environment.append(node('h3', '', 'Run environment'));
-    const metadata = node('dl', 'run-metadata');
-    const fields = [['Machine', e.machine], ['Database version', e.version], ['Suite', e.suite], ['Run ID', e.run_id], ['Configuration', e.tuned === 'yes' ? 'Tuned' : e.tuned === 'no' ? 'Default' : null], ['Region', e.region], ['Client location', e.client_location], ['Round-trip baseline', e.rtt_ms === undefined ? null : `${e.rtt_ms} ms`]];
-    for (const [key, value] of fields) if (value !== undefined && value !== null) { const pair = node('div'); pair.append(node('dt', '', key), node('dd', '', value)); metadata.append(pair); }
-    environment.append(metadata);
-    if (e.tags.length) { const tags = node('div', 'run-tags'); tags.append(...e.tags.map(tag => node('span', '', tag))); environment.append(tags); }
-    body.append(environment);
-    if (!e.mock) {
-        const provenance = node('details', 'run-provenance'); provenance.append(node('summary', '', 'Reproducibility details'));
-        const list = node('dl', 'run-metadata');
-        for (const [key, value] of [['Git commit', e.commit], ['Seed', e.seed], ['Python', e.python], ['Suite SHA-256', e.suite_sha256], ['Dataset SHA-256', e.dataset_sha256], ['Dependency lock SHA-256', e.lock_sha256], ...Object.entries(e.service || {})]) {
-            if (value !== undefined) { const pair = node('div'); pair.append(node('dt', '', key), node('dd', '', value)); list.append(pair); }
-        }
-        provenance.append(list); body.append(provenance);
-    }
-    runDialog.showModal();
-}
-el('close-run').addEventListener('click', () => runDialog.close());
-runDialog.addEventListener('close', () => { closeHelp(); if (runOpener) runOpener.focus(); });
-runDialog.addEventListener('click', event => {
-    if (event.target !== runDialog) return;
-    const box = runDialog.getBoundingClientRect();
-    if (event.clientX < box.left || event.clientX > box.right || event.clientY < box.top || event.clientY > box.bottom) runDialog.close();
-});
-function systemIcon(e) {
-    const icon = node('span', 'system-icon', e.system.slice(0, 1));
-    icon.setAttribute('data-system', e.system.toLowerCase().replace(/\s+/g, '-')); icon.setAttribute('aria-hidden', 'true');
-    return icon;
-}
-function bestOf(entries, row) {
-    const values = entries.map(row.value).filter(v => v !== null); return values.length ? Math.min(...values) : null;
-}
-function ratioOf(row, value, best) {
-    return value === null || best === null ? null : (value + row.shift) / (best + row.shift);
-}
-function scrolling(table) {
-    const box = node('div', 'scroll'); box.tabIndex = 0; box.setAttribute('role', 'region');
-    box.setAttribute('aria-label', table.getAttribute('aria-label')); box.append(table); return box;
-}
-function summaryRow(e, score, raw, rank) {
-    const tr = node('tr', 'result-row' + (rank === 1 ? ' rank-leader' : ''));
-    const position = tr.insertCell(); position.className = 'summary-rank'; position.append(node('span', 'rank-number', String(rank).padStart(2, '0')));
-    const name = tr.insertCell(); name.className = 'system-cell';
-    const identity = node('div', 'system-identity'), text = node('div');
-    const open = resultButton(e, data.filter(x => !x.mock && x.system === e.system && x.hosted === e.hosted).length > 1 ? label(e) : e.system);
-    text.append(open);
-    tr.addEventListener('click', event => { if (!event.target.closest('button, a')) showRun(e, open); });
-    identity.append(systemIcon(e), text); name.append(identity);
-    const number = tr.insertCell(); number.className = 'summary-number';
-    number.title = `Unrounded score: ${score}${raw === null ? '' : `; time: ${raw}s`}`;
-    number.append(node('span', 'score-value', `×${score.toFixed(2)}`));
-    const time = tr.insertCell(); time.className = 'summary-time';
-    if (raw !== null) { time.append(node('span', 'score-time', seconds(raw))); time.title = `${raw}s`; }
-    else { time.textContent = '—'; time.title = 'Composite score across multiple workloads; no single elapsed time.'; }
-    return tr;
-}
-function detailTable(ranked, best, entries) {
-    const table = node('table', 'details'); table.setAttribute('aria-label', `${entries[0].hosted === 'yes' ? 'Hosted' : 'Local'} measured workload timings`);
-    table.style.setProperty('--systems', entries.length);
-    const head = table.createTHead().insertRow();
-    const workload = node('th', '', 'Workload'); workload.scope = 'col'; head.append(workload);
-    const batch = node('th', 'batch-column', 'Operations'); batch.scope = 'col'; head.append(batch);
-    for (const e of entries) {
-        const th = node('th');
-        const identity = node('span', 'system-identity'); identity.append(systemIcon(e), resultButton(e, entries.filter(x => x.system === e.system).length > 1 ? label(e) : e.system)); th.append(identity);
-        th.scope = 'col'; th.title = `${e.machine} · ${e.date}`; head.append(th);
-    }
-    const body = table.createTBody();
-    for (const row of allRows) {
-        const tr = body.insertRow(), heading = node('th', 'row-label'); heading.scope = 'row';
-        const name = node('div', 'workload-name'); heading.append(name);
-        if (row === suiteRows[3] || row === loadRow) tr.className = 'workload-divider';
-        if (VIEWS.data.rows.includes(row)) {
-            const box = node('input'); box.type = 'checkbox'; box.checked = state.ticked.has(row); box.id = `row-${suiteRows.indexOf(row)}-${entries[0].hosted}`;
-            box.addEventListener('change', () => { box.checked ? state.ticked.add(row) : state.ticked.delete(row); render(); el(box.id).focus(); });
-            const wrap = node('label'); wrap.append(box, ` ${row.label}`); name.append(wrap);
-        } else name.append(node('span', '', row.label));
-        name.append(helpButton(row, name));
-        heading.append(node('span', 'mobile-batch', row.batch ? `${row.batch.toLocaleString()} operation${row.batch === 1 ? '' : 's'}` : 'Setup'));
-        if (!ranked.includes(row)) heading.append(node('span', 'system-meta', 'Not included in score'));
-        tr.append(heading);
-        const operations = tr.insertCell(); operations.className = 'batch-column'; operations.textContent = row.batch ? row.batch.toLocaleString() : 'Setup';
-        for (const e of entries) {
-            const value = row.value(e), td = tr.insertCell(), fastest = value !== null && value === best.get(row);
-            td.className = value === null ? 'cell-missing' : fastest ? 'cell-best' : '';
-            if (value !== null) {
-                const strength = value === 0 ? 1 : best.get(row) / value;
-                td.style.backgroundColor = `rgba(66, 156, 141, ${0.035 + strength * 0.19})`;
-                td.title = `${value}s${fastest ? ' · Fastest in this row' : ''}`;
-            }
-            if (fastest) { const mark = node('span', 'best-mark', '✓'); mark.setAttribute('role', 'img'); mark.setAttribute('aria-label', 'Fastest in this row'); td.append(mark); }
-            td.append(node('span', 'metric-value', seconds(value)));
-        }
-    }
-    return scrolling(table);
-}
-function previewCard(e) {
-    const card = node('article', 'preview-card'), top = node('div', 'preview-card-top'), identity = node('div', 'system-identity');
-    const title = node('h4'); title.append(resultButton(e)); identity.append(systemIcon(e), title); top.append(identity, node('span', 'preview-badge', 'MOCK'));
-    const first = allRows[0];
-    card.append(top, node('p', 'preview-label', first.label + (first.batch > 1 ? ` ×${first.batch}` : '')), node('p', 'preview-value', seconds(first.value(e))));
-    const metrics = node('dl', 'preview-metadata');
-    for (const row of allRows.slice(1)) metrics.append(node('dt', '', row.label + (row.batch > 1 ? ` ×${row.batch}` : '')), node('dd', '', seconds(row.value(e))));
-    card.append(metrics, node('p', 'preview-context', `${e.hosted === 'yes' ? e.region : e.machine} · illustrative, not measured`));
-    const basis = node('details', 'preview-basis'); basis.append(node('summary', '', 'Source'), node('p', '', e.basis));
-    const link = node('a', 'preview-link', 'JSON ↗'); link.href = e.source; card.append(basis, link);
-    return card;
-}
-function scoresFor(view, measured, best) {
-    const ranked = view.ranked(view.rows);
-    const usable = ranked.filter(r => best.get(r) !== null), dropped = ranked.filter(r => best.get(r) === null), scored = [], incomplete = [];
-    for (const e of usable.length ? measured : []) {
-        const missing = usable.filter(r => r.value(e) === null);
-        if (missing.length) { incomplete.push({e, missing}); continue; }
-        const logs = usable.map(r => Math.log(ratioOf(r, r.value(e), best.get(r))));
-        scored.push({e, score: Math.exp(logs.reduce((a, b) => a + b, 0) / logs.length)});
-    }
-    scored.sort((a, b) => a.score - b.score);
-    return {usable, dropped, scored, incomplete};
-}
-function scorePanel(title, view, measured, best) {
-    const {usable, dropped, scored, incomplete} = scoresFor(view, measured, best);
-    const panel = node('section', 'score-panel');
-    const heading = node('div', 'score-heading'); heading.append(node('h3', '', view.label));
-    heading.append(helpButton(view === VIEWS.data ? {op: 'data', label: view.label, title: 'Compare each selected workload with its fastest measured result, then take the geometric mean of those ratios. A lower score is better; this is not a single elapsed time.'} : view.rows[0], heading));
-    panel.append(heading, node('p', 'score-description', view.description));
-    if (scored.length) {
-        const summary = node('table', 'summary'); summary.setAttribute('aria-label', `${title}: ${view.label} ranking, lower is better`);
-        const head = summary.createTHead().insertRow();
-        for (const title of ['Rank', 'System', 'Score ↓', 'Time']) { const th = node('th', '', title); th.scope = 'col'; if (title === 'Score ↓') th.setAttribute('aria-sort', 'ascending'); head.append(th); }
-        const body = summary.createTBody();
-        body.append(...scored.map(({e, score}, i) => summaryRow(e, score, usable.length === 1 ? usable[0].value(e) : null, i + 1))); panel.append(scrolling(summary));
-        panel.append(node('p', 'score-footnote', view === VIEWS.data ? `${usable.length} workload${usable.length === 1 ? '' : 's'} · geometric mean` : view === VIEWS.load ? 'One-time measurement · provisioning excluded' : 'End-to-end latency · one operation'));
-    }
-    if (dropped.length) panel.append(node('p', 'table-note', `No measurements: ${dropped.map(r => r.label).join(', ')}.`));
-    for (const {e, missing} of incomplete) panel.append(node('p', 'table-note', `${label(e)} not ranked — missing ${missing.map(r => r.label).join(', ')}.`));
-    return panel;
-}
-function svgNode(tag, attributes = {}, text) {
-    const element = document.createElementNS('http://www.w3.org/2000/svg', tag);
-    for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, String(value));
-    if (text !== undefined) element.textContent = text;
-    return element;
-}
-function chartColor(e) {
-    return {'Dolt': '#347e6b', 'Doltgres': '#5475b4', 'Neon': '#277958', 'Tiger Cloud': '#98712d', 'Xata': '#8660a1'}[e.system]
-        || ['#347e6b', '#5475b4', '#98712d', '#8660a1'][data.indexOf(e) % 4];
-}
-function chartPoint(e, x, y, description, attributes = {}) {
-    const point = svgNode('g', {class: 'chart-point', tabindex: 0, role: 'button', 'aria-haspopup': 'dialog', 'aria-label': `${label(e)}: ${description}. View run details.`, ...attributes});
-    point.append(svgNode('title', {}, `${label(e)} · ${description}`), svgNode('circle', {cx: x, cy: y, r: 13, fill: 'transparent'}), svgNode('circle', {cx: x, cy: y, r: 5, fill: chartColor(e), stroke: '#fff', 'stroke-width': 2}));
-    point.addEventListener('click', () => showRun(e, point));
-    point.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); showRun(e, point); } });
-    return point;
-}
-function chartLegend(entries) {
-    const legend = node('div', 'chart-legend');
-    for (const e of entries) {
-        const item = node('span', 'chart-key'), dot = node('span', 'chart-swatch'); dot.style.backgroundColor = chartColor(e); dot.setAttribute('aria-hidden', 'true');
-        item.append(dot, resultButton(e, entries.filter(x => x.system === e.system).length > 1 ? label(e) : e.system)); legend.append(item);
-    }
-    return legend;
-}
-function chartLimit(value) {
-    const power = 10 ** Math.floor(Math.log10(value || 1));
-    return [1, 2, 5, 10].find(factor => factor * power >= value) * power;
-}
-function chartFrame(label, yLabel) {
-    const svg = svgNode('svg', {class: 'benchmark-chart', viewBox: '0 0 440 270', role: 'group', 'aria-label': label});
-    svg.append(svgNode('rect', {x: 58, y: 28, width: 352, height: 184, rx: 10, fill: '#f0f6f4'}), svgNode('text', {x: 58, y: 15, class: 'chart-axis-label'}, yLabel));
-    return svg;
-}
-function tradeoffChart(measured, best) {
-    const card = node('section', 'chart-card'), heading = node('div', 'chart-heading');
-    heading.append(node('h3', '', 'Performance trade-offs'), node('span', 'chart-badge', 'Better ↙'));
-    card.append(heading, node('p', 'chart-description', 'Branch readiness vs reads & writes. Lower-left is faster.'));
-    const branch = new Map(scoresFor(VIEWS.branch, measured, best).scored.map(({e, score}) => [e, score]));
-    const points = scoresFor(VIEWS.data, measured, best).scored.filter(({e, score}) => branch.has(e) && Number.isFinite(score))
-        .map(({e, score}) => ({e, x: branch.get(e), y: score}));
-    if (!points.length) { card.append(node('p', 'chart-empty', 'Complete first-query and read/write scores are needed for this comparison.')); return card; }
-    const maximum = chartLimit(Math.max(...points.flatMap(p => [p.x, p.y])) * 1.05);
-    const x = value => 72 + (value - 1) / (maximum - 1) * 320, y = value => 198 - (value - 1) / (maximum - 1) * 156;
-    const svg = chartFrame('Performance trade-offs. Category scores; lower is better on both axes.', 'Reads & writes score ↑');
-    for (const tick of [1, (maximum + 1) / 2, maximum]) {
-        svg.append(svgNode('line', {x1: x(tick), x2: x(tick), y1: 28, y2: 212, class: 'chart-grid'}), svgNode('line', {x1: 58, x2: 410, y1: y(tick), y2: y(tick), class: 'chart-grid'}),
-            svgNode('text', {x: x(tick), y: 235, 'text-anchor': 'middle', class: 'chart-tick'}, `×${Number(tick.toFixed(2))}`), svgNode('text', {x: 49, y: y(tick) + 4, 'text-anchor': 'end', class: 'chart-tick'}, `×${Number(tick.toFixed(2))}`));
-    }
-    svg.append(svgNode('text', {x: 234, y: 260, 'text-anchor': 'middle', class: 'chart-axis-label'}, 'First-query score →'));
-    for (const p of points) {
-        svg.append(chartPoint(p.e, x(p.x), y(p.y), `first-query score ×${p.x.toFixed(3)}, reads & writes score ×${p.y.toFixed(3)}`,
-            {'data-x-score': p.x, 'data-y-score': p.y}));
-    }
-    card.append(svg, chartLegend(points.map(p => p.e)), node('p', 'chart-note', `Same scores as the tables · ${state.mode === 'first' ? 'first try' : 'best repeat'} · ×1 is the fastest baseline.${points.length < measured.length ? ' Incomplete results are omitted.' : ''}`));
-    return card;
-}
-function repeatChart(measured) {
-    const card = node('section', 'chart-card'), heading = node('div', 'chart-heading');
-    heading.append(node('h3', '', 'Consistency across tries'));
-    const select = node('select', 'chart-workload'); select.id = `chart-workload-${measured[0].hosted}`; select.setAttribute('aria-label', 'Workload for attempt chart');
-    suiteRows.forEach((row, i) => { const option = node('option', '', row.label); option.value = String(i); select.append(option); }); select.value = String(state.chartRow);
-    select.addEventListener('change', () => { state.chartRow = Number(select.value); render(); el(select.id).focus(); });
-    heading.append(select); card.append(heading, node('p', 'chart-description', 'Every attempt, in order. Lower is faster; flatter is more consistent.'));
-    const row = suiteRows[state.chartRow], values = measured.flatMap(e => e.result[state.chartRow]).filter(v => v !== null);
-    if (!values.length) { card.append(node('p', 'chart-empty', 'No successful attempts for this workload.')); return card; }
-    const unit = Math.max(...values) < 1 ? 1000 : 1, maximum = chartLimit(Math.max(...values) * unit * 1.1);
-    const x = i => 72 + i / (suite.tries - 1) * 320, y = value => 198 - value * unit / maximum * 156;
-    const svg = chartFrame(`${row.label}, all ${suite.tries} attempts. Missing attempts leave gaps.`, `Batch time (${unit === 1000 ? 'ms' : 's'}) ↑`);
-    for (const tick of [0, maximum / 2, maximum]) svg.append(svgNode('line', {x1: 58, x2: 410, y1: y(tick / unit), y2: y(tick / unit), class: 'chart-grid'}), svgNode('text', {x: 49, y: y(tick / unit) + 4, 'text-anchor': 'end', class: 'chart-tick'}, Number(tick.toPrecision(3)).toString()));
-    for (let i = 0; i < suite.tries; i++) svg.append(svgNode('text', {x: x(i), y: 235, 'text-anchor': 'middle', class: 'chart-tick'}, `Try ${i + 1}`));
-    measured.forEach((e, index) => {
-        const tries = e.result[state.chartRow];
-        for (let i = 1; i < tries.length; i++) if (tries[i - 1] !== null && tries[i] !== null) svg.append(svgNode('line', {x1: x(i - 1), x2: x(i), y1: y(tries[i - 1]), y2: y(tries[i]), stroke: chartColor(e), 'stroke-width': 2, 'stroke-dasharray': index % 2 ? '5 4' : 'none', class: 'chart-series'}));
-        tries.forEach((value, i) => { if (value !== null) svg.append(chartPoint(e, x(i), y(value), `${row.label}, try ${i + 1}: ${seconds(value)}`, {'data-try': i + 1, 'data-seconds': value})); });
-    });
-    const missing = measured.length * suite.tries - values.length;
-    card.append(svg, chartLegend(measured), node('p', 'chart-note', `${row.batch.toLocaleString()} operation${row.batch === 1 ? '' : 's'} per attempt · all ${suite.tries} tries, independent of the score toggle.${missing ? ` ${missing} failed attempt${missing === 1 ? '' : 's'} omitted; lines break at failures.` : ''}`));
-    return card;
-}
-function renderGroup(title, entries) {
-    const measured = entries.filter(e => !e.mock), mocks = entries.filter(e => e.mock);
-    const section = node('section', 'benchmark-group');
-    if (measured.length) {
-        const best = new Map(allRows.map(r => [r, bestOf(measured, r)]));
-        const ranked = Object.values(VIEWS).flatMap(view => view.ranked(view.rows));
-        const heading = node('div', 'group-heading'); heading.append(node('h2', '', title === 'Local' ? 'Rankings' : 'Managed-service rankings'), node('span', 'group-count', 'Lower scores are better')); section.append(heading);
-        section.append(node('p', 'group-context', 'Select a result to explore its full run.'));
-        const panels = node('div', 'score-panels'); panels.append(...Object.values(VIEWS).map(view => scorePanel(title, view, measured, best))); section.append(panels);
-        const charts = node('div', 'insight-grid'); charts.append(tradeoffChart(measured, best), repeatChart(measured)); section.append(charts);
-        const card = node('section', 'detail-card'), details = node('div', 'detail-heading'), caption = node('div');
-        caption.append(node('h3', '', 'Workload breakdown'), node('p', 'table-note', 'Select read/write workloads to include in the score.'));
-        const legend = node('div', 'heatmap-legend'); legend.append(node('span', '', 'Slower'), node('span', 'heatmap-key'), node('span', '', 'Faster'));
-        legend.setAttribute('role', 'img'); legend.setAttribute('aria-label', 'Heatmap: darker mint is closer to the fastest time within each row');
-        details.append(caption, legend);
-        const foot = node('div', 'detail-footer'); foot.append(node('span', '', 'Batch totals in seconds · shading compares within each row'), node('span', '', '✓ Fastest in row'));
-        card.append(details, node('p', 'table-scroll-hint', 'Scroll across to compare systems →'), detailTable(ranked, best, measured), foot); section.append(card);
-    }
-    if (mocks.length) {
-        const preview = node('details', 'preview-section'), heading = node('summary', 'preview-heading');
-        heading.append(node('span', '', `${title} previews`), node('span', 'preview-badge', `${mocks.length} MOCK`));
-        const grid = node('div', 'preview-grid'); grid.append(...mocks.map(previewCard));
-        preview.append(heading, node('p', 'mock-note', 'Illustrative only. Never ranked.'), grid); section.append(preview);
-    }
-    return section;
-}
-function renderExcluded() {
-    const box = el('excluded'); box.replaceChildren(); if (!excluded.length) return;
-    const panel = node('details', 'excluded-panel'), title = node('summary', '', 'Excluded results'); title.append(node('span', 'excluded-count', String(excluded.length)));
-    const list = node('ul', 'excluded-list');
-    for (const x of excluded) {
-        const item = node('li', 'excluded-item'), a = node('a', '', `${x.system} / ${x.machine}`); a.href = x.source;
-        item.append(a, node('span', 'excluded-reason', x.reason)); list.append(item);
-    }
-    panel.append(title, list); box.append(panel);
-}
-function render() {
-    closeHelp();
-    toggles(el('selectors-hosted'), state.hosted, k => k === 'yes' ? 'Managed service' : 'Self-hosted');
-    toggles(el('selectors-system'), state.system); toggles(el('selectors-machine'), state.machine); toggles(el('selectors-tag'), state.tag);
-    toggles(el('selectors-kind'), state.kind, k => k === 'mock' ? 'Mock' : 'Measured'); el('data-row').hidden = !data.some(e => e.mock);
-    choice(el('selectors-mode'), {first: 'First try', best: 'Best repeat'}, 'mode');
-    const shown = data.filter(e => Object.values(FILTERS).every(f => f(e))), measured = shown.filter(e => !e.mock), mocked = shown.filter(e => e.mock);
-    const filtered = ['hosted', 'system', 'machine', 'tag', 'kind'].filter(k => Object.values(state[k]).some(v => !v));
-    el('filter-count').textContent = `${filtered.length} active`; el('filter-count').hidden = !filtered.length;
-    el('shown').textContent = `${measured.length} measured${filtered.length ? ' · filtered' : ''}`;
-    const noMeasurements = !data.some(e => !e.mock); el('empty-state').hidden = measured.length > 0;
-    el('empty-title').textContent = noMeasurements ? 'No measured results' : 'No matches';
-    el('empty-description').textContent = noMeasurements ? `Run suite ${suite.suite} to add scores.` : 'Adjust or reset filters.';
-    el('empty-guide').hidden = !noMeasurements; el('clear-empty-filters').hidden = !filtered.length;
-    el('groups').replaceChildren(...[measured, mocked].flatMap(entries => [['no', 'Local'], ['yes', 'Hosted']].filter(([hosted]) => entries.some(e => e.hosted === hosted)).map(([hosted, title]) => renderGroup(title, entries.filter(e => e.hosted === hosted)))));
-    renderExcluded();
-}
-el('stat-workloads').textContent = String(suite.rows.length); el('stat-tries').textContent = String(suite.tries);
-el('stat-rows').textContent = suite.dataset.row_counts[suite.table].toLocaleString(); el('stat-table-label').textContent = `initial ${suite.table} rows`;
-const tableCounts = Object.entries(suite.dataset.row_counts);
-el('dataset-size').textContent = `${tableCounts.reduce((total, [, count]) => total + count, 0).toLocaleString()} initial rows · ${tableCounts.length} tables`;
-el('dataset-scope').textContent = `The full seed is loaded and branched. Timed reads and writes target only ${suite.table}, initially ${suite.dataset.row_counts[suite.table].toLocaleString()} rows. Each data workload gets its own child branch.`;
-for (const [name, count] of tableCounts) {
-    const tr = node('tr', name === suite.table ? 'dataset-target' : ''), th = node('th', '', name);
-    th.scope = 'row';
-    if (name === suite.table) th.append(node('span', 'dataset-target-label', 'Timed table'));
-    tr.append(th, node('td', '', count.toLocaleString())); el('dataset-tables').append(tr);
-}
-el('workload-protocol').textContent = `${suite.tries} tries per workload · ${suite.chain_length}-branch chain. Each timing is a batch total in seconds, not a per-operation average.`;
-for (const row of suiteRows) {
-    const pair = node('div'), term = node('dt', '', row.label);
-    term.append(node('span', '', `${row.batch.toLocaleString()} op${row.batch === 1 ? '' : 's'} / try`));
-    pair.append(term, node('dd', '', row.title)); el('workload-guide').append(pair);
-}
-el('dataset-path').textContent = suite.dataset.path;
-el('dataset-hash').textContent = suite.dataset.sha256;
-el('dataset-version').textContent = `${suite.suite} / ${suite.seed}`;
-function openDatasetGuide() { if (window.location.hash === '#dataset') el('dataset').open = true; }
-window.addEventListener('hashchange', openDatasetGuide);
-openDatasetGuide();
-el('suite-badge').textContent = suite.suite;
-const latest = data.filter(e => !e.mock).map(e => e.date).sort().at(-1); el('updated').textContent = latest || 'Awaiting measurements';
-el('updated').title = 'Latest measured run';
-el('method').textContent = `Seed ${suite.seed} · ${suite.chain_length}-branch chain · isolated writes.`;
-render();
-</script>
+<script src="js/dom.js"></script>
+<script src="js/details.js"></script>
+<script src="js/scenes.js"></script>
+<script src="js/micro.js"></script>
+<script src="js/macro.js"></script>
+<script src="js/app.js"></script>
 </body>
 </html>

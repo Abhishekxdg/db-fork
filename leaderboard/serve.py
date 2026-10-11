@@ -1,6 +1,13 @@
-"""Local wizard with one-click macOS Terminal launch; standard library only.
+"""Serve the generated site of one phase on loopback; standard library only.
 
-Run from the repository root: python -m leaderboard.serve
+From the repository root:
+    python -m leaderboard.serve                 # production preview of leaderboard/.site/prod
+    python -m leaderboard.serve --phase local   # development preview with the Terminal launcher
+
+Both assemble the phase's site first (leaderboard.site), then serve only that
+directory. Production serves index.html, styles.css, the two data files, the six
+workflow diagram PNGs and the published raw records; it has no wizard, no launcher
+routes, no mocks and no README.
 """
 
 import argparse
@@ -13,7 +20,9 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from leaderboard import site
 from leaderboard.validate import BOARD, MACHINE_RE
+from leaderboard.validate_macro import ATTEMPT_RE, CAMPAIGN_FILE_RE, PRESETS, SCENARIOS
 
 ROOT = BOARD.parent
 PYTHON = str(ROOT / ".venv/bin/python") if (ROOT / ".venv/bin/python").exists() else sys.executable
@@ -22,15 +31,39 @@ SYSTEMS = {
     "tiger": ("TIGER_ACCESS_KEY", "TIGER_SECRET_KEY", "TIGER_PROJECT_ID"),
     "xata": ("XATA_API_KEY", "XATA_ORGANIZATION_ID"),
 }
-STATIC = {"/", "/index.html", "/run.html", "/styles.css", "/data.js", "/README.md"}
+STATIC = {phase: {"/", "/data.js", "/macro-data.js", *(f"/{rel}" for rel in (*site.PAGES[phase], *site.WORKFLOW_DIAGRAMS))} for phase in site.PHASES}
+SUITES = ("micro", "macro")
+BUILD = ["-m", "leaderboard.site", "--phase", "local"]  # the wizard only runs in the local phase
+
+
+def macro_commands(config: dict, systems: list, machine: str) -> list[str]:
+    """One run_macro per system, then one build that also runs after a failed run,
+    so a failed or incomplete campaign still reaches the page; the first failing
+    run's exit status is the script's. Every campaign runs all six workflows."""
+    preset = config.get("preset", "mini")
+    if not isinstance(preset, str) or preset not in PRESETS:
+        raise ValueError("Choose the Quick or Full workload.")
+    if any(SYSTEMS[system] for system in systems):
+        raise ValueError("Agent workflows run only on local systems.")
+    lines = ["", "# Run one database at a time and always rebuild the development site; the first failure's exit status is the script's.",
+             "status=0", 'keep() { [ "$status" -ne 0 ] || status=$1; }']
+    for system in systems:
+        lines.append(shlex.join([PYTHON, "-m", "leaderboard.run_macro", system, "--preset", preset, "--machine", machine]) + " || keep $?")
+    return lines + [shlex.join([PYTHON, *BUILD]) + " || keep $?", 'exit "$status"']
 
 
 def script_for(config: dict) -> str:
     systems, machine, location = config.get("systems"), config.get("machine"), config.get("location", "")
+    suite = config.get("suite", "micro")
+    if not isinstance(suite, str) or suite not in SUITES:
+        raise ValueError("Choose the microbench or the agent-workflow suite.")
     if (not isinstance(systems, list) or not 1 <= len(systems) <= len(SYSTEMS)
             or any(not isinstance(system, str) or system not in SYSTEMS for system in systems)
             or len(set(systems)) != len(systems)):
         raise ValueError("Choose one or more distinct supported databases.")
+    if any(not all((BOARD / system / filename).is_file() for filename in ("connector.py", "system.json"))
+           for system in systems):
+        raise ValueError("A selected database has no runnable leaderboard connector.")
     if not isinstance(machine, str) or not MACHINE_RE.fullmatch(machine):
         raise ValueError("Use a valid machine name.")
     if not isinstance(location, str) or len(location) > 120 or any(ord(c) < 32 or ord(c) == 127 for c in location):
@@ -39,20 +72,21 @@ def script_for(config: dict) -> str:
     if keys and not location.strip():
         raise ValueError("Enter the client location for managed services.")
     lines = ["#!/bin/bash", "set -e", f"cd {shlex.quote(str(ROOT))}"]
+    if suite == "macro":
+        return "\n".join(lines + macro_commands(config, systems, machine)) + "\n"
     if keys:
         lines += ["", "# Terminal prompts for missing credentials; input is hidden.",
                   f"for benchmark_key in {' '.join(keys)}; do",
                   '  if [ -z "${!benchmark_key:-}" ]; then',
                   '    read -r -s -p "$benchmark_key: " "$benchmark_key"',
                   "    printf '\\n'", "  fi", '  export "$benchmark_key"', "done"]
-    lines += ["", "# Run one database at a time, then validate and rebuild."]
+    lines += ["", "# Run one database at a time, then rebuild the development site from validated current-suite results."]
     for system in systems:
         args = [PYTHON, "-m", "leaderboard.run", system, "--machine", machine]
         if SYSTEMS[system]:
             args += ["--client-location", location.strip()]
         lines.append(shlex.join(args))
-    lines += [shlex.join([PYTHON, "-m", "leaderboard.validate"]),
-              shlex.join([PYTHON, "-m", "leaderboard.build"])]
+    lines += [shlex.join([PYTHON, *BUILD])]
     return "\n".join(lines) + "\n"
 
 
@@ -71,8 +105,10 @@ end run'''
 
 
 class Handler(SimpleHTTPRequestHandler):
+    phase = "prod"  # main() sets it; a request can never change it
+
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=str(BOARD), **kwargs)
+        super().__init__(*args, directory=str(site.SITE / self.phase), **kwargs)
 
     @property
     def origin(self):
@@ -90,10 +126,13 @@ class Handler(SimpleHTTPRequestHandler):
             return None
         path = unquote(urlsplit(self.path).path)
         parts = Path(path).parts[1:]
-        result = (len(parts) == 4 and parts[0] in SYSTEMS and parts[1] == "results"
-                  and len(parts[2]) == 8 and parts[2].isdigit() and parts[3].endswith(".json"))
-        preview = len(parts) == 2 and parts[0] == "mock" and parts[1] in {f"{s}.json" for s in SYSTEMS}
-        if (path not in STATIC and not result and not preview) or not Path(self.translate_path(path)).resolve().is_relative_to(BOARD):
+        result = (len(parts) == 4 and parts[0] in SYSTEMS and len(parts[2]) == 8 and parts[2].isdigit()
+                  and ((parts[1] == "results" and parts[3].endswith(".json"))
+                       or (parts[1] == "macro" and parts[3].endswith(".json")
+                           and any(r.fullmatch(parts[3].removesuffix(".json")) for r in (ATTEMPT_RE, CAMPAIGN_FILE_RE)))))
+        preview = self.phase == "local" and len(parts) == 2 and parts[0] == "mock" and parts[1] in {f"{s}.json" for s in SYSTEMS}
+        if ((path not in STATIC[self.phase] and not result and not preview)
+                or not Path(self.translate_path(path)).resolve().is_relative_to((site.SITE / self.phase).resolve())):
             self.send_error(404)
             return None
         return super().send_head()
@@ -107,6 +146,9 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        if self.phase != "local":
+            self.reply(404, {"error": "The launcher exists only in the local development phase."})
+            return
         # No CORS: only this loopback origin can request a terminal launch.
         if (self.headers.get("Host") != self.origin.removeprefix("http://")
                 or self.headers.get("Origin") != self.origin
@@ -138,13 +180,19 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--phase", choices=site.PHASES, help="prod (default) or local; $LEADERBOARD_PHASE otherwise")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
+    try:
+        Handler.phase = site.phase(args.phase)
+        target = site.assemble(Handler.phase)
+    except site.SiteError as e:
+        parser.exit(2, f"serve: {e}\n")
     with ThreadingHTTPServer(("127.0.0.1", args.port), Handler) as server:
-        url = f"http://127.0.0.1:{server.server_port}/run.html"
-        print(f"Benchmark wizard: {url}", flush=True)
+        url = f"http://127.0.0.1:{server.server_port}/"
+        print(f"{Handler.phase} site from {target}: {url}", flush=True)
         if not args.no_browser:
             webbrowser.open(url)
         try:

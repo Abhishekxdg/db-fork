@@ -70,7 +70,8 @@ class RunLifecycle(unittest.TestCase):
         self.suite = self.board / "suite.json"
         self.suite.write_text(json.dumps({"suite": "test", "seed": 1,
                                           "dataset": {"path": "dump.sql", "sha256": runner.sha256(self.dump)}}))
-        (self.board / "requirements.lock").write_text("fixture\n")
+        (self.root / "uv.lock").write_text("fixture\n")
+        (self.root / "build_protos.py").write_text("# fixture\n")
         (self.board / ".gitignore").write_text(".runs/\n")
         self.git("init", "-q")
         self.git("add", ".")
@@ -103,7 +104,7 @@ class RunLifecycle(unittest.TestCase):
         return json.loads(paths[0].read_text())["error"]
 
     def test_success_uses_launch_provenance_and_private_journal(self):
-        before = runner.source_snapshot(self.dump)
+        before = runner.source_snapshot(runner.CODE_PATHS, self.dump)
 
         def provision(_):
             path = runner.journal("dolt")
@@ -114,11 +115,12 @@ class RunLifecycle(unittest.TestCase):
         payload = json.loads(self.bench().read_text())
         self.assertEqual(payload["commit"], before["commit"])
         self.assertEqual(payload["suite_sha256"], before["files"][str(self.suite)])
+        self.assertEqual(payload["lock_sha256"], before["files"][str(self.root / "uv.lock")])
         self.assertFalse(payload["dirty"])
         self.assertFalse(runner.journal("dolt").exists())
 
     def test_changes_to_dirty_inputs_or_head_cannot_publish_success(self):
-        for target in (self.suite, self.meta, self.dump, self.board / "requirements.lock"):
+        for target in (self.suite, self.meta, self.dump, self.root / "uv.lock", self.root / "build_protos.py"):
             with self.subTest(target=target.name):
                 original = target.read_text()
                 target.write_text(original + "\n")

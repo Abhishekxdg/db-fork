@@ -36,5 +36,16 @@ class Dolt(Connector):
         dolt_mysql.drop_database(db)
         shutil.rmtree(self.data_dir / ".dolt_dropped_databases" / db, ignore_errors=True)
 
+    def exists(self, db: str) -> bool:
+        with closing(dolt_mysql.connect()) as conn, conn.cursor() as cur:
+            cur.execute("SHOW DATABASES LIKE %s", (db,))
+            listed = cur.fetchone() is not None
+        return listed or (self.data_dir / db).exists()
+
+    def version(self) -> str:
+        with closing(dolt_mysql.connect()) as conn, conn.cursor() as cur:
+            cur.execute(self.version_sql)
+            return str(cur.fetchone()[0])
+
 
 CONNECTOR = Dolt()
