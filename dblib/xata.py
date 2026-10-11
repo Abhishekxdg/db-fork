@@ -21,9 +21,22 @@ import dblib.result_collector as rc
 load_dotenv()
 API_KEY = os.environ.get("XATA_API_KEY", "")
 
+# Defaults target Xata cloud; override these (e.g. in .env) to point at a
+# self-hosted instance:
+#   XATA_API_URL          base URL of the Xata REST API
+#   XATA_ORGANIZATION_ID  organization that owns the projects
+#   XATA_REGION           region new projects are created in
+#   XATA_INSTANCE_TYPE    compute size of a project's "main" branch
+#   XATA_POSTGRES_IMAGE   Postgres image (full name, e.g. postgres:<version>)
+XATA_API_URL = os.environ.get("XATA_API_URL", "https://api.xata.tech").rstrip("/")
 # Everything runs in one pre-created organization.
 XATA_ORGANIZATION_ID = os.environ.get("XATA_ORGANIZATION_ID", "")
-XATA_API_BASE_URL = f"https://api.xata.tech/organizations/{XATA_ORGANIZATION_ID}/"
+XATA_API_BASE_URL = f"{XATA_API_URL}/organizations/{XATA_ORGANIZATION_ID}/"
+
+# Compute for the "main" branch of a new project (children inherit it).
+XATA_REGION = os.environ.get("XATA_REGION", "us-east-1")
+XATA_INSTANCE_TYPE = os.environ.get("XATA_INSTANCE_TYPE", "xata.medium")
+XATA_POSTGRES_IMAGE = os.environ.get("XATA_POSTGRES_IMAGE", "postgres:18.0")
 
 
 class XataToolSuite(DBToolSuite):
@@ -52,14 +65,14 @@ class XataToolSuite(DBToolSuite):
             "name": "main",
             "scaleToZero": {"enabled": True, "inactivityPeriodMinutes": 30},
             "configuration": {
-                "region": "us-east-1",
-                "instanceType": "xata.medium",
-                "image": "postgres:18.0",
+                "region": XATA_REGION,
+                "instanceType": XATA_INSTANCE_TYPE,
+                "image": XATA_POSTGRES_IMAGE,
                 "replicas": 0,
             },
         }
         default_branch = cls._request("POST", endpoint, json=branch_payload)
-        conn_string = cls._poll_branch_active(
+        cls._poll_branch_active(
             project_details["id"],
             default_branch["id"],
             initial_conn_string=default_branch.get("connectionString"),
@@ -69,7 +82,7 @@ class XataToolSuite(DBToolSuite):
             project_details["id"],
             default_branch["id"],
             default_branch["name"],
-            cls.add_db_name_to_connection_string(conn_string, "postgres"),
+            cls._get_xata_connection_uri(project_details["id"], default_branch["id"], "postgres"),
         )
 
     @classmethod
@@ -123,6 +136,8 @@ class XataToolSuite(DBToolSuite):
     ) -> str:
         """Block until the branch has a connection string and a ready status
         (a string can appear while the compute is still transient)."""
+        # NOTE: this waits on the branch's deprecated ``connectionString``
+        # field; it should migrate to the /credentials endpoint later.
         conn_string = initial_conn_string
         status_type = initial_status_type
         endpoint = f"projects/{project_id}/branches/{branch_id}"
@@ -143,7 +158,11 @@ class XataToolSuite(DBToolSuite):
 
     @classmethod
     def _get_xata_connection_uri(cls, project_id: str, branch_id: str, db_name: str) -> str:
-        response = cls._request("GET", f"projects/{project_id}/branches/{branch_id}")
+        # The branch's own ``connectionString`` field is deprecated (its host
+        # carries a "-deprecated" marker); the credentials endpoint is current.
+        response = cls._request(
+            "GET", f"projects/{project_id}/branches/{branch_id}/credentials"
+        )
         return cls.add_db_name_to_connection_string(response["connectionString"], db_name)
 
     # ------------------------------------------------------------------
@@ -217,13 +236,13 @@ class XataToolSuite(DBToolSuite):
             json={"mode": "inherit", "name": name, "parentID": parent_id},
         )
         branch_id = res["id"]
-        conn_string = self.__class__._poll_branch_active(
+        self.__class__._poll_branch_active(
             self.project_id,
             branch_id,
             initial_conn_string=res.get("connectionString"),
             initial_status_type=(res.get("status") or {}).get("statusType", ""),
         )
-        uri = self.__class__.add_db_name_to_connection_string(conn_string, self.db_name)
+        uri = self.__class__._get_xata_connection_uri(self.project_id, branch_id, self.db_name)
         self._all_branches[name] = (branch_id, uri)
 
     def _delete_impl(self, ref: Ref) -> None:
