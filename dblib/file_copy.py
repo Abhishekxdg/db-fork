@@ -189,6 +189,7 @@ class _Handle:
         self.raw = None
         self.busy = 0
         self.parked = False
+        self.connecting = False   # claimed while unconnected: about to connect
         self.reconnects = 0
         self.fdw_used = False
         self.closed = False
@@ -215,11 +216,16 @@ class _Handle:
             elif self.raw is None or self.raw.closed:
                 self._wait_gate_locked()
             self.busy += 1
+            if self.raw is None or self.raw.closed:
+                # Between here and the connect a clone cannot see a session
+                # yet; it waits for this flag instead.
+                self.connecting = True
 
     def _unclaim(self) -> None:
         with _REG.cond:
             self.busy = max(0, self.busy - 1)
             if self.busy == 0:
+                self.connecting = False
                 _REG.cond.notify_all()
 
     def _tx_idle(self) -> bool:
@@ -244,14 +250,17 @@ class _Handle:
     # -- owner side -----------------------------------------------------
 
     def _ensure(self) -> None:
-        if self.raw is None or self.raw.closed:
-            raw = psycopg2.connect(_uri(self.db))
-            raw.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
-            self.raw = raw
-            if self.parked:
-                self.parked = False
-                self.reconnects += 1
-                FileCopyToolSuite.observe("reconnects_after_park")
+        try:
+            if self.raw is None or self.raw.closed:
+                raw = psycopg2.connect(_uri(self.db))
+                raw.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+                self.raw = raw
+                if self.parked:
+                    self.parked = False
+                    self.reconnects += 1
+                    FileCopyToolSuite.observe("reconnects_after_park")
+        finally:
+            self.connecting = False
 
     def hold(self) -> None:
         self._claim()
@@ -292,6 +301,7 @@ class _Handle:
         """Close the connection from the owner's side (no cursor open)."""
         with _REG.cond:
             self._park_locked()
+            self.connecting = False
 
     def cancel(self) -> None:
         raw = self.raw
@@ -538,37 +548,8 @@ class FileCopyToolSuite(PgMergeMixin, DBToolSuite):
         The caller must not hold an open connection to ``db`` itself."""
         with _REG.cond:
             _REG.gates[db] = _REG.gates.get(db, 0) + 1
-        t0 = time.monotonic()
-        parked = 0
         try:
-            with _REG.cond:
-                while True:
-                    waiting = 0
-                    for h in list(_REG.handles.get(db, ())):
-                        if h.raw is None or h.raw.closed:
-                            continue
-                        if h.busy == 0 and h._tx_idle():
-                            h._park_locked()
-                            parked += 1
-                        else:
-                            waiting += 1
-                    if not waiting:
-                        break
-                    if time.monotonic() - t0 > PARK_TIMEOUT_SEC:
-                        raise RuntimeError(f"{waiting} connection(s) to {db} stayed busy for "
-                                           f"{PARK_TIMEOUT_SEC:.0f}s; cannot copy it")
-                    _REG.cond.release()
-                    try:
-                        self._check_cancel()
-                    finally:
-                        _REG.cond.acquire()
-                    _REG.cond.wait(0.05)
-            waited = time.monotonic() - t0
-            if parked:
-                self.observe("parked_connections", parked)
-            if waited > 0.01:
-                self.observe("quiesce_wait_sec", waited)
-                self.observe("quiesce_waits")
+            self._quiesce(db)
             yield
         finally:
             with _REG.cond:
@@ -579,21 +560,67 @@ class FileCopyToolSuite(PgMergeMixin, DBToolSuite):
                     _REG.gates.pop(db, None)
                 _REG.cond.notify_all()
 
+    def _quiesce(self, db: str) -> None:
+        """With the gate on ``db`` closed: park its idle registered
+        connections and wait for the busy (or connecting) ones to finish.
+        Bounded by PARK_TIMEOUT_SEC in total per exclusive section."""
+        t0 = time.monotonic()
+        parked = 0
+        with _REG.cond:
+            while True:
+                waiting = 0
+                for h in list(_REG.handles.get(db, ())):
+                    if h.raw is None or h.raw.closed:
+                        if h.connecting:
+                            waiting += 1
+                        continue
+                    if h.busy == 0 and h._tx_idle():
+                        h._park_locked()
+                        parked += 1
+                    else:
+                        waiting += 1
+                if not waiting:
+                    break
+                if time.monotonic() - t0 > PARK_TIMEOUT_SEC:
+                    raise RuntimeError(f"{waiting} connection(s) to {db} stayed busy for "
+                                       f"{PARK_TIMEOUT_SEC:.0f}s; cannot copy it")
+                _REG.cond.release()
+                try:
+                    self._check_cancel()
+                finally:
+                    _REG.cond.acquire()
+                _REG.cond.wait(0.05)
+        waited = time.monotonic() - t0
+        if parked:
+            self.observe("parked_connections", parked)
+        if waited > 0.01:
+            self.observe("quiesce_wait_sec", waited)
+            self.observe("quiesce_waits")
+
     def _clone(self, template: str, target: str, exclusive: bool = True) -> None:
         sql = f"CREATE DATABASE {_q(target)} TEMPLATE {_q(template)} STRATEGY = {FILE_COPY_STRATEGY}"
-        ctx = self._exclusive(template) if exclusive else contextlib.nullcontext()
-        with ctx:
-            for attempt in range(6):
+        if not exclusive:
+            self._admin(sql)
+            return
+        with self._exclusive(template):
+            t0 = time.monotonic()
+            attempt = 0
+            while True:
                 self._check_cancel()
                 try:
                     self._admin(sql)
                     return
-                except psycopg2.errors.ObjectInUse:
-                    # A connection slipped in between our check and the
-                    # server's: it is held back by the gate now.
+                except psycopg2.errors.ObjectInUse as e:
+                    # A session the registry did not know (or one that
+                    # connected before the gate closed) is on the template:
+                    # the server waited 5 s for it. Quiesce again, which
+                    # waits for registered sessions to finish, then retry.
+                    attempt += 1
                     self.observe("clone_retries")
-                    time.sleep(0.2 * (attempt + 1))
-            self._admin(sql)
+                    if time.monotonic() - t0 > PARK_TIMEOUT_SEC:
+                        raise RuntimeError(f"could not copy {template} within {PARK_TIMEOUT_SEC:.0f}s: {e}")
+                    time.sleep(min(2.0, 0.2 * attempt))
+                    self._quiesce(template)
 
     def _mark_snapshot(self, db: str) -> None:
         """A snapshot is read-only (the setting is not inherited by clones
