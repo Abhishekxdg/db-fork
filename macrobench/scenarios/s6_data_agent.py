@@ -150,6 +150,15 @@ class DataAgentScenario(Scenario):
         before = manifest_on_spine()
 
         rows_per_step = max(1, math.ceil(p.batch_rows / p.steps_per_batch))
+        # The batch's order ids: step s loads ids [first + s*rows, first + (s+1)*rows).
+        first_id = ORDER_ID_BASE + b * p.steps_per_batch * rows_per_step
+        last_id = first_id + p.steps_per_batch * rows_per_step
+
+        def batch_orders_on(ref):
+            r = suite.exec([("SELECT COUNT(*) FROM orders WHERE o_id >= %s AND o_id < %s",
+                             (first_id, last_id))], refs=[ref], label="invariant")[0]
+            return int(r.rows[0][0]) if r.ok and r.rows else None
+
         committed = []   # (step, hash)
         step = 0
         loaded_by_step = {}   # a redone step replaces its earlier count
@@ -171,7 +180,7 @@ class DataAgentScenario(Scenario):
                 # Pipeline stage failed: go back to an earlier commit.
                 back_step, back_hash = rng.choice(committed)
                 if suite.supports("reset"):
-                    rs = suite.reset(branch, back_hash, label="batch_reset")
+                    rs = ctx.retry(lambda: suite.reset(branch, back_hash, label="batch_reset"))
                     ok = rs.ok
                 else:
                     nb = f"{branch}_r{resets + 1}"
@@ -180,9 +189,18 @@ class DataAgentScenario(Scenario):
                     if ok:
                         branch = nb
                         branches.append(nb)
+                # S6.2: after the reset the branch holds exactly the rows
+                # loaded up to the commit it went back to, nothing from
+                # the steps after it. A failed reset leaves the later
+                # rows in place and fails the check.
+                expected = sum(loaded_by_step.get(st, 0) for st in range(back_step + 1))
+                inv.expect(f"S6.2 batch {b} reset to step {back_step} restores its rows",
+                           batch_orders_on(branch), expected,
+                           f"reset {rs.status_name} {rs.error[:80]}".rstrip())
                 if ok:
                     resets += 1
                     committed = [c for c in committed if c[0] <= back_step]
+                    loaded_by_step = {st: n for st, n in loaded_by_step.items() if st <= back_step}
                     step = back_step + 1
                     continue
             step += 1
@@ -198,9 +216,9 @@ class DataAgentScenario(Scenario):
         # The spine load is paused while merging so its uncommitted writes
         # cannot land between the pre-merge commit and the merge.
         with self._merge_lock, self.quiesced():
-            rb = suite.rebase(branch, ctx.spine, on_conflict=additive_resolver, label="batch_rebase")
-            m = suite.merge(ctx.spine, branch, message=f"merge batch {b}",
-                            on_conflict=additive_resolver, label="batch_merge")
+            rb = ctx.retry(lambda: suite.rebase(branch, ctx.spine, on_conflict=additive_resolver, label="batch_rebase"))
+            m = ctx.retry(lambda: suite.merge(ctx.spine, branch, message=f"merge batch {b}",
+                                              on_conflict=additive_resolver, label="batch_merge"))
         if rb.ok and isinstance(rb.value, dict):
             ctx.bump_metric("rebase_conflicts", int(rb.value.get("conflicts", 0)))
         if m.ok:

@@ -178,7 +178,7 @@ class DevAgentScenario(Scenario):
                     inv.expect(f"S4.2a spine sentinel invisible on {branch} before rebase",
                                sentinel_visible(), 0)
                 with self._spine_lock:
-                    rb = suite.rebase(branch, ctx.spine, on_conflict="theirs", label="dev_rebase")
+                    rb = ctx.retry(lambda: suite.rebase(branch, ctx.spine, on_conflict="theirs", label="dev_rebase"))
                 rebases_done += 1
                 if rb.ok and isinstance(rb.value, dict):
                     ctx.bump_metric("rebase_conflicts", int(rb.value.get("conflicts", 0)))
@@ -214,10 +214,12 @@ class DevAgentScenario(Scenario):
 
         # Invariant: feature data never leaks into production.
         # MySQL-protocol backends list every database's tables in
-        # information_schema, so count only the current one there.
+        # information_schema, so count only the current one there; the
+        # dialect probe is untimed so its miss on Postgres is not a
+        # recorded failure.
         r = suite.exec([("SELECT COUNT(*) FROM information_schema.tables "
                          "WHERE table_name = %s AND table_schema = DATABASE()",
-                         ("loyalty_tier",))], refs=[ctx.spine], label="invariant")[0]
+                         ("loyalty_tier",))], refs=[ctx.spine], label="invariant", timed=False)[0]
         if not r.ok:
             r = suite.exec([("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = %s",
                              ("loyalty_tier",))], refs=[ctx.spine], label="invariant")[0]
