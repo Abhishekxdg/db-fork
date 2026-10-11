@@ -223,7 +223,8 @@ workload {
 
 ```bash
 ./scripts/run_macrobench.sh [--mini] [--outdir DIR] [--max-runtime-sec N] [--measure-storage] \
-    [--branch-intensity X] [--data-intensity Y] <scenario> <backend> [scale_factor]
+    [--storage-sample-interval SEC] [--branch-intensity X] [--data-intensity Y] \
+    <scenario> <backend> [scale_factor]
 ```
 
 | Argument | Description |
@@ -231,6 +232,8 @@ workload {
 | `scenario` | `rl_env`, `context_mgmt`, `multi_agent`, `dev_agent`, `ops_agent`, `data_agent` |
 | `backend` | `dolt`, `dolt_mysql`, `seekdb`, `matrixone`, `neon`, `xata`, `file_copy` |
 | `scale_factor` | W warehouses for the generated data (default: the config's) |
+| `--storage-sample-interval SEC` | seconds between background storage samples (default 5, 0 = off) |
+| `--measure-storage` | also measure storage around every operation |
 
 ```bash
 ./scripts/run_macrobench.sh --mini rl_env dolt
@@ -246,6 +249,29 @@ A backend that lacks a verb still runs the whole scenario: the verb is
 recorded as UNSUPPORTED, `workflow_supported` is false in the e2e stats, and
 invariance checks that depend on it are reported as not applicable.
 
+#### Storage
+
+Every run records the backend's storage size (`DBToolSuite._storage_bytes()`:
+the database's own directory on Dolt, the whole server data directory on
+SeekDB and MatrixOne, which declare `STORAGE_SCOPE = "server"`) at four
+workflow-level points, written to the e2e stats under `storage.points`:
+
+| Point | When |
+|---|---|
+| `after_setup` | schema and seed data loaded, before the scenario |
+| `after_workflow` | the scenario is done (its branches deleted) |
+| `after_gc` | after the backend's GC/flush hook (`gc()`: `dolt_gc`, MatrixOne checkpoint; UNSUPPORTED on SeekDB) |
+| `after_cleanup` | the run's database dropped (and, on Dolt, the dropped databases purged) |
+
+A background sampler also records the size every 5 s during the scenario
+(`storage.samples`, wall-clock seconds and bytes); `--storage-sample-interval
+SEC` changes the interval (`0` turns it off), as does
+`storage_sample_interval_sec` in the config. `--measure-storage` additionally
+measures before and after every verb and every exec() call (two directory
+walks per operation; off by default, and not attributable under concurrent
+workers). The report's `storage.png` draws the sampled series with the four
+points as markers; `summary.md` carries them as `storage_after_*_mb`.
+
 ### Output
 
 ```
@@ -255,10 +281,13 @@ run_stats/
 ```
 
 The e2e stats carry the workload parameters, the seed statistics,
-`capabilities`, `workflow_supported` with `unsupported_ops` and
-`op_status_counts`, the `invariants` results, the scenario's own `metrics`
-(e.g. S3 merge order and conflicts, S5 time to recovery, S6 fast-forward vs
-three-way merges) and the spine load's transaction counts.
+`capabilities` and `implementation` (how the backend realises each verb:
+native, composed or simulated), `workflow_supported` with `unsupported_ops`
+and `op_status_counts`, the `invariants` results, the scenario's own
+`metrics` (e.g. S3 merge order and conflicts, S5 time to recovery, S6
+fast-forward vs three-way merges), the spine load's transaction counts and
+the `storage` block (the four workflow-level points, the GC status, the
+sampled series; see [Storage](#storage)).
 
 ---
 
@@ -454,7 +483,7 @@ uv run python scripts/plotting/plot_macrobench.py \
 | `exec_time_by_op.png` | per scenario, one horizontal 100% bar per script label and backend (adjacent rows) showing where `exec()` time goes: statement types, CONNECT, and `other` (untimed BEGIN/COMMIT/ROLLBACK round trips plus the Python between statements); mean ms and count at the bar end |
 | `data/data_ops.md/.csv` | data statements (READ/INSERT/UPDATE/DELETE_ROWS/DDL) split by workload role: spine traffic vs. the agent's own statements (ingest, backfill, rollout_step, ...) |
 | `cdf/latency_cdf_<scenario>.png` | latency CDF of each branch verb and data statement type (agent rows only), one line per backend |
-| `storage.png` | database size over the run (runs made with `--measure-storage`) |
+| `storage.png` | storage over the run: the 5 s sampled series (or the per-operation sizes of runs made with `--measure-storage`) with the four workflow-level points as markers; log axis when database-scope and server-scope backends share a panel |
 
 Only the newest run per (scenario, backend) is used unless `--all-runs` is
 given; `--run-glob` narrows by run id (e.g. `'macro_*_mini_*'`).
