@@ -80,9 +80,15 @@ NEON_PG_VERSION = int(os.environ.get("NEON_PG_VERSION", "17"))
 NEON_COMPUTE_CU = float(os.environ.get("NEON_COMPUTE_CU", "2"))
 # How long Neon keeps history (commit refs are LSNs inside this window).
 NEON_HISTORY_RETENTION_SEC = int(os.environ.get("NEON_HISTORY_RETENTION_SEC", str(2 * 86400)))
-# Scale-to-zero backstop for branch computes (0 = the plan default, 5 min on
-# Launch, which is also its minimum); the default branch never suspends.
-NEON_BRANCH_SUSPEND_TIMEOUT_SEC = int(os.environ.get("NEON_BRANCH_SUSPEND_TIMEOUT_SEC", "0"))
+# Scale-to-zero of branch computes: -1 (never) by default. Neon's
+# autosuspend counts only running statements as activity, not open
+# connections: with the plan default (5 min on Launch, its minimum) a
+# branch compute that a worker holds but has not queried for 5 minutes
+# (waiting for a lock, in a quiet review phase, or read over postgres_fdw
+# by a merge that is busy elsewhere) is suspended under its connections,
+# which then fail with "SSL connection has been closed unexpectedly".
+# The active-compute budget below suspends computes explicitly instead.
+NEON_BRANCH_SUSPEND_TIMEOUT_SEC = int(os.environ.get("NEON_BRANCH_SUSPEND_TIMEOUT_SEC", "-1"))
 # Active computes the process keeps at most (the plan allows 20 besides the
 # default branch): when a new compute is needed above this, the least
 # recently used idle one is suspended first.
@@ -358,9 +364,10 @@ class NeonToolSuite(DBToolSuite):
         "multi_ref_exec": "unsupported",
     }
     IMPLEMENTATION_NOTES = {
-        "branch": "POST /branches with parent_id (+ parent_lsn for a commit) and a 2 CU compute, "
-                  "waiting for the operations; the branch's compute is suspended when the "
-                  "connection leaves it (CONNECT carries the resume)",
+        "branch": "POST /branches with parent_id (+ parent_lsn for a commit) and a 2 CU compute "
+                  "that never auto-suspends, waiting for the operations; computes are suspended "
+                  "by the process's active-compute budget (LRU) and on delete (CONNECT carries "
+                  "the resume)",
         "commit": "_bb_commits row + pg_current_wal_flush_lsn() as the point in time",
         "log": "SELECT from the _bb_commits bookkeeping table",
         "diff": "per-table row hashes on each compute, differing tables pulled over postgres_fdw "
@@ -387,6 +394,7 @@ class NeonToolSuite(DBToolSuite):
     # and how many open connections each one has. Shared by every suite.
     _ACTIVE: dict = {}
     _HOLDS: dict = {}
+    _SUSPENDING: set = set()     # branch ids with a suspend request in flight
     _ACT_LOCK = threading.Lock()
 
     @classmethod
@@ -515,13 +523,30 @@ class NeonToolSuite(DBToolSuite):
         ep = self._endpoint_id(branch_id)
         if not ep:
             return
-        with type(self)._ACT_LOCK:
-            type(self)._ACTIVE.pop(branch_id, None)
+        cls = type(self)
+        with cls._ACT_LOCK:
+            # Chosen as a victim while unheld, but a thread may have taken
+            # it since: a suspend would close that connection.
+            if cls._HOLDS.get(branch_id, 0) > 0 or branch_id in cls._SUSPENDING:
+                self.observe("suspend_skipped_held")
+                return
+            last = cls._ACTIVE.pop(branch_id, None)
+            cls._SUSPENDING.add(branch_id)
         try:
             self._api("POST", f"projects/{self.project_id}/endpoints/{ep}/suspend")
         except NeonAPIError as e:
             if e.status not in (409, 422, 423):   # already suspended / in transition
                 raise
+            # In transition (most likely starting for another connection):
+            # still active as far as the quota goes, so it stays a candidate
+            # for the next time room is needed.
+            self.observe("suspend_in_transition")
+            with cls._ACT_LOCK:
+                if last is not None:
+                    cls._ACTIVE.setdefault(branch_id, last)
+        finally:
+            with cls._ACT_LOCK:
+                cls._SUSPENDING.discard(branch_id)
 
     def _make_room(self, target: str) -> None:
         """Keep the process under NEON_ACTIVE_BUDGET active computes: before
@@ -538,13 +563,15 @@ class NeonToolSuite(DBToolSuite):
             victims = []
             now = time.monotonic()
             while len(cls._ACTIVE) + 1 > NEON_ACTIVE_BUDGET:
-                # Only computes nobody holds and nobody touched recently: a
-                # worker switching branches releases one for a moment.
-                idle = [b for b in cls._ACTIVE if cls._HOLDS.get(b, 0) <= 0 and b != default_id
-                        and now - cls._ACTIVE[b] > 20.0]
-                if not idle:
+                # Computes nobody holds, those untouched for 20 s first (a
+                # worker switching branches releases one for a moment);
+                # when that is not enough, the least recently used of the
+                # rest: a resume later is the cost of the quota.
+                unheld = [b for b in cls._ACTIVE if cls._HOLDS.get(b, 0) <= 0 and b != default_id]
+                if not unheld:
                     break
-                lru = min(idle, key=lambda b: cls._ACTIVE[b])
+                idle = [b for b in unheld if now - cls._ACTIVE[b] > 20.0]
+                lru = min(idle or unheld, key=lambda b: cls._ACTIVE[b])
                 del cls._ACTIVE[lru]
                 victims.append(lru)
             cls._ACTIVE[target] = time.monotonic()
@@ -554,6 +581,50 @@ class NeonToolSuite(DBToolSuite):
                 self.observe("lru_suspends")
             except Exception as e:
                 print(f"Warning: could not suspend compute of {b}: {e}")
+
+    def _reconcile_actives(self) -> int:
+        """Rebuild the registry from Neon's own view of the project's
+        computes and suspend active ones no connection holds, least
+        recently used first, until the budget has room. Called when a
+        connect is refused for the active-compute limit: the registry may
+        have missed a compute (a suspend refused in transition, a compute
+        another path started), and a compute used a moment ago is still
+        a legitimate victim when the alternative is waiting. Returns the
+        number of suspends issued."""
+        resp = self._api("GET", f"projects/{self.project_id}/endpoints")
+        default_id = self._branches[self.default_branch]["id"]
+        cls = type(self)
+        victims = []
+        with cls._ACT_LOCK:
+            now = time.monotonic()
+            seen = set()
+            for e in resp.get("endpoints", []):
+                if e.get("type") != "read_write":
+                    continue
+                b = e.get("branch_id")
+                self._endpoints.setdefault(b, e["id"])
+                # A compute on its way to idle (our suspend in flight) is
+                # not active; one on its way up is.
+                if (e.get("pending_state") or e.get("current_state")) == "active":
+                    seen.add(b)
+                    if b != default_id and b not in cls._ACTIVE:
+                        cls._ACTIVE[b] = now - 60.0
+                        self.observe("active_compute_unregistered")
+            for b in [b for b in cls._ACTIVE if b not in seen]:
+                del cls._ACTIVE[b]
+            unheld = sorted((b for b in cls._ACTIVE if cls._HOLDS.get(b, 0) <= 0 and b != default_id),
+                            key=lambda b: cls._ACTIVE[b])
+            while len(cls._ACTIVE) + 1 > NEON_ACTIVE_BUDGET and unheld:
+                b = unheld.pop(0)
+                del cls._ACTIVE[b]
+                victims.append(b)
+        for b in victims:
+            try:
+                self._suspend(b)
+                self.observe("limit_suspends")
+            except Exception as e:
+                print(f"Warning: could not suspend compute of {b}: {e}")
+        return len(victims)
 
     def _reserve(self, branch_id: str, n: int = 1) -> None:
         """Hold (or release, n=-1) a compute without a connection, so the
@@ -581,14 +652,42 @@ class NeonToolSuite(DBToolSuite):
         active-compute limit (or failing while the compute changes state)
         is retried, with the waits recorded."""
         uri = self._uri(branch_id)
+        cls = type(self)
         self._make_room(branch_id)
+        # Held from here on: a compute being connected to is not a victim
+        # for the LRU or the quota reconcile of another thread. A suspend
+        # already in flight for it is allowed to land first, so the new
+        # connection is not the one it closes.
+        deadline = time.monotonic() + 30.0
+        while True:
+            with cls._ACT_LOCK:
+                if branch_id not in cls._SUSPENDING or time.monotonic() > deadline:
+                    cls._HOLDS[branch_id] = cls._HOLDS.get(branch_id, 0) + 1
+                    break
+            time.sleep(0.05)
         t0 = time.perf_counter()
+        attempt = 0
+        try:
+            conn = self._connect_loop(uri, branch_id, max_wait, t0)
+        except BaseException:
+            with cls._ACT_LOCK:
+                cls._HOLDS[branch_id] = max(0, cls._HOLDS.get(branch_id, 0) - 1)
+            raise
+        with cls._ACT_LOCK:
+            if branch_id != self._branches[self.default_branch]["id"]:
+                cls._ACTIVE[branch_id] = time.monotonic()
+        if not hasattr(self, "_conn_owner"):
+            self._conn_owner = {}
+        self._conn_owner[id(conn)] = branch_id
+        return conn
+
+    def _connect_loop(self, uri: str, branch_id: str, max_wait: float, t0: float):
         attempt = 0
         while True:
             try:
                 conn = psycopg2.connect(uri, connect_timeout=30)
                 conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
-                break
+                return conn
             except psycopg2.OperationalError as e:
                 msg = str(e)
                 attempt += 1
@@ -596,7 +695,13 @@ class NeonToolSuite(DBToolSuite):
                     raise
                 if _ACTIVE_LIMIT_MSG in msg:
                     self.observe("active_compute_limit_hits")
-                    delay = 2.0 + random.random()
+                    # Make room from Neon's view of what is active, then retry.
+                    try:
+                        freed = self._reconcile_actives()
+                    except Exception as re:
+                        freed = 0
+                        print(f"Warning: could not reconcile active computes: {re}")
+                    delay = (0.5 if freed else 2.0) + random.random()
                     label = "compute_wait"
                 else:
                     delay = min(3.0, 0.5 * attempt)
@@ -604,15 +709,6 @@ class NeonToolSuite(DBToolSuite):
                     self.observe("connect_error: " + " ".join(msg.split())[:70])
                 self._wait_row(delay, label)
                 time.sleep(delay)
-        cls = type(self)
-        with cls._ACT_LOCK:
-            if branch_id != self._branches[self.default_branch]["id"]:
-                cls._ACTIVE[branch_id] = time.monotonic()
-            cls._HOLDS[branch_id] = cls._HOLDS.get(branch_id, 0) + 1
-        if not hasattr(self, "_conn_owner"):
-            self._conn_owner = {}
-        self._conn_owner[id(conn)] = branch_id
-        return conn
 
     def list_branches(self) -> list:
         self._refresh_branches()
@@ -1234,8 +1330,14 @@ class NeonToolSuite(DBToolSuite):
                 pl = plans[t]
                 cols, pk = pl["cols"], pl["pk"]
                 if not pk:
-                    self._exec(ours, f'INSERT INTO {pl["O"]} ({", ".join(_q(c) for c in cols)}) SELECT {self._cols("t", cols)} FROM {pl["T"]} t '
-                                     f'WHERE NOT EXISTS (SELECT 1 FROM {pl["B"]} b WHERE {self._same("b", "t", cols)})')
+                    # Rows theirs added since base, as a multiset difference:
+                    # EXCEPT ALL hashes (NULLs compare equal), where an anti-join
+                    # on IS NOT DISTINCT FROM over every column is a nested loop
+                    # that grows with |theirs| x |base| (the history table of a
+                    # dev_agent run made that the rebase's dominant cost).
+                    cl = ", ".join(_q(c) for c in cols)
+                    self._exec(ours, f'INSERT INTO {pl["O"]} ({cl}) SELECT {cl} FROM '
+                                     f'(SELECT {cl} FROM {pl["T"]} EXCEPT ALL SELECT {cl} FROM {pl["B"]}) x')
                     info["merged_tables"].append(t)
                     info["skipped_tables"][t] = "no primary key: new rows only"
                     continue
@@ -1442,12 +1544,33 @@ class NeonToolSuite(DBToolSuite):
 
     # -- reset / revert ------------------------------------------------------
 
+    def _ancestor_holding(self, branch_id: str, lsn: str) -> str:
+        """The branch, or the nearest ancestor, whose timeline contains
+        ``lsn``: walk up while the LSN is older than the branch's fork
+        point (its parent_lsn)."""
+        by_id = {info["id"]: info for info in self._branches.values()}
+        target = lsn_to_int(lsn)
+        cur = branch_id
+        while True:
+            info = by_id.get(cur)
+            if not info or not info.get("parent_id") or not info.get("parent_lsn"):
+                return cur
+            if target >= lsn_to_int(info["parent_lsn"]):
+                return cur
+            cur = info["parent_id"]
+
     def _reset_impl(self, ref: Ref, to: str) -> None:
         bid = self._on(ref)
         row = self._find_commit(self.conn, to)
         if not row["lsn"]:
             raise ValueError(f"commit {to} has no LSN")
-        src = row["branch_id"] or bid
+        # A restore with preserve_under_name makes the backup branch the
+        # parent of the restored branch at the restore LSN, so a later
+        # reset to an older commit must name the ancestor whose timeline
+        # holds that LSN (Neon refuses "LSN is older than parent" from the
+        # branch itself).
+        self._refresh_branches()
+        src = self._ancestor_holding(row["branch_id"] or bid, row["lsn"])
         n = len([k for k in self._branches if k.startswith(f"{ref.branch}_bk_")])
         body = {"source_branch_id": src, "source_lsn": row["lsn"],
                 "preserve_under_name": f"{ref.branch}_bk_{n + 1}_{int(time.time()) % 100000}"}
