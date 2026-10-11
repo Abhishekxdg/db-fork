@@ -54,6 +54,8 @@ from dblib.matrixone import MatrixOneToolSuite
 from dblib import neon as neon_mod
 from dblib.neon import NeonToolSuite
 from dblib.file_copy import FileCopyToolSuite
+from dblib.chronos import ChronosToolSuite
+from dblib import chronos as chronos_mod
 from dblib.xata import XataToolSuite
 from dblib.db_api import DBToolSuite, Ref
 from dblib import result_collector as rc
@@ -297,6 +299,7 @@ class BackendInfo:
     neon_project_id: Optional[str] = None
     xata_project_id: Optional[str] = None
     file_copy_info: Optional[FileCopyToolSuite.FileCopyInfo] = None
+    chronos_info: Optional[ChronosToolSuite.ChronosInfo] = None
     setup_branches: list = None
 
 
@@ -338,6 +341,10 @@ def create_db_tools(
             backend_info.file_copy_info.branches_lock,
             backend_info.file_copy_info.create_db_lock,
             measure_storage,
+        )
+    if backend == tp.Backend.CHRONOS:
+        return ChronosToolSuite.init_for_bench(
+            result_collector, db_name, default_branch, measure_storage
         )
     if backend == tp.Backend.NEON:
         return NeonToolSuite.init_for_bench(
@@ -447,6 +454,13 @@ class BackendManager:
             info.default_branch_name = db_name
             print(f"Default FILE_COPY connection URI: {info.default_uri}")
 
+        elif backend == tp.Backend.CHRONOS:
+            info.chronos_info = ChronosToolSuite.ChronosInfo(db_name)
+            info.default_uri = ChronosToolSuite.get_default_connection_uri()
+            info.default_branch_name = chronos_mod.MAIN_BRANCH
+            info.root_branch_name = chronos_mod.MAIN_BRANCH
+            print(f"Default CHRONOS connection URI: {info.default_uri}")
+
         elif backend == tp.Backend.NEON:
             if require_db_setup:
                 # Leftovers of interrupted runs keep billing: drop them first.
@@ -529,6 +543,8 @@ class BackendManager:
         # Backend-specific cleanup
         if info.file_copy_info:
             FileCopyToolSuite.cleanup(info.file_copy_info)
+        elif info.chronos_info:
+            ChronosToolSuite.cleanup(info.chronos_info)
         elif self.config.backend == tp.Backend.DOLT_MYSQL and db_name:
             try:
                 dolt_mysql.drop_database(db_name)
@@ -600,6 +616,8 @@ class BackendManager:
             return MatrixOneToolSuite.get_initial_connection_uri(db_name)
         elif backend == tp.Backend.FILE_COPY:
             return FileCopyToolSuite.get_initial_connection_uri(db_name)
+        elif backend == tp.Backend.CHRONOS:
+            return ChronosToolSuite.get_initial_connection_uri(db_name)
         elif backend == tp.Backend.NEON:
             return NeonToolSuite._get_neon_connection_uri(
                 info.neon_project_id, info.default_branch_id, db_name
