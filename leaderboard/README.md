@@ -578,18 +578,21 @@ presents mixed groups as one comparison. The builder lists campaigns newest
 first; older campaigns of a system can be chosen from its details.
 
 
-Two quick campaigns on 2026-10-10 (Doltgres campaign `bf237d81`, Dolt campaign
-`1da1f06c`, Doltgres 0.54.10 and Dolt 1.81.2) ran from uncommitted sources
-before validation blocked such runs, so the builder now lists them under **Runs
-not on the board** and the local agent-workflow board is empty until a run from
-a committed tree exists. Their evidence still holds: both attempted all six mini
-workloads with verified database cleanup and a stopped server. Dolt verified all
-six. Doltgres verified S3 and S5 only; S1 and S6 failed because Doltgres rejects
-three TPC-C consistency queries with `GMSCast expected type float64, got
-decimal.Decimal`, and S2, S4 and S6 failed because `dolt_rebase` aborted with
-`rebase aborted due to changes in branch ...` even though the adapter commits
-first. No Full campaign has been run yet, and `publish.json` is empty, so the
-production site shows no agent-workflow results.
+### Current local status
+
+Two quick campaigns on 2026-10-11 from commit `77ffb8f` on an Apple M5 (10 CPUs,
+32 GiB, machine label `fable-mini`) passed validation and share one comparison
+group: Dolt 1.81.2 (campaign `3d6a3943`) verified all six workflows, and Doltgres
+0.54.10 (campaign `e7966bf3`) verified S3 and S5. Doltgres failed S1, S2, S4 and
+S6: S1 because Doltgres rejects TPC-C consistency queries (`GMSCast expected type
+float64, got decimal.Decimal`), and S2, S4 and S6 because `dolt_rebase` aborted
+with `rebase aborted due to changes in branch ...` even though the adapter
+commits first. These are backend or adapter limitations surfaced by the evidence
+and are shown as **Failed** with their reasons. Every database was cleaned up and
+both servers stopped. Two earlier quick campaigns from 2026-10-10 ran from
+uncommitted sources and are listed under **Runs not on the board**. No Full
+campaign has been run yet, and `publish.json` is empty, so the production site
+shows no agent-workflow results.
 
 Tests: `python -m unittest discover -s leaderboard -p 'test_*.py'` (including
 `test_site.py` for the phases, the manifest and the generated directories),
