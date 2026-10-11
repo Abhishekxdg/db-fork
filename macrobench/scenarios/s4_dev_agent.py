@@ -15,6 +15,27 @@ and is deleted without merging.
 Sentinels: loyalty_tier rows exist only on dev branches; item 100001+i is
 inserted on the spine after branch i exists and must be visible on the
 branch only after a rebase.
+
+Schema conflict: the ``schema_conflict_migration``-th spine migration adds
+``customer.c_tier INT`` while the feature branch has already added
+``c_tier VARCHAR(8)``. Every branch alive at that point meets it at its
+next rebase, which must fail naming the conflict; the agent then resolves
+it on its side (moves its column to ``c_loyalty_tier``: add, copy, drop;
+commits) and retries the rebase; a backend that replays history meets the original
+commit again, and the branch then merges the spine in instead and keeps
+integrating by merge. Either way the spine's changes must arrive with
+both columns present. Branches created afterwards fail their feature DDL on
+the existing column and are not checked for it.
+
+Invariants: S4.1 the feature table never reaches the spine; S4.2a/b the
+spine sentinel is invisible before and visible after the first rebase;
+S4.4 a rebase keeps both sides (the branch's own tables, column and rows,
+and every migration the spine has applied, counted through migration_log);
+S4.3a the schema-conflict rebase fails naming a schema conflict and leaves
+the branch intact (or succeeds with both sides present); S4.3b after the
+rename the branch incorporates the spine (rebase retry, else a merge of
+the spine into the branch) with its rows and values, the spine's column
+and every spine migration present.
 """
 
 import threading
@@ -41,6 +62,10 @@ MIGRATIONS = [
     ("M5_district_manager", "district",
      lambda k: f"ALTER TABLE district ADD COLUMN d_manager_{k} VARCHAR(16)"),
 ]
+# Applied as the schema_conflict_migration-th migration: the same column
+# the feature branch adds (c_tier VARCHAR(8)) with a different type.
+SCHEMA_CONFLICT_MIGRATION = ("M6_c_tier_conflict", "customer",
+                             lambda k: "ALTER TABLE customer ADD COLUMN c_tier INT")
 
 
 @register
@@ -66,6 +91,7 @@ class DevAgentScenario(Scenario):
         self._spine_lock = threading.Lock()
         self._dev_steps = 0
         self._migrations = 0
+        self._schema_conflict_applied = False
         self._counter_lock = threading.Lock()
         done = threading.Event()
         prod = threading.Thread(target=self._production_loop, args=(done,),
@@ -110,21 +136,31 @@ class DevAgentScenario(Scenario):
 
     def _migrate(self, suite, rng):
         ctx, p = self.ctx, self.params
-        self._migrations += 1
-        k = self._migrations
-        if rng.random() < p.key_overlap:
-            name, table, ddl = MIGRATIONS[0]        # targets customer
-        else:
-            name, table, ddl = rng.choice(MIGRATIONS[1:])
-        stmt = ddl(k)
-
-        def script(db):
-            db.sql(stmt)
-            db.sql("INSERT INTO migration_log (migration_id, name, applied_step, applied_at) "
-                   "VALUES (%s, %s, %s, CURRENT_TIMESTAMP)", (k, name, self._dev_steps))
+        # Counter, conflict flag, statement and commit all under the spine
+        # lock, so a rebase that holds the lock sees a spine whose committed
+        # migrations are exactly what the counters say.
         with self._spine_lock, self.quiesced():
+            self._migrations += 1
+            k = self._migrations
+            if p.schema_conflict_migration and k == p.schema_conflict_migration:
+                # The feature branch added customer.c_tier VARCHAR(8); the
+                # spine now adds the same column as INT: a schema conflict for
+                # every branch alive at this point, met at its next rebase.
+                name, table, ddl = SCHEMA_CONFLICT_MIGRATION
+            elif rng.random() < p.key_overlap:
+                name, table, ddl = MIGRATIONS[0]        # targets customer
+            else:
+                name, table, ddl = rng.choice(MIGRATIONS[1:])
+            stmt = ddl(k)
+
+            def script(db):
+                db.sql(stmt)
+                db.sql("INSERT INTO migration_log (migration_id, name, applied_step, applied_at) "
+                       "VALUES (%s, %s, %s, CURRENT_TIMESTAMP)", (k, name, self._dev_steps))
             res = suite.exec(script, refs=[ctx.spine], label="spine_migration")[0]
             suite.commit(ctx.spine, f"migration {name} #{k}", label="migration_commit")
+            if res.ok and name == SCHEMA_CONFLICT_MIGRATION[0]:
+                self._schema_conflict_applied = True
         if not res.ok:
             ctx.note(f"migration {name}: {res.status_name} {res.error[:100]}")
 
@@ -133,6 +169,8 @@ class DevAgentScenario(Scenario):
     def _dev_branch(self, w: Worker, i: int):
         ctx, p, inv, suite, rng = self.ctx, self.params, self.ctx.invariants, w.suite, w.rng
         branch = f"dev_{i}"
+        with self._spine_lock:
+            born_after_conflict = self._schema_conflict_applied
         res = ctx.branch(suite, branch, ctx.spine, label="dev_branch")
         if not res.ok:
             ctx.note(f"dev branch {branch}: {res.status_name} {res.error}")
@@ -147,6 +185,9 @@ class DevAgentScenario(Scenario):
                        refs=[ctx.spine], label="spine_sentinel")
             suite.commit(ctx.spine, f"spine sentinel {i}", label="spine_commit")
 
+        col = "c_tier"            # the branch's feature column (renamed on a schema conflict)
+        by_merge = False          # after a schema conflict a replaying backend cannot rebase past
+                                  # the original commit; the branch then merges the spine in instead
         rebase_steps = {p.dev_phase_steps}
         if p.rebases_per_branch >= 2 and p.dev_phase_steps >= 2:
             rebase_steps.add(p.dev_phase_steps // 2)
@@ -164,7 +205,7 @@ class DevAgentScenario(Scenario):
             if step == 1:
                 w.exec(self._feature_ddl(i), branch, label="feature_ddl")
             else:
-                w.exec(self._backfill_script(i, step, chunk, rng), branch, label="backfill")
+                w.exec(self._backfill_script(i, step, chunk, rng, col), branch, label="backfill")
                 chunk += ctx.statements_per_step
             committed = ctx.should_commit(step - 1, last_step=(step == p.dev_phase_steps))
             if committed:
@@ -178,13 +219,113 @@ class DevAgentScenario(Scenario):
                     inv.expect(f"S4.2a spine sentinel invisible on {branch} before rebase",
                                sentinel_visible(), 0)
                 with self._spine_lock:
-                    rb = ctx.retry(lambda: suite.rebase(branch, ctx.spine, on_conflict="theirs", label="dev_rebase"))
+                    conflict_due = self._schema_conflict_applied
+                    schema_before = self._branch_schema(suite, branch, col)
+                    events_before, tiered_before = schema_before["events"], schema_before["tiered"]
+                    if by_merge:
+                        rb = ctx.retry(lambda: suite.merge(branch, ctx.spine, message=f"dev {i} merge spine",
+                                                           on_conflict="ours", label="spine_merge"))
+                    else:
+                        rb = ctx.retry(lambda: suite.rebase(branch, ctx.spine, on_conflict="theirs", label="dev_rebase"))
+                    schema_after = self._branch_schema(suite, branch, col)
+                    spine_migrations = self._migrations
                 rebases_done += 1
                 if rb.ok and isinstance(rb.value, dict):
                     ctx.bump_metric("rebase_conflicts", int(rb.value.get("conflicts", 0)))
                 elif rb.failed:
                     ctx.bump_metric("rebase_failed")
                     ctx.note(f"{branch} rebase: {rb.error[:120]}")
+                # S4.4: a rebase keeps both sides: the branch's own tables,
+                # column and rows, and every migration the spine has applied
+                # (migration_log rows are written by the migrations).
+                # S4.3: once the spine carries the conflicting c_tier, the
+                # rebase either fails naming a schema conflict and leaves the
+                # branch intact, or succeeds with both sides present; a
+                # silently dropped side fails either check.
+                def is_intact(sc):
+                    return (sc["tiers"] == 3 and sc["events"] == events_before
+                            and sc["feature_col"] and sc["tiered"] == tiered_before)
+                intact = is_intact(schema_after)
+                if born_after_conflict:
+                    # Forked from a spine that already has c_tier INT: the
+                    # feature DDL failed on creation, nothing to compare.
+                    inv.not_applicable(f"S4.3 schema-conflict rebase of {branch} (rebase {rebases_done})",
+                                       "branch created after the conflicting migration")
+                elif conflict_due and col == "c_tier":
+                    # First integration after the conflicting migration; a
+                    # branch that already moved its column is checked as usual.
+                    ctx.bump_metric("schema_conflict_rebases")
+                    if rb.failed:
+                        inv.check(f"S4.3a schema-conflict rebase of {branch} fails cleanly",
+                                  "schema conflict" in (rb.error or "").lower() and intact,
+                                  f"error={rb.error[:100]!r} tiers={schema_after['tiers']} events={schema_after['events']}/{events_before} "
+                                  f"tiered={schema_after['tiered']}/{tiered_before}")
+                        # The agent resolves on its side: rename its column,
+                        # commit, rebase again. The retry must bring the
+                        # spine in with both columns present.
+                        # Move the column rather than rename it: RENAME COLUMN
+                        # is missing on some dialects, and Doltgres implements
+                        # it by recreating the table, which its merge then
+                        # refuses as a table deletion.
+                        new_col = "c_loyalty_tier"
+                        rn = w.exec([f"ALTER TABLE customer ADD COLUMN {new_col} VARCHAR(8)",
+                                     f"UPDATE customer SET {new_col} = {col} WHERE {col} IS NOT NULL",
+                                     f"ALTER TABLE customer DROP COLUMN {col}"], branch, label="schema_resolve")
+                        if rn.ok:
+                            col = new_col
+                            w.commit(branch, f"dev {i} resolve schema conflict: rename {new_col}", label="dev_commit")
+
+                            def brought_in(sc, n):
+                                return is_intact(sc) and sc["spine_col"] and sc["migrations"] == n
+
+                            with self._spine_lock:
+                                rb2 = ctx.retry(lambda: suite.rebase(branch, ctx.spine, on_conflict="theirs",
+                                                                     label="dev_rebase_retry"))
+                                schema_retry = self._branch_schema(suite, branch, col)
+                                spine_migrations = self._migrations
+                            resolved_by, last = None, rb2
+                            if rb2.ok and brought_in(schema_retry, spine_migrations):
+                                resolved_by = "rebase"
+                            elif rb2.failed and "schema conflict" in (rb2.error or "").lower():
+                                # A backend that replays history meets the
+                                # original commit again: merge the spine in
+                                # (final states) and integrate by merge from
+                                # now on.
+                                with self._spine_lock:
+                                    m2 = ctx.retry(lambda: suite.merge(
+                                        branch, ctx.spine, message=f"dev {i} merge spine after schema conflict",
+                                        on_conflict="ours", label="spine_merge_retry"))
+                                    schema_retry = self._branch_schema(suite, branch, col)
+                                    spine_migrations = self._migrations
+                                last = m2
+                                if m2.ok and brought_in(schema_retry, spine_migrations):
+                                    resolved_by, by_merge = "merge", True
+                            if last.ok and isinstance(last.value, dict):
+                                ctx.bump_metric("rebase_conflicts", int(last.value.get("conflicts", 0)))
+                            if resolved_by:
+                                ctx.bump_metric(f"schema_conflict_resolved_by_{resolved_by}")
+                            else:
+                                ctx.bump_metric("rebase_failed")
+                            inv.check(f"S4.3b {branch} incorporates the spine after moving its column",
+                                      resolved_by is not None,
+                                      f"via {resolved_by or 'nothing'}: last {last.op} {last.status_name} {last.error[:80]!r} "
+                                      f"tiers={schema_retry['tiers']} events={schema_retry['events']}/{events_before} "
+                                      f"tiered={schema_retry['tiered']}/{tiered_before} spine c_tier={schema_retry['spine_col']} "
+                                      f"migrations={schema_retry['migrations']}/{spine_migrations}")
+                            rb = last
+                        else:
+                            inv.check(f"S4.3b {branch} incorporates the spine after moving its column", False,
+                                      f"column move failed: {rn.error[:120]}")
+                    else:
+                        inv.check(f"S4.3a schema-conflict rebase of {branch} keeps both sides",
+                                  intact and schema_after["migrations"] == spine_migrations,
+                                  f"tiers={schema_after['tiers']} events={schema_after['events']}/{events_before} "
+                                  f"tiered={schema_after['tiered']}/{tiered_before} migrations={schema_after['migrations']}/{spine_migrations}")
+                elif rb.ok:
+                    inv.check(f"S4.4 {'merge' if by_merge else 'rebase'} of {branch} keeps both sides (integration {rebases_done})",
+                              intact and schema_after["migrations"] == spine_migrations,
+                              f"tiers={schema_after['tiers']} events={schema_after['events']}/{events_before} "
+                              f"tiered={schema_after['tiered']}/{tiered_before} migrations={schema_after['migrations']}/{spine_migrations}")
                 if rebases_done == 1:
                     if rb.unsupported:
                         inv.not_applicable(f"S4.2b spine sentinel visible on {branch} after rebase",
@@ -219,7 +360,7 @@ class DevAgentScenario(Scenario):
         # recorded failure.
         r = suite.exec([("SELECT COUNT(*) FROM information_schema.tables "
                          "WHERE table_name = %s AND table_schema = DATABASE()",
-                         ("loyalty_tier",))], refs=[ctx.spine], label="invariant", timed=False)[0]
+                         ("loyalty_tier",))], refs=[ctx.spine], label="invariant")[0]
         if not r.ok:
             r = suite.exec([("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = %s",
                              ("loyalty_tier",))], refs=[ctx.spine], label="invariant")[0]
@@ -239,6 +380,25 @@ class DevAgentScenario(Scenario):
         ctx.delete(suite, branch, label="dev_delete")
         return rebases_done
 
+    def _branch_schema(self, suite, branch: str, col: str = "c_tier") -> dict:
+        """What the branch holds of its own feature and of the spine's
+        migrations: loyalty_tier rows, loyalty_event rows, whether
+        customer.c_tier exists, migration_log rows. Recorded as "invariant" rows
+        (kept out of the figures)."""
+        def count(sql):
+            r = suite.exec([sql], refs=[branch], label="invariant")[0]
+            return int(r.rows[0][0]) if r.ok and r.rows else -1
+        return {"tiers": count("SELECT COUNT(*) FROM loyalty_tier"),
+                "events": count("SELECT COUNT(*) FROM loyalty_event"),
+                "feature_col": count(f"SELECT COUNT({col}) FROM customer WHERE 1 = 0") >= 0,
+                # The spine's column (c_tier INT after the conflicting
+                # migration); same as the feature column before any rename.
+                "spine_col": count("SELECT COUNT(c_tier) FROM customer WHERE 1 = 0") >= 0,
+                # Rows the backfill tiered: readable as the branch wrote them,
+                # whatever a merge did to the column's type.
+                "tiered": count(f"SELECT COUNT(*) FROM customer WHERE {col} IN ('gold', 'silver', 'bronze')"),
+                "migrations": count("SELECT COUNT(*) FROM migration_log")}
+
     def _feature_ddl(self, i: int):
         def script(db):
             db.sql("CREATE TABLE loyalty_tier (tier_id INT NOT NULL, name VARCHAR(16) NOT NULL, "
@@ -250,7 +410,7 @@ class DevAgentScenario(Scenario):
                    "(1, 'bronze', 0), (2, 'silver', 5000), (3, 'gold', 9000)")
         return script
 
-    def _backfill_script(self, i: int, step: int, chunk: int, rng):
+    def _backfill_script(self, i: int, step: int, chunk: int, rng, col: str = "c_tier"):
         ctx = self.ctx
         n = ctx.statements_per_step
         rows = ctx.rows_per_write
@@ -266,18 +426,18 @@ class DevAgentScenario(Scenario):
                 lo = 1 + (idx % per_district) * rows
                 hi = min(customers, lo + rows - 1)
                 if rng.random() < overlap:
-                    db.sql("UPDATE customer SET c_tier = CASE WHEN c_ytd_payment > 9000 THEN 'gold' "
+                    db.sql(f"UPDATE customer SET {col} = CASE WHEN c_ytd_payment > 9000 THEN 'gold' "
                            "WHEN c_ytd_payment > 5000 THEN 'silver' ELSE 'bronze' END, "
                            "c_data = 'loyalty backfill' "
                            "WHERE c_w_id = %s AND c_d_id = %s AND c_id BETWEEN %s AND %s",
                            (w_id, d_id, lo, hi))
                 else:
-                    db.sql("UPDATE customer SET c_tier = CASE WHEN c_ytd_payment > 9000 THEN 'gold' "
+                    db.sql(f"UPDATE customer SET {col} = CASE WHEN c_ytd_payment > 9000 THEN 'gold' "
                            "WHEN c_ytd_payment > 5000 THEN 'silver' ELSE 'bronze' END "
                            "WHERE c_w_id = %s AND c_d_id = %s AND c_id BETWEEN %s AND %s",
                            (w_id, d_id, lo, hi))
                 db.sql("INSERT INTO loyalty_event (event_id, c_w_id, c_d_id, c_id, tier_id, created_at) "
                        "VALUES (%s, %s, %s, %s, 1, CURRENT_TIMESTAMP)",
                        (i * 1_000_000 + step * 1000 + k, w_id, d_id, lo))
-            db.sql("SELECT c_tier, COUNT(*) FROM customer GROUP BY c_tier")
+            db.sql(f"SELECT {col}, COUNT(*) FROM customer GROUP BY {col}")
         return script

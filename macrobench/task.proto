@@ -206,6 +206,10 @@ message DevAgentParams {
     // alters, and share of backfilled rows whose c_data the branch also
     // rewrites (both create rebase conflicts).
     float key_overlap = 8;
+    // The k-th spine migration (1-based, 0 = never) adds customer.c_tier
+    // with a type different from the one the feature branch added: a
+    // schema conflict for every branch alive at that point.
+    int32 schema_conflict_migration = 9;
 }
 
 // S5 Operations agent: dense commits on the spine, a corrupting deploy,

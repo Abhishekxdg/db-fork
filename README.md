@@ -167,7 +167,7 @@ whether the sentinel-based invariance checks held.
 | S1 Agentic RL environment | `rl_env` | T task branches, G rollout leaves each, forks from recorded steps | branch (from commit), commit, diff, delete |
 | S2 Agent context management | `context_mgmt` | long spine, candidate branches per compaction | branch, commit, merge (ff), revert, rebase, delete |
 | S3 Multi-agent collaboration | `multi_agent` | N agents merging into a spine that keeps changing | branch, commit, log, merge (with conflicts), delete |
-| S4 Development agent | `dev_agent` | dev branches off a busy production spine, never merged | branch, commit, rebase (with conflicts), delete |
+| S4 Development agent | `dev_agent` | dev branches off a busy production spine, never merged; one spine migration adds a column the branches already added with another type (a schema conflict at their next rebase, which the branch resolves by moving its column and retrying; a backend that replays history merges the spine in instead) | branch, commit, rebase (with data and schema conflicts), merge (conflict recovery), delete |
 | S5 Operations agent | `ops_agent` | dense commits, bad deploy, investigation branches, PITR | branch (from commit), commit, diff, reset, delete |
 | S6 Data agent | `data_agent` | ingestion batches rebased and merged into a warehouse | branch, commit, reset, rebase, merge, delete |
 

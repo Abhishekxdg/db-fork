@@ -15,6 +15,11 @@ deleted after integration.
 Sentinels: the commit-message token LOGSENTINEL-<round>-<agent> must be
 visible through log(); task 0's status must show three different values
 before the first merge, between the two merges and after the second.
+
+Invariants: S3.1 the round's commits are readable in the spine's log;
+S3.2 the shared sentinel takes three distinct values across the first two
+merges; S3.3 after every successful merge the sentinel task carries the
+merging agent's value (the resolver takes theirs on that row).
 """
 
 import threading
@@ -179,6 +184,12 @@ class MultiAgentScenario(Scenario):
                       before != v1 and v1 != v2 and before != v2
                       and v1 == merged[0]["sentinel_value"] and v2 == merged[1]["sentinel_value"],
                       f"before={before!r} after first merge={v1!r} after second={v2!r}")
+        # S3.3: after every successful merge the sentinel task carries the
+        # merging agent's value (the resolver takes theirs on that row).
+        wrong = [m["agent"] for m in merged if m["sentinel_after"] != m["sentinel_value"]]
+        if merged:
+            inv.check(f"S3.3 sentinel carries each merging agent's value (round {r})", not wrong,
+                      f"{len(wrong)} of {len(merged)} merges left another value (agents {wrong[:5]})")
         ctx.add_metric(f"merge_order_round_{r}", [m["agent"] for m in self._merge_order])
         ctx.bump_metric("merges_ok", len(merged))
         ctx.bump_metric("merges_failed", sum(1 for m in self._merge_order if not m["ok"]))

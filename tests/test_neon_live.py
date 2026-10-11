@@ -192,3 +192,18 @@ def test_reset_twice_to_an_older_commit(suite):
     assert [r[0] for r in rows(suite, "twice", "SELECT id FROM t WHERE id >= 10 ORDER BY id")] == [10]
     log = suite.log("twice", limit=5)
     assert log.ok and log.value[0]["message"] == "s1"
+
+
+def test_column_type_clash_is_a_schema_conflict(suite):
+    """The same column added with different types on both sides: the
+    merge fails naming a schema conflict and changes nothing."""
+    b = suite.branch("typeclash", "main")
+    assert b.ok, b.error
+    suite.exec(["ALTER TABLE t ADD COLUMN tier VARCHAR(8)", "UPDATE t SET tier = 'gold' WHERE id = 1"], refs=["typeclash"])
+    suite.commit("typeclash", "branch adds tier varchar")
+    suite.exec(["ALTER TABLE t ADD COLUMN tier INT"], refs=["main"])
+    suite.commit("main", "main adds tier int")
+    m = suite.merge("main", "typeclash", message="clash")
+    assert m.failed and "schema conflict" in m.error.lower(), (m.status_name, m.error)
+    assert [r[0] for r in rows(suite, "main", "SELECT data_type FROM information_schema.columns WHERE table_name = 't' AND column_name = 'tier'")] == ["integer"]
+    assert rows(suite, "typeclash", "SELECT tier FROM t WHERE id = 1") == [("gold",)]

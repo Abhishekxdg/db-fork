@@ -125,6 +125,9 @@ SPINE_LABEL = "spine"
 # S3's background task updater is time-based like the spine and is kept
 # out of the agent figures for the same reason.
 BACKGROUND_LABELS = (SPINE_LABEL, "spine_update")
+# Invariant probes are recorded (their rows document the checks) but are
+# harness work: neither agent steps nor background load in the figures.
+HARNESS_LABELS = ("invariant",)
 SPINE_OPS = [o for o in DATA_OPS if o != "DDL"] + ["EXEC"]
 PALETTE = plt.get_cmap("tab10")
 
@@ -213,7 +216,7 @@ def agent_ops(run: Run) -> pd.DataFrame:
     """The scenario's own rows: everything but the spine load."""
     if run.ops.empty or "label" not in run.ops.columns:
         return run.ops
-    return run.ops[~run.ops["label"].isin(BACKGROUND_LABELS)]
+    return run.ops[~run.ops["label"].isin(BACKGROUND_LABELS + HARNESS_LABELS)]
 
 
 def spine_ops(run: Run) -> pd.DataFrame:

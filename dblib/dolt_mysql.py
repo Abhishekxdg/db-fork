@@ -372,7 +372,7 @@ class DoltMySQLToolSuite(DBToolSuite):
                     # Schema conflict: Dolt aborts the rebase itself and
                     # leaves the branch as it was.
                     self._current_ref = None
-                    raise RuntimeError(f"rebase aborted: {e}")
+                    raise RuntimeError(f"schema conflict; rebase aborted: {e}")
                 resolved = self._resolve_conflicts(ref, on_conflict)
                 info["conflicts"] += 1
                 info["conflict_tables"] = sorted(

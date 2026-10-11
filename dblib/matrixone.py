@@ -630,10 +630,13 @@ class MatrixOneToolSuite(DBToolSuite):
             if self._pk(ours_db, table) != self._pk(theirs.db, table):
                 raise RuntimeError(f"schema conflict on {table}: primary keys differ "
                                    f"between {ours_db} and {theirs.db}")
-            have = {c[0] for c in self._columns(ours_db, table)}
+            have = {c[0]: c[1] for c in self._columns(ours_db, table)}
             for name, ctype, nullable, default in self._columns(theirs.db, table):
                 if name not in have:
                     plan_cols.append((table, name, ctype, default))
+                elif str(ctype).lower() != str(have[name]).lower():
+                    raise RuntimeError(f"schema conflict on {table}.{name}: types differ "
+                                       f"(ours {have[name]}, theirs {ctype})")
         for table in new_tables:
             self._execute(f"DATA BRANCH CREATE TABLE {_qt(ours_db, table)} FROM {theirs.expr(table)};")
         for table, name, ctype, default in plan_cols:

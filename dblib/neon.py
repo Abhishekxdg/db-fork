@@ -1212,10 +1212,15 @@ class NeonToolSuite(DBToolSuite):
         for t in sorted(ours_tables & set(theirs_tables)):
             if self._pk(ours, t) != self._pk(theirs_conn, t):
                 raise RuntimeError(f"schema conflict on {t}: primary keys differ")
-            have = {c[0] for c in self._columns(ours, t)}
+            have = {c[0]: c for c in self._columns(ours, t)}
             for col in self._columns(theirs_conn, t):
                 if col[0] not in have:
                     plan_cols.append((t, col))
+                elif self._type_sql(col) != self._type_sql(have[col[0]]):
+                    # The same column added or altered on both sides with
+                    # different types: nothing to merge automatically.
+                    raise RuntimeError(f"schema conflict on {t}.{col[0]}: types differ "
+                                       f"(ours {self._type_sql(have[col[0]])}, theirs {self._type_sql(col)})")
         if new_tables:
             schema = self._fdw_schema(ours, self._branch_id(self._current_ref.branch), theirs_id, new_tables)
             for t in new_tables:
