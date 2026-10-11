@@ -15,8 +15,11 @@ path; task B must not see task A's rows.
 Invariants: S1.1 the kept sentinel is readable from every leaf; S1.2 the
 path sentinel differs per leaf; S1.3 a task cannot see another task's
 sentinel; S1.4 the diff of a leaf against the task commit reports exactly
-the repair_audit rows the path inserted, at least the stock rows and the
-path sentinel it updated, and no deletion.
+the rows the path inserted (its repair_audit rows, plus what the fault's
+repair re-inserts on a repaired path), at least the existing stock rows
+and the path sentinel it updated, and no deletion other than the
+delete-plus-add some backends report for a repair's update of a row in a
+table without a primary key.
 """
 
 from macrobench import faults
@@ -143,7 +146,7 @@ class RlEnvScenario(Scenario):
 
         # 3. Score the group: cross-branch consistency read + diff per leaf.
         leaf_refs = [b for b, _ in leaves]
-        rewards = self._score(w, task_id, leaf_refs, task_ref)
+        rewards = self._score(w, task_id, leaf_refs, task_ref, fault, fw, fd)
 
         # 4. Invariance checks.
         self._check_invariants(w, task_id, leaves)
@@ -174,7 +177,10 @@ class RlEnvScenario(Scenario):
         do_ddl = first or rng.random() < ctx.data_ops.ddl_fraction
         start_item = rng.randint(1, max(1, ctx.scale.items - rows))
         conditions = [rng.choice(faults.CONDITIONS) for _ in range(reads)]
-        keys = {(fw, start_item + k * rows + j) for k in range(writes) for j in range(rows)}
+        # The ranges after the first can run past the last item; only rows
+        # that exist count towards what the diff must report as modified.
+        keys = {(fw, i) for k in range(writes) for j in range(rows)
+                for i in (start_item + k * rows + j,) if i <= ctx.scale.items}
 
         def script(db):
             if first:
@@ -208,7 +214,8 @@ class RlEnvScenario(Scenario):
             db.sql("SELECT COUNT(*) FROM repair_audit WHERE task_id = %s", (task_id,))
         return script, keys
 
-    def _score(self, w: Worker, task_id: int, leaf_refs: list, task_ref: str) -> list:
+    def _score(self, w: Worker, task_id: int, leaf_refs: list, task_ref: str,
+               fault, fw: int, fd: int) -> list:
         """Group-relative reward: -violations per leaf (cross-branch read),
         plus a diff of each leaf against the task commit."""
         ctx = self.ctx
@@ -243,18 +250,32 @@ class RlEnvScenario(Scenario):
             if d.ok and isinstance(d.value, dict):
                 ctx.bump_metric("diff_rows_modified", int(d.value.get("rows_modified") or 0))
                 # S1.4: the diff of a leaf against the task commit must show
-                # exactly the repair_audit rows the path inserted (the table
-                # did not exist at the task commit), at least the stock rows
-                # and the path sentinel it updated, and no deletion.
-                audit = w.suite.exec(["SELECT COUNT(*) FROM repair_audit"], refs=[ref], label="invariant")[0]
-                n_audit = int(audit.rows[0][0]) if audit.ok and audit.rows else -1
+                # exactly the rows the path inserted: its repair_audit rows
+                # (the table did not exist at the task commit) plus whatever
+                # the fault's repair re-inserts once the path has repaired;
+                # at least the existing stock rows and the path sentinel it
+                # updated; and no deletion, except that a backend may report
+                # the repair's update of a row in a keyless table (history)
+                # as one deleted plus one added row.
+                def counts(db):
+                    audit = int(db.sql("SELECT COUNT(*) FROM repair_audit")[0][0])
+                    repaired = int(db.sql("SELECT COUNT(*) FROM repair_audit WHERE action = 'repair'")[0][0]) > 0
+                    keyless = (fault.repair_keyless_rows(db, fw, fd)
+                               if repaired and fault.repair_keyless_rows else 0)
+                    return audit, (fault.repair_inserts if repaired else 0), keyless
+                cnt = w.exec(counts, ref, label="invariant")
+                n_audit, inserts, keyless = cnt.value if cnt.ok else (-1, 0, 0)
                 v = d.value
                 added, deleted, modified = (int(v.get("rows_added") or 0), int(v.get("rows_deleted") or 0),
                                             int(v.get("rows_modified") or 0))
                 min_mod = self._touched.get(ref, 0) + 1
+                want_added = n_audit + inserts
                 inv.check(f"S1.4 diff of {ref} against the task commit reports the path's changes",
-                          n_audit >= 0 and added == n_audit and deleted == 0 and modified >= min_mod,
-                          f"added={added} (audit rows {n_audit}) deleted={deleted} modified={modified} (>= {min_mod} expected)")
+                          n_audit >= 0 and deleted in (0, keyless)
+                          and added - deleted == want_added and modified >= min_mod,
+                          f"added={added} deleted={deleted} (want added-deleted={want_added}: audit rows {n_audit}"
+                          f" + repair inserts {inserts}; deleted 0 or {keyless} keyless rows) "
+                          f"modified={modified} (>= {min_mod} expected)")
         return rewards
 
     def _check_invariants(self, w: Worker, task_id: int, leaves: list):

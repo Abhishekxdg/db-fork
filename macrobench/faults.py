@@ -138,6 +138,13 @@ class Fault:
     conditions: tuple  # the conditions it violates
     inject: Callable   # inject(db, w, d) -> dict (state the repair needs)
     repair: Callable   # repair(db, w, d, state) -> None
+    # What the repair changes besides modifying keyed rows, for a diff of
+    # a repaired branch against the state after the injection: rows it
+    # inserts, and keyless_rows(db, w, d) -> rows it updates in a table
+    # without a primary key (a backend may report such an update as one
+    # deleted plus one added row).
+    repair_inserts: int = 0
+    repair_keyless_rows: Callable = None
 
 
 def _district_ytd_inject(db, w, d):
@@ -220,12 +227,21 @@ def _history_repair(db, w, d, state):
            "WHERE h_w_id = %s AND h_d_id = %s AND h_c_id = 1", (w, d))
 
 
+def _history_rows(db, w, d) -> int:
+    rows = db.sql("SELECT COUNT(*) FROM history WHERE h_w_id = %s AND h_d_id = %s AND h_c_id = 1", (w, d))
+    return int(rows[0][0]) if rows else 0
+
+
 FAULTS = {
     1: Fault(1, "district_ytd_drift", ("C1", "C9"), _district_ytd_inject, _district_ytd_repair),
-    2: Fault(2, "lost_new_order", ("C3", "C5"), _lost_new_order_inject, _lost_new_order_repair),
+    # The injection deletes a new_order row; the repair inserts it back.
+    2: Fault(2, "lost_new_order", ("C3", "C5"), _lost_new_order_inject, _lost_new_order_repair,
+             repair_inserts=1),
     3: Fault(3, "order_line_count_drift", ("C4",), _ol_cnt_inject, _ol_cnt_repair),
     4: Fault(4, "carrier_cleared", ("C5", "C7"), _carrier_inject, _carrier_repair),
-    5: Fault(5, "history_amount_doubled", ("C8", "C9"), _history_inject, _history_repair),
+    # history has no primary key.
+    5: Fault(5, "history_amount_doubled", ("C8", "C9"), _history_inject, _history_repair,
+             repair_keyless_rows=_history_rows),
 }
 
 
