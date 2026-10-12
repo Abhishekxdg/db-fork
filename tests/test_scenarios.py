@@ -284,6 +284,28 @@ def test_s4_waits_for_a_branch_slot_without_holding_the_spine_lock():
     assert ctx.work["failed"] == 0 and ctx.worker_errors == [], (ctx.work, ctx.worker_errors)
 
 
+class _NoOpRebaseSuite(FakeSuite):
+    """A rebase that reports success and changes nothing."""
+
+    def _rebase_impl(self, ref, onto, on_conflict="ours"):
+        return {"conflicts": 0}
+
+
+def test_s4_a_failed_probe_never_vouches_for_a_rebase():
+    """-1 means the probe failed. An events count that could be read neither before the rebase
+    nor after it must not prove that the rebase kept the branch's rows (S4.4)."""
+    ctx, scenario, suite = _run("dev_agent", suite_class=_NoOpRebaseSuite, spine_migration_interval=0)
+    probe = scenario._branch_schema
+
+    def events_lost(suite_, branch, col="c_tier"):
+        suite_.branches[branch].raw.execute("DROP TABLE IF EXISTS loyalty_event")
+        return probe(suite_, branch, col)
+    scenario._branch_schema = events_lost
+    scenario.run()
+    s4_4 = [r for r in ctx.invariants.summary()["results"] if r["name"].startswith("S4.4")]
+    assert s4_4 and all(r["passed"] is False for r in s4_4), s4_4
+
+
 def test_s4_isolation_check_fails_when_the_spine_cannot_be_probed():
     """Only a missing-relation error proves the table is absent. A probe that
     fails for any other reason cannot pass S4.1."""

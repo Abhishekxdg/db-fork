@@ -263,9 +263,9 @@ class DevAgentScenario(Scenario):
                 # rebase either fails naming a schema conflict and leaves the
                 # branch intact, or succeeds with both sides present; a
                 # silently dropped side fails either check.
-                def is_intact(sc):
-                    return (sc["tiers"] == 3 and sc["events"] == events_before
-                            and sc["feature_col"] and sc["tiered"] == tiered_before)
+                def is_intact(sc):  # a failed probe (-1) proves nothing, even when it fails on both sides
+                    return (sc["tiers"] == 3 and events_before >= 0 and sc["events"] == events_before
+                            and sc["feature_col"] and tiered_before >= 0 and sc["tiered"] == tiered_before)
                 intact = is_intact(schema_after)
                 if born_after_conflict:
                     # Forked from a spine that already has c_tier INT: the
