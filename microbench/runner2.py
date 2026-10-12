@@ -57,6 +57,8 @@ from dblib.file_copy import FileCopyToolSuite
 from dblib.chronos import ChronosToolSuite
 from dblib import chronos as chronos_mod
 from dblib.xata import XataToolSuite
+from dblib import terminusdb
+from dblib.terminusdb import TerminusDBToolSuite
 from dblib.db_api import DBToolSuite, Ref
 from dblib import result_collector as rc
 
@@ -368,6 +370,10 @@ def create_db_tools(
         return ChronosToolSuite.init_for_bench(
             result_collector, db_name, default_branch, measure_storage
         )
+    if backend == tp.Backend.TERMINUSDB:
+        return TerminusDBToolSuite.init_for_bench(
+            result_collector, db_name, default_branch, measure_storage
+        )
     if backend == tp.Backend.NEON:
         return NeonToolSuite.init_for_bench(
             result_collector,
@@ -483,6 +489,11 @@ class BackendManager:
             info.root_branch_name = chronos_mod.MAIN_BRANCH
             print(f"Default CHRONOS connection URI: {info.default_uri}")
 
+        elif backend == tp.Backend.TERMINUSDB:
+            info.default_uri = TerminusDBToolSuite.get_default_connection_uri()
+            info.default_branch_name = terminusdb.MAIN_BRANCH
+            print(f"Default TerminusDB server: {info.default_uri}")
+
         elif backend == tp.Backend.NEON:
             if require_db_setup:
                 # Leftovers of interrupted runs keep billing: drop them first.
@@ -537,6 +548,9 @@ class BackendManager:
             seekdb.setup_database(db_name, sql_dump_path)
         elif require_db_setup and backend == tp.Backend.MATRIXONE:
             matrixone.setup_database(db_name, sql_dump_path)
+        elif require_db_setup and backend == tp.Backend.TERMINUSDB:
+            # No SQL: the dump is converted to a schema and documents.
+            terminusdb.setup_database(db_name, sql_dump_path)
         elif require_db_setup:
             self._create_database(info.default_uri, db_name)
 
@@ -576,6 +590,11 @@ class BackendManager:
             try:
                 # Also drops every branch database forked from db_name.
                 seekdb.drop_database(db_name)
+            except Exception as e:
+                print(f"Error deleting database: {e}")
+        elif self.config.backend == tp.Backend.TERMINUSDB and db_name:
+            try:
+                terminusdb.drop_database(db_name)
             except Exception as e:
                 print(f"Error deleting database: {e}")
         elif self.config.backend == tp.Backend.MATRIXONE and db_name:
@@ -634,6 +653,8 @@ class BackendManager:
             return DoltMySQLToolSuite.get_initial_connection_uri(db_name)
         elif backend == tp.Backend.SEEKDB:
             return SeekDBToolSuite.get_initial_connection_uri(db_name)
+        elif backend == tp.Backend.TERMINUSDB:
+            return info.default_uri
         elif backend == tp.Backend.MATRIXONE:
             return MatrixOneToolSuite.get_initial_connection_uri(db_name)
         elif backend == tp.Backend.FILE_COPY:
@@ -2410,6 +2431,14 @@ class ResultManager:
             "data_throughput": self.metrics["data_throughput"],
             "support": self.metrics.get("support", {}),
         }
+        # Server behaviour the backend worked around (retries and the like)
+        suite_class = {
+            tp.Backend.CHRONOS: ChronosToolSuite,
+            tp.Backend.TERMINUSDB: TerminusDBToolSuite,
+        }.get(self.config.backend)
+        observed = getattr(suite_class, "OBSERVED", None)
+        if observed:
+            summary["backend_observations"] = dict(observed)
 
         # Build filename
         filename_parts = [

@@ -12,6 +12,8 @@ enum Backend {
   SEEKDB = 8;
   MATRIXONE = 9;
   CHRONOS = 10;
+  // 11 and 12 are used by backends on other branches.
+  TERMINUSDB = 13;
 }
 
 // Operation types for benchmarking
