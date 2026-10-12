@@ -603,6 +603,224 @@ first; older campaigns of a system can be chosen from its details.
 
 ### Current local status
 
+After merging main (`e9ae186`), two quick campaigns on 2026-10-12 from commit
+`358d742` on an Apple M5 (10 CPUs, 32 GiB, machine label `fable-mini`) passed
+validation and share one comparison group: Dolt 1.81.2 (campaign `094049ed`)
+verified all six workflows, including S4's new schema conflict, which both live
+branches resolved by merge, and Doltgres 0.54.10 (campaign `2e602353`) verified
+S3 and S5. Doltgres failed S1, S2, S4 and S6 as it did before the merge: S1 and
+S6's ingest because Doltgres rejects TPC-C consistency queries (`GMSCast expected
+type float64, got decimal.Decimal`), and S2, S4 and S6 because `dolt_rebase`
+aborted with `rebase aborted due to changes in branch ...` even though the
+adapter commits first; main's S6.2 to S6.4 checks now name the S6 failures too.
+These are backend or adapter limitations surfaced by the evidence and are shown
+as **Failed** with their reasons. Every database was cleaned up and both servers
+stopped. Two earlier Dolt campaigns of the same day (`ec942e50`, `1ffb607b`) ran
+from intermediate commits of the merge and remain selectable as other runs on
+this machine. The campaigns of 2026-10-10 and 2026-10-11 are listed under **Runs
+not on the board**: main changed the S4 preset, so their S4 attempts no longer
+match the frozen preset's digest. No Full campaign has been run yet, and
+`publish.json` is empty, so the production site shows no agent-workflow results.
+
+Tests: `python -m unittest discover -s leaderboard -p 'test_*.py'` and
+`node leaderboard/test_page.cjs`.
+
+## Agent workflows
+
+A second, separate lane runs main's six macrobench scenarios on a local Doltgres
+or Dolt server and shows the outcome of every attempt on the page under **Agent
+workflows**. It shares nothing with `local-4`: its own runner, result contract,
+validator, build step and `macro-data.js`. Production opens on this lane; the
+microbench stays one switch away. The micro validator/build never read these files.
+
+The page names each workflow by the job it simulates and keeps the upstream
+scenario name and key as secondary information:
+
+| Page name | Upstream scenario | Key |
+| --- | --- | --- |
+| Evaluate agent rollouts | S1 RL environment | `rl_env` |
+| Manage context history | S2 Context management | `context_mgmt` |
+| Coordinate multiple agents | S3 Multi-agent | `multi_agent` |
+| Develop against live data | S4 Dev agent | `dev_agent` |
+| Recover from a bad deployment | S5 Ops agent | `ops_agent` |
+| Ingest and merge data | S6 Data agent | `data_agent` |
+
+The S6 description on the page says what the scenario does: with a configured
+probability a step is treated as failed and the batch resets to an earlier
+commit, or continues on a new branch from that commit when the backend has no
+reset, then redoes the work.
+
+The workflow board has a row per system and a column per workflow, one table
+per comparison group, headed on one line by its machine and how many systems it
+compares. A completed workflow shows its completion time; any other outcome
+shows a drawn status icon and its word. Within the group, systems are ranked by
+one workflow's completion time at a time, chosen from the column headers (also
+part of the URL: `#agent-workflows?workflow=ops_agent`, with `&order=desc` for
+slowest first). Tied times share a rank.
+A column with at least two completion times marks its fastest and is shaded
+relative to it; a column with one time has no mark and no shading, because
+nothing compares. A workflow that did not complete is unranked in that column
+only. The last column holds how many workflows completed and the row's
+**Details** button. There is no overall score or weighted average. Rows carry no
+badges: every campaign on the board passed validation (below), and a campaign
+that did not is listed under **Runs not on the board** with its reasons. A
+board wider than its card scrolls sideways past a pinned system column. The page
+is built for desktop browsers; it has no phone layout, high-contrast or dark mode.
+
+**The workflows**, directly below the board, defines each workflow
+(`#workflows?workflow=ops_agent`): what it simulates, an animated branch history
+drawn on a Canvas (played once when seen, then held; illustrative, not a trace;
+each label is placed clear of every line, commit, mark and ref chip, and a label
+with no clear spot is left out, and the caption and **Read the history as text**
+carry every step; a ref chip that would cross a line slides along its lane or
+moves to its other side),
+the branch and history operations it exercises, and the completion times of the
+comparable systems for that workflow.
+
+**Completion time** is the upstream runner's `elapsed_sec`: its clock starts
+after the schema and seed data are in place (reported separately as the setup
+time) and stops once the last workflow step has finished and the background
+production traffic some workflows run (the spine workers) has been stopped. It
+excludes schema and seed setup and the parent's later database deletion and
+server stop. It is shown only for a verified attempt.
+
+Each row has one control, **Details**, which opens one dialog with everything
+about that run: its rank in the chosen workflow, then each workflow with its
+time against the fastest in the group (or its status and first reason). Each
+workflow expands in place to its evidence: status, completion and setup time,
+work units and correctness checks as proportion bars, then the checks, the
+operation tables and the attempt record behind disclosures. Older runs of the
+same system and machine can be chosen there (`#agent-workflows?campaign=<id>`),
+and provenance closes the dialog. Malformed evidence is named and shown as
+recorded, never drawn as a proportion.
+
+```bash
+# Validation comes first: a run starts only from a committed tree and always covers all six workflows.
+export PATH="$(brew --prefix libpq)/bin:$PATH"
+# Quick: the upstream *_mini workloads, minutes per database, shown on this machine only.
+python -m leaderboard.run_macro dolt       --preset mini --machine apple-m5-32gb
+python -m leaderboard.run_macro dolt_mysql --preset mini --machine apple-m5-32gb
+python -m leaderboard.site --phase local
+open "leaderboard/.site/local/index.html#agent-workflows"
+
+# Full: the paper-size workloads; hours per database. Only Full campaigns can be published.
+python -m leaderboard.run_macro dolt_mysql --preset full --machine apple-m5-32gb
+```
+
+`run.html` offers the same choices (suite, local databases, Quick or Full,
+machine) and the launcher reconstructs the script from those validated enums. The
+generated script rebuilds this machine's leaderboard even when a run fails and exits
+with the first failing run's status. **Run in Terminal** means the launch was
+accepted, nothing more.
+
+### How a run works
+
+One `run_macro` invocation is a campaign: one system, one preset, the selected
+scenario set, one attempt per scenario, sequentially. The campaign:
+
+1. refuses to start if a server already answers on the connector's host and port
+   or if `leaderboard/.runs/<system>.pid` names a live process (it only benchmarks
+   servers it starts itself), and takes the per-system lock;
+2. writes its campaign record `<system>/macro/<YYYYMMDD>/campaign_<id>.json`
+   before the server starts, then starts the server. Ownership is the pid file the
+   start script writes: a server that started but never passed its readiness check
+   is still stopped at the end; one that never started is left alone. The record
+   is rewritten after every attempt and at the end with the server-stop verdict
+   (`stopped`, `failed`, `not_started`), the finish time and any abort reason, so
+   a campaign that failed before its first child, lost its server or was
+   interrupted stays visible on the page instead of letting an older success stand.
+
+For every attempt the parent:
+
+1. deletes what an earlier run's journal names and proves that database is
+   absent, keeping the journal otherwise, then writes a private journal
+   (`leaderboard/.runs/<system>.journal.json`, mode 0600) with the attempt's
+   `bb_<8 hex>` database name before anything is created;
+3. writes an effective config from the frozen upstream preset with that unique
+   run id and database name, `cleanup: false` and generated data, and runs
+   `python -m macrobench.runner` as a child with `--max-runtime-sec` equal to the
+   deadline (`--deadline-min`, default 30 for mini and 360 for full, setup
+   included); the parent kills the child 120 s past that cap;
+4. reads the child's e2e stats, validates their shape and classifies the outcome
+   from that evidence and from how the child ended (`exited`, `killed` at the
+   deadline, `interrupted`, `launch_failed`), never from the exit code; a child
+   the parent had to kill is never verified, even if it wrote a result first;
+5. deletes the database through the connector, checks that it is gone, and only
+   then deletes the journal; the cleanup verdict is recorded separately. A delete
+   that fails, a database that is still there, or an absence check that could not
+   run keeps the journal and stops the campaign. Cleanup and publication run on
+   every path once the journal exists: a child that could not be started, an
+   unreadable result and Ctrl-C all publish a non-verified attempt first;
+6. publishes `<system>/macro/<YYYYMMDD>/<attempt id>.json` atomically and never
+   rewrites it: the campaign id, selected scenarios, outcome, cleanup, how the
+   child ended, the scrubbed allowlisted evidence, the Git commit and dirty state,
+   a digest of every source file, the frozen preset's digest, the complete
+   normalized workload (only run id, backend selector and database name cleared)
+   and its digest, the lock digest, the backend version, the Python and platform
+   versions, and the machine's CPU, core count and memory (null when unknown).
+
+The server is stopped at the end of the campaign. Raw logs, Parquet, the effective
+config and the child's full e2e JSON stay private under `leaderboard/.runs/macro/`.
+
+The upstream runner now refuses to start timed work when a schema statement or the
+seed commit failed (`status: setup_failed`), counts every logical work unit with an
+explicit outcome (succeeded, failed, skipped), records every exception that escaped
+a worker, splits FAILED verb/exec rows into expected (background spine traffic)
+and unexpected, counts commit-ref and branch-head fallbacks, and exits non-zero
+unless the scenario completed. A failed setup starts neither the workflow nor the
+background spine load. S1 gives each rollout leaf at most two branch attempts and
+records the shortfall instead of retrying until the runtime cap.
+
+### Outcome states
+
+| State | Meaning |
+| --- | --- |
+| Verified completed | Setup complete, every expected unit succeeded, no worker exception, no unexpected failed operation, every applicable correctness check passed, nothing unsupported, no history-ref fallback. Only this state shows a completion time. |
+| Incomplete | Completed, but units were skipped, a verb was unsupported, a history reference fell back to a branch head, a check was not applicable or checks were disabled. |
+| Failed | Setup failed, a worker raised, units failed, an operation failed unexpectedly, a correctness check failed, or the child crashed. |
+| Timed out | The runtime cap ended the workflow, or the parent killed the child at the deadline, with or without a result. Partial elapsed time is shown only in the details. |
+
+These are the only states on the board. An attempt whose evidence is
+missing or unreadable, a workflow the campaign never reached and a scenario
+with two attempts make the campaign fail validation instead.
+
+Database cleanup is `verified`, `failed` or `unknown` per attempt and the server
+stop is `stopped`, `failed` or `not_started` per campaign; neither changes a
+workflow outcome, but anything other than a verified cleanup and a stopped
+server fails validation.
+
+The validator recomputes every outcome and its timings from the stored evidence
+and child record and rejects any file that disagrees, that carries a malformed
+nested shape (lists where objects belong, booleans or negative numbers as
+counters, totals that do not match their results, non-finite numbers), whose
+workload digest is not the digest of its effective config, or whose base digest
+is not the frozen preset's. The builder rejects files, never crashes on them. A
+campaign whose attempts disagree with its record (version, source, lock, Python,
+platform, hardware, preset, scenario set) or that holds two attempts of one
+scenario is listed as inconsistent rather than resolved by picking one; dirty and
+changed-during-run flags are true if any attempt says so.
+
+**Validation.** Before a run starts, the runner checks that the sources are
+committed, the system is local and runnable, the tools are on PATH and nothing
+else answers on its port; if any check fails it writes nothing and runs
+nothing. There is no flag to bypass this, and a campaign always runs all six
+workflows. After the run, the builder validates the recorded campaign: sources
+unchanged during the run, a finished run that was not aborted, a stopped
+server, every database cleaned up, every named attempt present and readable,
+and no conflicting attempt or provenance. A campaign that passes is a result; a
+campaign that fails is excluded with every reason, never shown with a caveat.
+
+Systems compare only within one comparison group. The group binds the preset,
+the per-scenario workload digests, the source digest, the lock digest, the
+Python and platform versions, the machine label and the recorded CPU, core count
+and memory; the system under test and its version stay per row so systems
+compare across rows. The page shows one table per comparison group and never
+presents mixed groups as one comparison. The builder lists campaigns newest
+first; older campaigns of a system can be chosen from its details.
+
+
+### Current local status
+
 Two quick campaigns on 2026-10-11 from commit `77ffb8f` on an Apple M5 (10 CPUs,
 32 GiB, machine label `fable-mini`) passed validation and share one comparison
 group: Dolt 1.81.2 (campaign `3d6a3943`) verified all six workflows, and Doltgres
