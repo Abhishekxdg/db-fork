@@ -187,57 +187,31 @@ function tradeoffChart(ctx) {
     for (const tick of yTicks) svg.append(svgNode('line', {x1: left, x2: right, y1: y(tick), y2: y(tick), class: 'chart-grid'}), svgNode('text', {x: left - 8, y: y(tick) + 4, 'text-anchor': 'end', class: 'chart-tick'}, `×${tick}`));
     svg.append(svgNode('text', {x: (left + right) / 2, y: 228, 'text-anchor': 'middle', class: 'chart-axis-label'}, 'First-query score'));
     for (const p of points) svg.append(chartPoint(p.e, x(p.x), y(p.y), `first-query score ×${p.x.toFixed(3)}, reads & writes score ×${p.y.toFixed(3)}`, {'data-x-score': p.x, 'data-y-score': p.y}, ctx));
-    card.append(svg, chartLegend(measured.filter(e => points.some(p => p.e === e))), node('p', 'panel-note', `${tryLabel(true)} · ×1 is the fastest · logarithmic axes.${points.length < measured.length ? ' Incomplete results are omitted.' : ''}`));
+    card.append(svg, chartLegend(measured.filter(e => points.some(p => p.e === e)), nameOf), node('p', 'panel-note', `${tryLabel(true)} · ×1 is the fastest · logarithmic axes.${points.length < measured.length ? ' Incomplete results are omitted.' : ''}`));
     return card;
-}
-function chartLegend(systems) {
-    const legend = node('div', 'chart-legend');
-    for (const e of systems) { const item = node('span', 'chart-key'), dot = node('span', 'chart-swatch'); dot.style.backgroundColor = seriesColor(e); dot.setAttribute('aria-hidden', 'true'); item.append(dot, node('span', '', nameOf(e))); legend.append(item); }
-    return legend;
 }
 // Warm-up: each system's first try over its best repeat, a dot per workload. The board's First try / Best repeat choice
 // picks between these two times; this shows where that choice matters. At ×1 the first try was as fast as the warmed-up
-// repeat; further right is a slower cold start. Ratios, so the axis is logarithmic. A dot's height within its row is fixed
-// per system, so dots on the same ratio stay apart.
+// repeat; further right is a slower cold start. Ratios, so the axis is logarithmic.
 function warmupChart(ctx) {
-    const card = node('figure', 'panel warmup-panel');
+    const card = node('figure', 'panel dotplot-panel');
     card.append(node('h3', '', 'Warm-up'), node('p', 'panel-note', 'First try against best repeat, per workload. At ×1 the first try was as fast as the repeat; further right, a slower cold start.'));
-    const rows = suiteRows.map((row, i) => ({row, dots: ctx.measured.flatMap(e => {
+    const rows = suiteRows.map((row, i) => ({label: row.label, dots: ctx.measured.flatMap(e => {
         const first = e.result[i][0], best = pick(e.result[i], 'best');
-        return first !== null && best ? [{e, first, best, ratio: first / best}] : [];
+        return first !== null && best ? [{e, value: first / best, title: `${nameOf(e)} · ${row.label}: first try ${seconds(first)}, best repeat ${seconds(best)} (×${(first / best).toFixed(2)})`}] : [];
     })}));
-    const ratios = rows.flatMap(r => r.dots.map(d => d.ratio));
+    const ratios = rows.flatMap(r => r.dots.map(d => d.value));
     if (!ratios.length) { card.append(node('p', 'chart-empty', 'A first try and both repeats are needed for this comparison.')); return card; }
-    const lowest = Math.min(...ratios), below = lowest < 1 ? [[0.5, 0.8, 0.9].findLast(t => t <= lowest) ?? Number(lowest.toFixed(2))] : [];
-    const candidates = [...below, ...logTicks(Math.max(...ratios))], from = Math.log(candidates[0]), span = Math.log(candidates.at(-1)) - from;
+    const lowest = Math.min(...ratios), highest = Math.max(...ratios), below = lowest < 1 ? [[0.5, 0.8, 0.9].findLast(t => t <= lowest) ?? Number(lowest.toFixed(2))] : [];
+    const candidates = [...below, ...logTicks(highest)], from = Math.log(candidates[0]), span = Math.log(candidates.at(-1)) - from;
     // The track can be 180px wide, so besides ×1 and the axis end a tick is kept only a fifth of the axis from every other.
     const ticks = candidates.filter(t => t === 1 || t === candidates.at(-1));
     for (const t of candidates) if (ticks.every(u => Math.abs(Math.log(t / u)) >= span / 5)) ticks.push(t);
     ticks.sort((a, b) => a - b);
-    const at = value => `${((Math.log(value) - from) / span * 100).toFixed(2)}%`;
-    const plot = node('div', 'warmup'), grid = node('div', 'warmup-grid'), axis = node('div', 'warmup-axis');
-    plot.setAttribute('role', 'img');
-    plot.setAttribute('aria-label', `Warm-up across ${plural(rows.length, 'workload')}: first try over best repeat, from ×${lowest.toFixed(2)} to ×${Math.max(...ratios).toFixed(2)}.`);
-    for (const t of ticks) {
-        const line = node('span', t === 1 ? 'warmup-line warmup-one' : 'warmup-line'), tick = node('span', 'warmup-tick', `×${t}`);
-        line.style.left = tick.style.left = at(t); grid.append(line); axis.append(tick);
-    }
-    plot.append(grid);
-    const n = ctx.measured.length, step = n > 1 ? Math.min(5, 12 / (n - 1)) : 0;
-    for (const {row, dots} of rows) {
-        const line = node('div', 'warmup-row'), track = node('span', 'warmup-track');
-        for (const d of dots) {
-            const dot = node('span', 'warmup-dot');
-            dot.style.left = at(d.ratio); dot.style.top = `calc(50% + ${((ctx.measured.indexOf(d.e) - (n - 1) / 2) * step).toFixed(1)}px)`;
-            dot.style.backgroundColor = seriesColor(d.e);
-            dot.title = `${nameOf(d.e)} · ${row.label}: first try ${seconds(d.first)}, best repeat ${seconds(d.best)} (×${d.ratio.toFixed(2)})`;
-            track.append(dot);
-        }
-        line.append(node('span', 'warmup-label', row.label), track); plot.append(line);
-    }
-    plot.append(axis);
-    const shown = ctx.measured.filter(e => rows.some(r => r.dots.some(d => d.e === e))), gaps = rows.some(r => r.dots.length < n);
-    card.append(plot, chartLegend(shown), node('p', 'panel-note', `Logarithmic axis; every try is in each system's details.${gaps ? ' A workload with a failed try has no dot for that system.' : ''}`));
+    const shown = ctx.measured.filter(e => rows.some(r => r.dots.some(d => d.e === e))), gaps = rows.some(r => r.dots.length < ctx.measured.length);
+    card.append(dotPlot(`Warm-up across ${plural(rows.length, 'workload')}: first try over best repeat, from ×${lowest.toFixed(2)} to ×${highest.toFixed(2)}.`, rows, ctx.measured,
+        ticks.map(t => ({value: t, text: `×${t}`, ref: t === 1})), value => `${((Math.log(value) - from) / span * 100).toFixed(2)}%`),
+        chartLegend(shown, nameOf), node('p', 'panel-note', `Logarithmic axis; every try is in each system's details.${gaps ? ' A workload with a failed try has no dot for that system.' : ''}`));
     return card;
 }
 // One board group inside the card: its heading, the ranking table, and a note for every score that could not be computed.
@@ -252,17 +226,10 @@ function boardGroup(title, ctx) {
     if (notes.length) section.append(tagList(notes, 'table-notes'));
     return section;
 }
-// The evidence behind a group's ranking, below the card: the workload heatmap beside the trade-off plot and the warm-up
-// plot, the two columns stretched to one height.
+// The evidence behind a group's ranking, below the card: the workload heatmap beside the trade-off and warm-up plots.
 function breakdown(title, ctx, named) {
-    const section = node('section', 'breakdown-group');
-    if (named) section.append(node('h2', 'breakdown-title', title));
-    const grid = node('div', 'breakdown'), matrix = node('figure', 'panel heatmap-panel'), caption = node('div', 'panel-head');
-    caption.append(node('h3', '', 'Workload breakdown'), heatKey('Shading: darker mint is closer to the fastest time within each row'));
-    matrix.append(caption, node('p', 'panel-note', 'Batch totals in seconds, shaded within each row. Tick read/write workloads to choose what the reads & writes score includes.'), scrolling(heatmap(ctx), 'Scroll sideways to compare systems.'));
-    const side = node('div', 'breakdown-side'); side.append(tradeoffChart(ctx), warmupChart(ctx));
-    grid.append(matrix, side); section.append(grid);
-    return section;
+    return breakdownSection(named ? title : null, 'Workload breakdown', 'Batch totals in seconds, shaded within each row. Tick read/write workloads to choose what the reads & writes score includes.',
+        heatmap(ctx), [tradeoffChart(ctx), warmupChart(ctx)]);
 }
 
 // A system's details: why it sits where it does, every try, the environment, then provenance behind a disclosure.

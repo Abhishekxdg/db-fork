@@ -276,21 +276,21 @@ for (const mode of ['first', 'best']) {
     cold.result = suite.rows.map(() => [0.2, 0.1, 0.1]);  // every first try twice its best repeat
     fast.result[1] = [null, 0.1, 0.1];  // a failed branch-create first try: no dot
     fast.result[2] = [0.095, 0.1, 0.1];  // a first try faster than both repeats sits left of ×1
-    const warm = mount([fast, cold]), chart = inside(warm, 'breakdowns', 'warmup-panel')[0], dots = classNodes(chart, 'warmup-dot');
-    assert.equal(classNodes(chart, 'warmup-row').length, suite.rows.length);
+    const warm = mount([fast, cold]), chart = inside(warm, 'breakdowns', 'dotplot-panel')[0], dots = classNodes(chart, 'dotplot-dot');
+    assert.equal(classNodes(chart, 'dotplot-row').length, suite.rows.length);
     assert.equal(dots.length, 2 * suite.rows.length - 1, 'One dot per system and workload, none for a failed try');
-    assert.deepEqual(classNodes(chart, 'warmup-tick').map(t => [t.textContent, t.style.left]), [['×1', '8.75%'], ['×1.5', '42.43%'], ['×2', '66.32%'], ['×3', '100.00%']],
+    assert.deepEqual(classNodes(chart, 'dotplot-tick').map(t => [t.textContent, t.style.left]), [['×1', '8.75%'], ['×1.5', '42.43%'], ['×2', '66.32%'], ['×3', '100.00%']],
         'The axis starts below the fastest first try; ticks too close to ×1 or the axis end are dropped so labels never touch');
-    assert.equal(classNodes(chart, 'warmup-one')[0].style.left, '8.75%', 'The ×1 line, no warm-up, is drawn apart');
+    assert.equal(classNodes(chart, 'dotplot-ref')[0].style.left, '8.75%', 'The ×1 line, no warm-up, is drawn apart');
     assert.deepEqual(dots.filter(d => d.title.startsWith('Cold')).map(d => d.style.left), Array(suite.rows.length).fill('66.32%'));
     assert.match(dots.find(d => d.title.startsWith('Fast · Branch connect')).title, /: first try .+, best repeat .+ \(×0\.95\)$/);
     assert.equal(dots.find(d => d.title.startsWith('Fast · Branch connect')).style.left, '4.49%');
-    for (const row of classNodes(chart, 'warmup-row')) { const tops = classNodes(row, 'warmup-dot').map(d => d.style.top); assert.equal(new Set(tops).size, tops.length, 'Systems keep apart within a row'); }
+    for (const row of classNodes(chart, 'dotplot-row')) { const tops = classNodes(row, 'dotplot-dot').map(d => d.style.top); assert.equal(new Set(tops).size, tops.length, 'Systems keep apart within a row'); }
     const legends = inside(warm, 'breakdowns', 'chart-legend').map(l => classNodes(l, 'chart-key').map(k => k.textContent));
     assert.deepEqual(legends, Array(2).fill(classNodes(inside(warm, 'breakdowns', 'heatmap')[0], 'system-name').map(n => n.textContent)), 'Both legends list the systems in the heatmap\'s column order');
     assert.match(classNodes(chart, 'panel-note').at(-1).textContent, /A workload with a failed try has no dot for that system\.$/);
     const untried = entry('Untried', 0.1, []); untried.result = suite.rows.map(() => [null, 0.1, 0.1]);
-    assert.equal(inside(mount([untried]), 'breakdowns', 'warmup-panel')[0].children.at(-1).className, 'chart-empty', 'Without a first try there is nothing to compare');
+    assert.equal(inside(mount([untried]), 'breakdowns', 'dotplot-panel')[0].children.at(-1).className, 'chart-empty', 'Without a first try there is nothing to compare');
 }
 // The rank metric is chosen from the score column headers; the other scores stay in place.
 click('sort-load-no');

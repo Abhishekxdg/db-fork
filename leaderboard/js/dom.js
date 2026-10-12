@@ -177,6 +177,45 @@ function resultBars(label, timed, missing = [], nameOf = e => e.system) {
     for (const {e, word} of missing) { const li = node('li'); li.append(resultName(e, nameOf(e)), node('span'), node('span', 'cell-missing', word)); list.append(li); }
     return list;
 }
+// A chart's legend names each system beside its color, so identity never rests on color alone.
+function chartLegend(systems, nameOf = e => e.system) {
+    const legend = node('div', 'chart-legend');
+    for (const e of systems) { const item = node('span', 'chart-key'), dot = node('span', 'chart-swatch'); dot.style.backgroundColor = seriesColor(e); dot.setAttribute('aria-hidden', 'true'); item.append(dot, node('span', '', nameOf(e))); legend.append(item); }
+    return legend;
+}
+// A dot plot: a track per row and a dot per system on one horizontal axis, where `at(value)` is a position along it. Each
+// system keeps one height within every row, so equal values stay apart. Gridlines, tracks and axis share one horizontal
+// extent, so a percentage means the same value in each; the rows share whatever height the panel has.
+function dotPlot(label, rows, systems, ticks, at) {
+    const plot = node('div', 'dotplot'), grid = node('div', 'dotplot-grid'), axis = node('div', 'dotplot-axis');
+    plot.setAttribute('role', 'img'); plot.setAttribute('aria-label', label);
+    for (const t of ticks) {
+        const line = node('span', t.ref ? 'dotplot-line dotplot-ref' : 'dotplot-line'), tick = node('span', 'dotplot-tick', t.text);
+        line.style.left = tick.style.left = at(t.value); grid.append(line); axis.append(tick);
+    }
+    plot.append(grid);
+    const n = systems.length, step = n > 1 ? Math.min(5, 12 / (n - 1)) : 0;
+    for (const row of rows) {
+        const line = node('div', 'dotplot-row'), track = node('span', 'dotplot-track');
+        for (const d of row.dots) {
+            const dot = node('span', 'dotplot-dot'); dot.title = d.title;
+            dot.style.left = at(d.value); dot.style.top = `calc(50% + ${((systems.indexOf(d.e) - (n - 1) / 2) * step).toFixed(1)}px)`;
+            dot.style.backgroundColor = seriesColor(d.e); track.append(dot);
+        }
+        line.append(node('span', 'dotplot-label', row.label), track); plot.append(line);
+    }
+    plot.append(axis);
+    return plot;
+}
+// The evidence behind a board, below its card: a heatmap panel beside a column of charts, the two columns ending on one line.
+function breakdownSection(title, heading, note, table, charts) {
+    const section = node('section', 'breakdown-group'), grid = node('div', 'breakdown'), matrix = node('figure', 'panel heatmap-panel'), caption = node('div', 'panel-head'), side = node('div', 'breakdown-side');
+    if (title) section.append(node('h2', 'breakdown-title', title));
+    caption.append(node('h3', '', heading), heatKey('Shading: darker mint is closer to the fastest time within each row'));
+    matrix.append(caption, node('p', 'panel-note', note), scrolling(table, 'Scroll sideways to compare systems.'));
+    side.append(...charts); grid.append(matrix, side); section.append(grid);
+    return section;
+}
 // One entry of an explorer's picker: the definition's name with a secondary line under it.
 function explorerOption(id, name, sub, ariaLabel, active, onclick) {
     const button = selector('', active, onclick, id); button.classList.add('explorer-option'); button.setAttribute('aria-label', ariaLabel);
