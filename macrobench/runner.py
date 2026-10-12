@@ -91,10 +91,10 @@ class StallWatchdog(threading.Thread):
         # A quarter of the threshold, between 0.5 s and 5 s.
         self.interval = interval if interval is not None else min(5.0, max(0.5, threshold / 4.0))
         self.log = log
-        self._stop = threading.Event()
+        self._halt = threading.Event()  # not _stop: on Python 3.11 and 3.12 that is a Thread method join() calls
 
     def run(self):
-        while not self._stop.wait(self.interval):
+        while not self._halt.wait(self.interval):
             for o in self.collector.stalled_ops(self.threshold):
                 if o["cancelled"]:
                     continue
@@ -104,7 +104,7 @@ class StallWatchdog(threading.Thread):
                     self.log(f"Stall watchdog: {desc} {note}; the operation fails and the run goes on")
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
 
 
 class StorageSampler(threading.Thread):
@@ -118,16 +118,16 @@ class StorageSampler(threading.Thread):
         self.suite = suite
         self.interval = interval
         self.samples: list = []
-        self._stop = threading.Event()
+        self._halt = threading.Event()
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             t = time.time()
             self.samples.append((round(t, 3), self.suite._safe_storage()))
-            self._stop.wait(self.interval)
+            self._halt.wait(self.interval)
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
         self.join(timeout=60)
 
 

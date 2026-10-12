@@ -13,7 +13,7 @@ from dblib.db_api import DBToolSuite
 from macrobench import faults, schema, task_pb2 as tp
 from macrobench.datagen.ch import CHScale, CHGenerator, seed_ch
 from macrobench.intensity import apply_intensity
-from macrobench.runner import setup_outcome, timed_work_allowed
+from macrobench.runner import StallWatchdog, StorageSampler, setup_outcome, timed_work_allowed
 from macrobench.scenarios.base import InvariantFailed, InvariantRecorder
 from macrobench.tpcc import Quiescer
 from tests.fake_backend import FakeSuite
@@ -279,3 +279,19 @@ def test_support_summary_separates_failed_verbs_from_statements(suite):
     assert summary["commit_ref_fallbacks"] == 0
     assert summary["op_status_counts"]["EXEC"]["ok_seconds"] > 0
     assert suite.result_collector.failed_verbs() == {"spine": 1, "step": 1}
+
+
+def test_runner_threads_leave_thread_internals_alone():
+    """Thread._stop is a method on Python 3.11 and 3.12 that join() calls; an Event stored under
+    that name breaks stop() there, before the run's evidence is written."""
+    class Storage:
+        def _safe_storage(self):
+            return 0
+    sampler = StorageSampler(Storage(), 0.01)
+    watchdog = StallWatchdog(rc.ResultCollector(), 60.0, log=lambda m: None)
+    assert "_stop" not in vars(sampler) and "_stop" not in vars(watchdog)
+    for thread in (sampler, watchdog):
+        thread.start()
+        thread.stop()
+    watchdog.join(timeout=5)
+    assert not sampler.is_alive() and not watchdog.is_alive()
