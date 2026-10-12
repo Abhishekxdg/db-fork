@@ -8,7 +8,7 @@ const state = {
     mode: 'first', sort: 'branch', sortDesc: false, ticked: new Set(suiteRows), op: allRows[0].op, hosted: allOn(Object.keys(HOSTING)),
     system: allOn(uniq(data.map(e => e.system))), machine: allOn(uniq(data.map(e => e.machine))), tag: allOn(uniq(data.flatMap(e => e.tags))),
 };
-const decoded = text => { try { return decodeURIComponent(text); } catch { return null; } };  // a mangled link is treated as absent, never as a crash
+const decoded = text => { try { return decodeURIComponent(text); } catch { return null; } };  // a mangled link is treated as absent, never as a crash; a key counts only when it is the table's own (not "constructor")
 function parseHash() {
     const [path, query = ''] = window.location.hash.slice(1).split('?'), params = {};
     for (const pair of query.split('&')) {
@@ -25,12 +25,12 @@ function parseHash() {
 const FILTER_PARAMS = {hosted: 'hosting', system: 'systems', machine: 'machines', tag: 'capabilities'};
 function applyHash() {
     const {path, params} = parseHash();
-    if (path === 'workflows') { state.suite = 'macro'; if (params.workflow in SCENARIOS) state.workflow = params.workflow; return; }
+    if (path === 'workflows') { state.suite = 'macro'; if (Object.hasOwn(SCENARIOS, params.workflow)) state.workflow = params.workflow; return; }
     if (['microbench', 'dataset', 'methodology'].includes(path)) state.suite = 'micro';
     if (path === 'dataset' && allRows.some(r => r.op === params.operation)) state.op = params.operation;
     if (path === 'microbench') {
         state.mode = params.try === 'best' ? 'best' : 'first';
-        state.sort = params.sort in SORTS ? params.sort : 'branch'; state.sortDesc = params.order === 'desc';
+        state.sort = Object.hasOwn(SORTS, params.sort) ? params.sort : 'branch'; state.sortDesc = params.order === 'desc';
         const named = (params.workloads || '').split(',').map(op => VIEWS.data.rows.find(r => r.op === op)).filter(Boolean);
         state.ticked = new Set([...VIEWS.branch.rows, ...named.length ? named : VIEWS.data.rows]);
         for (const [key, param] of Object.entries(FILTER_PARAMS)) {
@@ -41,7 +41,7 @@ function applyHash() {
     if (path === 'macro-guide') state.suite = 'macro';
     if (path !== 'agent-workflows') return;
     state.suite = 'macro';
-    state.rank = params.workflow in SCENARIOS ? params.workflow : Object.keys(SCENARIOS)[0]; state.rankDesc = params.order === 'desc';
+    state.rank = Object.hasOwn(SCENARIOS, params.workflow) ? params.workflow : Object.keys(SCENARIOS)[0]; state.rankDesc = params.order === 'desc';
     state.campaign = new Set((params.campaign || '').split(',').filter(Boolean));
 }
 // A board's link carries only what differs from its default view, so the plain link stays plain.

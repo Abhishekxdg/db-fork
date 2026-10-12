@@ -576,6 +576,7 @@ assert.equal(headRow(rankedBoard())[1].getAttribute('aria-sort'), 'descending');
 assert.equal(ranked.document.getElementById('rank-rl_env-aaaa11112222').getAttribute('aria-label'), 'Evaluate agent rollouts, sorted slowest first; sort fastest first');
 assert.deepEqual(rankedRows().map(r => [nameOf(r).textContent, classNodes(r, 'rank-number')[0].textContent]), [['Doltgres', '3'], ['Tie', '1'], ['Dolt', '1'], ['Late', '—']], 'Slowest first keeps each rank, and a workflow without a time stays last');
 assert.equal(mount(data, [], rankedData, '#agent-workflows?workflow=ops_agent&order=desc').run('[state.rank, state.rankDesc].join()'), 'ops_agent,true', 'The order is part of the link');
+assert.deepEqual(['#agent-workflows?workflow=constructor', '#workflows?workflow=toString'].map(hash => mount(data, [], rankedData, hash).run('[state.rank, state.workflow].join()')), ['rl_env,rl_env', 'rl_env,rl_env'], 'An inherited name is not a workflow');
 ranked.document.getElementById('rank-rl_env-aaaa11112222').click();
 assert.equal(ranked.run('window.location.hash'), '#agent-workflows');
 detailsOf(rankedRows()[2]).click();
@@ -1040,6 +1041,7 @@ assert.equal(shared.run('[state.mode, state.sort, state.sortDesc, countedData().
 assert.deepEqual(bodyRows(shared.byClass('summary')[0]).map(row => nameOf(row).textContent), ['B'], 'The filter in the link applies');
 assert.equal(shared.run('boardHash()'), '#microbench?try=best&sort=data&order=desc&workloads=insert,update&systems=B', 'and the view writes the same link back');
 assert.equal(mount(selectionData, [], null, '#microbench?workloads=nope&sort=bogus').run('[countedData().length, state.sort].join()'), '5,branch', 'Unknown values in a link fall back to the defaults');
+for (const name of ['constructor', 'toString', '__proto__']) assert.equal(mount(selectionData, [], null, `#microbench?sort=${name}`).run('state.sort'), 'branch', `sort=${name} names no score of its own, so the default holds and nothing breaks`);
 // Tied scores share a rank; the next rank skips, as in a competition.
 const tied = mount([entry('A', 0.03, []), entry('B', 0.03, []), entry('C', 0.06, [])]);
 assert.deepEqual(tied.byClass('rank-number').map(e => [e.textContent, e.className]), [['1', 'rank-number rank-leader'], ['1', 'rank-number rank-leader'], ['3', 'rank-number']]);
