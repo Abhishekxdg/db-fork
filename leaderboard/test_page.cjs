@@ -1126,6 +1126,7 @@ async function checkLivePreview() {
     const nodes = new Map(), replies = [];
     const context = vm.createContext({AbortSignal,
         el: id => { if (!nodes.has(id)) nodes.set(id, {}); return nodes.get(id); },
+        say: (id, text) => { if (!nodes.has(id)) nodes.set(id, {}); nodes.get(id).textContent = text; },
         fetch: () => new Promise(resolve => replies.push(resolve)),
     });
     const prepareSource = wizardScript.slice(wizardScript.indexOf('async function prepareRun('),

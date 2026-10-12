@@ -146,16 +146,17 @@ time against the fastest in its group, so the score's arithmetic is visible.
 Every try, the environment and provenance follow; the raw JSON is linked from
 the dialog.
 
-In the local phase, **Run a benchmark** opens `run.html`: a single-page setup with suite choice
-(Microbench or Agent workflows), database selection, environment fields, and a
+In the local phase, **Run a benchmark** opens `run.html` on the suite in view: a
+single-page setup with the suite (Macrobench or Microbench), database selection,
+for the macrobench the workload size (Quick or Full), environment fields, and a
 live script preview. Select one or more databases;
 changing any setting updates the script and invalidates the previous launch
 preview. Expand **Tools & credentials** for prerequisites. The shell-quoted
-commands run the selected databases sequentially and rebuild the development
-site once. The build validates results and excludes historical suites and
-errors. The sequence stops if a command fails. A workflow diagram explains setup,
-measurement, cleanup, and comparison. Detailed setup instructions remain in the
-expandable help.
+commands run the selected databases sequentially and rebuild this machine's
+leaderboard once. The build validates results and excludes historical suites and
+errors. The sequence stops if a command fails. **How a run works** lists the
+steps of the chosen suite. Detailed setup instructions remain in the expandable
+help.
 
 For **Run in Terminal** on macOS, start `python -m leaderboard.serve --phase local`
 from the repository root and open `http://127.0.0.1:8765/run.html`. Review the
@@ -490,7 +491,7 @@ python -m leaderboard.run_macro dolt_mysql --preset full --machine apple-m5-32gb
 
 `run.html` offers the same choices (suite, local databases, Quick or Full,
 machine) and the launcher reconstructs the script from those validated enums. The
-generated script rebuilds the development site even when a run fails and exits
+generated script rebuilds this machine's leaderboard even when a run fails and exits
 with the first failing run's status. **Run in Terminal** means the launch was
 accepted, nothing more.
 

@@ -45,7 +45,7 @@ def macro_commands(config: dict, systems: list, machine: str) -> list[str]:
         raise ValueError("Choose the Quick or Full workload.")
     if any(SYSTEMS[system] for system in systems):
         raise ValueError("Agent workflows run only on local systems.")
-    lines = ["", "# Run one database at a time and always rebuild the development site; the first failure's exit status is the script's.",
+    lines = ["", "# Run one database at a time and always rebuild this machine's leaderboard; the first failure's exit status is the script's.",
              "status=0", 'keep() { [ "$status" -ne 0 ] || status=$1; }']
     for system in systems:
         lines.append(shlex.join([PYTHON, "-m", "leaderboard.run_macro", system, "--preset", preset, "--machine", machine]) + " || keep $?")
@@ -80,7 +80,7 @@ def script_for(config: dict) -> str:
                   '  if [ -z "${!benchmark_key:-}" ]; then',
                   '    read -r -s -p "$benchmark_key: " "$benchmark_key"',
                   "    printf '\\n'", "  fi", '  export "$benchmark_key"', "done"]
-    lines += ["", "# Run one database at a time, then rebuild the development site from validated current-suite results."]
+    lines += ["", "# Run one database at a time, then rebuild this machine's leaderboard from validated current-suite results."]
     for system in systems:
         args = [PYTHON, "-m", "leaderboard.run", system, "--machine", machine]
         if SYSTEMS[system]:
