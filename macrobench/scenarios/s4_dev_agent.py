@@ -178,9 +178,19 @@ class DevAgentScenario(Scenario):
     def _dev_branch(self, w: Worker, i: int):
         ctx, p, inv, suite, rng = self.ctx, self.params, self.ctx.invariants, w.suite, w.rng
         branch = f"dev_{i}"
-        with self._spine_lock:  # the flag and the fork together: a migration cannot land between them
-            born_after_conflict = self._schema_conflict_applied
-            res = ctx.branch(suite, branch, ctx.spine, label="dev_branch")
+        with self._spine_lock:
+            conflict_before = self._schema_conflict_applied
+        # The fork may wait for a free branch slot, so it never runs under the spine lock: a worker
+        # holding the lock while waiting would block the branch that has to finish to free the slot.
+        res = ctx.branch(suite, branch, ctx.spine, label="dev_branch")
+        with self._spine_lock:
+            conflict_after = self._schema_conflict_applied
+        born_after_conflict = conflict_before
+        if res.ok and conflict_after and not conflict_before:
+            # The conflicting migration landed while the branch was forking. Before the feature DDL,
+            # only that migration puts c_tier on customer, so the branch itself says which side it is on.
+            born_after_conflict = suite.exec(["SELECT COUNT(c_tier) FROM customer WHERE 1 = 0"], refs=[branch],
+                                             label="invariant", timed=False)[0].ok
         if not res.ok:
             ctx.note(f"dev branch {branch}: {res.status_name} {res.error}")
             ctx.tick(p.dev_phase_steps + p.review_phase_steps, outcome="failed")

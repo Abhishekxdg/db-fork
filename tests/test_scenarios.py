@@ -5,6 +5,7 @@ the lifecycle completes, unsupported verbs are recorded, and the
 invariants that depend on them are marked not applicable."""
 
 import random
+import threading
 
 import pytest
 from google.protobuf import text_format
@@ -95,12 +96,14 @@ def test_scenario_runs_to_completion_on_fake_backend(key):
     assert collector.failed_verbs() == {}, collector.failed_verbs()
 
 
-def _run(key, **overrides):
+def _run(key, suite_class=FakeSuite, branch_ops=None, **overrides):
     cfg = _config(key)
     for name, value in overrides.items():
         setattr(getattr(cfg.workload, key), name, value)
+    for name, value in (branch_ops or {}).items():
+        setattr(cfg.workload.branch_ops, name, value)
     collector = rc.ResultCollector()
-    suite = FakeSuite(collector)
+    suite = suite_class(collector)
     ctx = ScenarioContext(config=cfg, suite_factory=lambda: suite, collector=collector,
                           spine="main", invariants=InvariantRecorder(), log=lambda m: None)
     scenario = create_scenario(ctx)
@@ -249,19 +252,36 @@ def test_s4_conflict_on_a_backend_without_rebase_is_not_applicable():
     assert [r for r in results if r["name"].startswith("S4.3") and r["passed"] is None], results
 
 
-def test_s4_dev_branches_fork_under_the_spine_lock():
-    """Whether a branch was born after the conflict and its fork are read together,
-    so the conflicting migration cannot land between them."""
-    ctx, scenario, suite = _run("dev_agent", spine_migration_interval=0)
-    fork, held = suite._branch_impl, []
+def test_s4_a_branch_forked_after_the_conflict_landed_is_not_checked_for_it():
+    """The conflicting migration can land while a branch forks. The branch's own schema then says
+    which side it is on, so its feature DDL failing by design is not counted as a failure."""
+    ctx, scenario, suite = _run("dev_agent", schema_conflict_migration=1, spine_migration_interval=0)
+    fork = suite._branch_impl
 
-    def branch(name, from_ref):
+    def fork_after_the_migration(name, from_ref):
         if name.startswith("dev_"):
-            held.append(scenario._spine_lock.locked())
+            scenario._migrate(suite, random.Random(0))  # lands between the first flag read and the fork
         return fork(name, from_ref)
-    suite._branch_impl = branch
+    suite._branch_impl = fork_after_the_migration
     scenario.run()
-    assert held == [True], held
+    assert scenario._schema_conflict_applied
+    assert ctx.work["failed"] == 0 and ctx.worker_errors == [], (ctx.work, ctx.worker_errors)
+
+
+def test_s4_waits_for_a_branch_slot_without_holding_the_spine_lock():
+    """With one live branch allowed, the second dev branch waits for the first to delete its
+    branch. The first needs the spine lock to get there, so the wait must not hold it."""
+    ctx, scenario, suite = _run("dev_agent", branch_ops={"max_live_branches": 1}, dev_branches=2,
+                                concurrent_branches=2, spine_migration_interval=0)
+    runner = threading.Thread(target=scenario.run, daemon=True)
+    runner.start()
+    runner.join(timeout=30)
+    deadlocked = runner.is_alive()
+    if deadlocked:
+        ctx.cancel_all("test timeout")
+        runner.join(timeout=30)
+    assert not deadlocked
+    assert ctx.work["failed"] == 0 and ctx.worker_errors == [], (ctx.work, ctx.worker_errors)
 
 
 def test_s4_isolation_check_fails_when_the_spine_cannot_be_probed():
