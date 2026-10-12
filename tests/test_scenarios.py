@@ -306,6 +306,18 @@ def test_s4_a_failed_probe_never_vouches_for_a_rebase():
     assert s4_4 and all(r["passed"] is False for r in s4_4), s4_4
 
 
+def test_s1_touched_rows_are_rows_that_exist():
+    """A step writes ranges of stock rows. A range that runs past the last item updates only the
+    items that exist, so only those count toward the changes S1.4 expects."""
+    ctx, scenario, suite = _run("rl_env")
+
+    class LastStart(random.Random):
+        def randint(self, a, b):
+            return b  # the last start the step allows
+    _, keys = scenario._step_script(1, 1, 1, False, 1.0, None, 1, 1, None, repair=False, rng=LastStart(0))
+    assert keys and max(i for _, i in keys) == ctx.scale.items, sorted(keys)
+
+
 def test_s4_isolation_check_fails_when_the_spine_cannot_be_probed():
     """Only a missing-relation error proves the table is absent. A probe that
     fails for any other reason cannot pass S4.1."""

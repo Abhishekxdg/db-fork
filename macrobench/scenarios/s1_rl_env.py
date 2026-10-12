@@ -185,7 +185,8 @@ class RlEnvScenario(Scenario):
         do_ddl = first or rng.random() < ctx.data_ops.ddl_fraction
         start_item = rng.randint(1, max(1, ctx.scale.items - rows))
         conditions = [rng.choice(faults.CONDITIONS) for _ in range(reads)]
-        keys = {(fw, start_item + k * rows + j) for k in range(writes) for j in range(rows)}
+        keys = {(fw, i) for k in range(writes) for j in range(rows)  # a range past the last item updates only the items that exist
+                if (i := start_item + k * rows + j) <= ctx.scale.items}
 
         def script(db):
             if first:
