@@ -147,6 +147,7 @@ def _capabilities_for(backend) -> dict:
     from dblib.dolt_mysql import DoltMySQLToolSuite
     from dblib.seekdb import SeekDBToolSuite
     from dblib.matrixone import MatrixOneToolSuite
+    from dblib.chronos import ChronosToolSuite
     from dblib.xata import XataToolSuite
     from dblib.file_copy import FileCopyToolSuite
 
@@ -155,6 +156,7 @@ def _capabilities_for(backend) -> dict:
         tp.Backend.DOLT_MYSQL: DoltMySQLToolSuite,
         tp.Backend.SEEKDB: SeekDBToolSuite,
         tp.Backend.MATRIXONE: MatrixOneToolSuite,
+        tp.Backend.CHRONOS: ChronosToolSuite,
         tp.Backend.NEON: NeonToolSuite,
         tp.Backend.XATA: XataToolSuite,
         tp.Backend.FILE_COPY: FileCopyToolSuite,
@@ -169,6 +171,7 @@ def _implementation_for(backend) -> dict:
     from dblib.dolt_mysql import DoltMySQLToolSuite
     from dblib.seekdb import SeekDBToolSuite
     from dblib.matrixone import MatrixOneToolSuite
+    from dblib.chronos import ChronosToolSuite
     from dblib.xata import XataToolSuite
     from dblib.file_copy import FileCopyToolSuite
 
@@ -177,6 +180,7 @@ def _implementation_for(backend) -> dict:
         tp.Backend.DOLT_MYSQL: DoltMySQLToolSuite,
         tp.Backend.SEEKDB: SeekDBToolSuite,
         tp.Backend.MATRIXONE: MatrixOneToolSuite,
+        tp.Backend.CHRONOS: ChronosToolSuite,
         tp.Backend.NEON: NeonToolSuite,
         tp.Backend.XATA: XataToolSuite,
         tp.Backend.FILE_COPY: FileCopyToolSuite,

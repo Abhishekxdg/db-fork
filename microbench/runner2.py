@@ -51,6 +51,8 @@ from dblib import seekdb
 from dblib.seekdb import SeekDBToolSuite
 from dblib import matrixone
 from dblib.matrixone import MatrixOneToolSuite
+from dblib import chronos
+from dblib.chronos import ChronosToolSuite
 from dblib import neon as neon_mod
 from dblib.neon import NeonToolSuite
 from dblib.file_copy import FileCopyToolSuite
@@ -329,6 +331,10 @@ def create_db_tools(
         return MatrixOneToolSuite.init_for_bench(
             result_collector, db_name, default_branch, measure_storage
         )
+    if backend == tp.Backend.CHRONOS:
+        return ChronosToolSuite.init_for_bench(
+            result_collector, db_name, default_branch, measure_storage
+        )
     if backend == tp.Backend.FILE_COPY:
         return FileCopyToolSuite.init_for_bench(
             result_collector,
@@ -441,6 +447,11 @@ class BackendManager:
             info.default_branch_id = db_name
             print(f"Default MatrixOne connection URI: {info.default_uri}")
 
+        elif backend == tp.Backend.CHRONOS:
+            info.default_uri = ChronosToolSuite.get_default_connection_uri()
+            info.default_branch_name = chronos.MAIN_BRANCH
+            print(f"Default Chronos connection URI: {info.default_uri}")
+
         elif backend == tp.Backend.FILE_COPY:
             info.file_copy_info = FileCopyToolSuite.FileCopyInfo(db_name)
             info.default_uri = FileCopyToolSuite.get_default_connection_uri()
@@ -501,6 +512,13 @@ class BackendManager:
             seekdb.setup_database(db_name, sql_dump_path)
         elif require_db_setup and backend == tp.Backend.MATRIXONE:
             matrixone.setup_database(db_name, sql_dump_path)
+        elif require_db_setup and backend == tp.Backend.CHRONOS:
+            # Chronos is a library over a plain PostgreSQL database: psql
+            # loads a dump, then its tables are registered for branching.
+            chronos.setup_database(db_name)
+            if sql_dump_path:
+                load_sql_file(self._get_connection_uri(info), sql_dump_path)
+                chronos.adopt_tables(db_name)
         elif require_db_setup:
             self._create_database(info.default_uri, db_name)
 
@@ -544,6 +562,12 @@ class BackendManager:
             try:
                 # Also drops every branch database and snapshot of the run.
                 matrixone.drop_database(db_name)
+            except Exception as e:
+                print(f"Error deleting database: {e}")
+        elif self.config.backend == tp.Backend.CHRONOS and db_name:
+            try:
+                # Branches are rows in the database's own metadata tables.
+                chronos.drop_database(db_name)
             except Exception as e:
                 print(f"Error deleting database: {e}")
         elif info.default_uri and db_name:
@@ -598,6 +622,8 @@ class BackendManager:
             return SeekDBToolSuite.get_initial_connection_uri(db_name)
         elif backend == tp.Backend.MATRIXONE:
             return MatrixOneToolSuite.get_initial_connection_uri(db_name)
+        elif backend == tp.Backend.CHRONOS:
+            return ChronosToolSuite.get_initial_connection_uri(db_name)
         elif backend == tp.Backend.FILE_COPY:
             return FileCopyToolSuite.get_initial_connection_uri(db_name)
         elif backend == tp.Backend.NEON:

@@ -113,6 +113,7 @@ both under `capabilities` and `implementation`.
 | `xata` | yes | | | | | yes | | | yes |
 | `seekdb` | yes | yes (SCN snapshots) | yes (SQL three-way) | yes | yes | yes | yes | yes | yes |
 | `matrixone` | yes | yes (snapshots) | yes (DATA BRANCH MERGE) | yes | yes (diff-driven) | yes | yes | yes | yes |
+| `chronos` | yes | yes (checkpoints) | yes, or branch-local DDL (see below) | rebase as a merge / revert diff-driven | yes (diff-driven) | yes | yes (read-only) | per-ref fallback | |
 | `file_copy` | yes | | | | | yes | | | yes |
 
 ### exec()
@@ -230,7 +231,7 @@ workload {
 | Argument | Description |
 |----------|-------------|
 | `scenario` | `rl_env`, `context_mgmt`, `multi_agent`, `dev_agent`, `ops_agent`, `data_agent` |
-| `backend` | `dolt`, `dolt_mysql`, `seekdb`, `matrixone`, `neon`, `xata`, `file_copy` |
+| `backend` | `dolt`, `dolt_mysql`, `seekdb`, `matrixone`, `chronos`, `neon`, `xata`, `file_copy` |
 | `scale_factor` | W warehouses for the generated data (default: the config's) |
 | `--max-runtime-sec N` | runtime cap; default one hour times the largest of the scale factor and the intensity multipliers (3600 s at scale 1, intensity 1), 0 = no cap. A run that reaches it (or gets Ctrl-C / SIGTERM) is recorded as `interrupted` with its rows and stats written |
 | `--op-stall-sec N` | stall limit for one operation: a verb or an exec that has been running longer than this (default 600 s, 0 = off) is cancelled and recorded `FAILED` with a `stalled: cancelled after Ns` note; the run goes on, so later failures and invariant results are recorded too; the e2e stats list the cancelled operations under `stalls` with their outcome (`failed`, or `completed` when it finished before the cancel landed), and a run with a cancelled operation that failed ends with status `incomplete` instead of `completed` |
@@ -686,6 +687,126 @@ closes.
 Async mode (`use_async` / `concurrent_requests > 1`) uses an aiomysql pool,
 like `dolt_mysql`. Each pool connection is opened on the worker's branch
 database.
+
+---
+
+## Chronos backend — `chronos`
+
+[Chronos](https://github.com/mitdbg/chronos) ([paper](https://arxiv.org/abs/2609.14889))
+is a bolt-on branching layer: a Python library, `chronos-core`, over an
+ordinary PostgreSQL database. It is not on PyPI and is not in `uv.lock`;
+build it into the environment (needs a C++ toolchain, cmake, `libpq-dev`,
+`libsqlite3-dev` and `libboost-dev`; 0.2.0a1 was used here):
+
+```bash
+uv pip install 'git+https://github.com/mitdbg/chronos#subdirectory=packages/chronos-core'
+```
+
+The other backends run without it. Point the backend at any PostgreSQL
+server with `CHRONOS_HOST` (default `localhost`), `CHRONOS_PORT` (`5432`),
+`CHRONOS_USER` (`postgres`) and `CHRONOS_PASSWORD` (`password`); the run's
+database is created there and dropped (`WITH (FORCE)`) afterwards. Every
+worker owns a Chronos context, which holds three to four server connections,
+so `max_connections` must cover about four per worker thread and spine
+client. Storage is `pg_database_size` of the run's database (rows of every
+branch are stored once, with their visibility intervals, next to Chronos'
+metadata tables).
+
+Chronos has no wire protocol and no SQL functions for branching. Branches
+are rows in metadata tables, a fork copies nothing, and SQL goes through a
+session checked out on one branch, which rewrites it for that branch. The
+backend class gives the harness a DB-API facade over that session:
+
+- `branch()` is `create_branch` (`create_branch_from_checkpoint` for
+  `"b@commit"`), `delete()` is `delete_branch`; the root branch `main` cannot
+  be deleted. `delete_branch` removes a branch together with every branch
+  forked from it: a workload that still uses a child after deleting its
+  parent finds it gone, a later `delete()` of such a child is a no-op, and
+  the e2e stats count them (`backend_observations`).
+- `commit()` is `create_checkpoint`; the checkpoint id is the commit id.
+  Checkpoints belong to one branch, so `log()` walks them along the lineage
+  the backend keeps in branch and checkpoint metadata (where a branch was
+  forked from, what a merge brought in). A commit ref used with `exec()` is a
+  read-only checkpoint session: writes to it fail.
+- `diff()` is Chronos' row-level `diff` between two branches; a commit ref
+  is materialised as a throwaway branch (`_bbtmp_*`, deleted when the
+  connection closes).
+- `merge()` is `merge_apply`: first under the snapshot-isolation policy (the
+  native one-pass merge), and on a write-write conflict again with
+  `target_wins` ("ours") or `source_wins` ("theirs"), the conflicts counted
+  from `merge_preview`. A resolve callable gets the two sides (`our_*`,
+  `their_*`; Chronos does not report the base row). A checkpoint records the
+  merge. Chronos cannot merge a branch created from a commit ("no shared
+  fork base"): that merge is recorded as UNSUPPORTED.
+- `rebase()` is the same merge with the upstream as the source and the
+  branch as the target. Chronos keeps the original fork point as the merge
+  base, so a row both sides changed is still a conflict in the merge back
+  that follows (it is not a fast-forward as on Dolt).
+- `reset()` and `revert()` do not exist in Chronos: both apply a `diff`
+  (branch vs. commit; commit vs. its predecessor) to the branch with the
+  session's `upsert_rows` / `delete_keys`.
+- Multi-branch `exec()` is unsupported (one session, one branch), and there
+  is no async mode.
+
+The backend is wired for the macrobenchmark. The microbenchmark runner can
+set a Chronos database up, but its operations issue PostgreSQL session and
+catalog statements (`SET search_path`, `information_schema` lookups of the
+user tables) that a Chronos session does not take.
+
+**Schema branching or merge.** Chronos 0.2 does not merge tables under
+schema branching, so the backend has two modes, chosen with
+`CHRONOS_SCHEMA_BRANCHING`:
+
+| | `1` (default) | `0` |
+|---|---|---|
+| CREATE / ALTER / DROP TABLE, CREATE INDEX on a branch | yes, branch-local | no (CREATE TABLE on `main` only, visible on every branch) |
+| `merge()`, `rebase()` | UNSUPPORTED | yes |
+
+Run a scenario in both modes to cover both sets of operations; with `0`,
+the scenarios' branch-local DDL fails and takes the invariants that depend
+on it with it.
+
+Chronos accepts a subset of SQL, so the facade translates what the
+workloads need and passes everything else as is:
+
+- `%s` parameters become Chronos' named parameters.
+- `CREATE TABLE` is rewritten to the form its DDL parser takes (primary key
+  inline, no `NOT NULL`). A table without a primary key (`history`) gets a
+  hidden `_bb_rowid` key the facade fills on INSERT (`SELECT *` shows it).
+- `BETWEEN` in the WHERE of an UPDATE or DELETE becomes two comparisons.
+- Rows come back as dicts keyed by column name, so a SELECT with several
+  unnamed expressions gets aliases; timestamps, dates and numeric
+  expressions, returned as text, are parsed to Python types.
+- BEGIN / COMMIT / ROLLBACK drive `session.transaction()`; CHECKPOINT,
+  VACUUM and ANALYZE go straight to PostgreSQL.
+
+A statement Chronos rejects is recorded as FAILED with its reason: views,
+foreign keys, `INSERT ... SELECT`, an INSERT without a column list, and on a
+table whose schema a branch changed, an UPDATE with a subquery or an `IN`
+list. A fork, checkpoint or merge briefly bars the branch for the other
+workers; an operation that meets that barrier is retried inside its own
+latency for up to a minute.
+
+A fork, commit or merge of a branch needs that branch's metadata row, which
+every statement in a transaction on the branch share-locks. Under a steady
+stream of transactions (the spine load) such an operation can wait
+indefinitely, and a Chronos call cannot be cancelled from the client. The
+run's database therefore gets `lock_timeout` = `CHRONOS_LOCK_TIMEOUT_SEC`
+(default 600, the stall watchdog's default; 0 = wait forever), after which
+the operation is recorded as FAILED.
+
+Closing a context waits for Chronos' background interval GC; when its GC
+thread has died that wait never returns, so the backend gives a close 30 s
+and then goes on (`gc_waits_abandoned` in the e2e stats' `backend_observations`).
+
+With a `sql_dump` source the dump is loaded with psql and every table that
+has a primary key is registered with Chronos (`chronos.adopt_tables`).
+
+```bash
+CHRONOS_PORT=5432 ./scripts/run_macrobench.sh --mini rl_env chronos
+CHRONOS_SCHEMA_BRANCHING=0 ./scripts/run_macrobench.sh --outdir run_stats/chronos_merge data_agent chronos
+uv run python -m pytest tests/test_chronos_live.py   # needs the server; run with =0 as well
+```
 
 ---
 
