@@ -239,6 +239,21 @@ def test_s4_conflict_on_a_backend_without_rebase_is_not_applicable():
     assert [r for r in results if r["name"].startswith("S4.3") and r["passed"] is None], results
 
 
+def test_s4_dev_branches_fork_under_the_spine_lock():
+    """Whether a branch was born after the conflict and its fork are read together,
+    so the conflicting migration cannot land between them."""
+    ctx, scenario, suite = _run("dev_agent", spine_migration_interval=0)
+    fork, held = suite._branch_impl, []
+
+    def branch(name, from_ref):
+        if name.startswith("dev_"):
+            held.append(scenario._spine_lock.locked())
+        return fork(name, from_ref)
+    suite._branch_impl = branch
+    scenario.run()
+    assert held == [True], held
+
+
 def test_s4_isolation_check_fails_when_the_spine_cannot_be_probed():
     """Only a missing-relation error proves the table is absent. A probe that
     fails for any other reason cannot pass S4.1."""

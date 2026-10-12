@@ -178,9 +178,9 @@ class DevAgentScenario(Scenario):
     def _dev_branch(self, w: Worker, i: int):
         ctx, p, inv, suite, rng = self.ctx, self.params, self.ctx.invariants, w.suite, w.rng
         branch = f"dev_{i}"
-        with self._spine_lock:
+        with self._spine_lock:  # the flag and the fork together: a migration cannot land between them
             born_after_conflict = self._schema_conflict_applied
-        res = ctx.branch(suite, branch, ctx.spine, label="dev_branch")
+            res = ctx.branch(suite, branch, ctx.spine, label="dev_branch")
         if not res.ok:
             ctx.note(f"dev branch {branch}: {res.status_name} {res.error}")
             ctx.tick(p.dev_phase_steps + p.review_phase_steps, outcome="failed")
