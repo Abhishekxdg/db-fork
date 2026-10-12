@@ -407,10 +407,11 @@ class DevAgentScenario(Scenario):
     def _branch_schema(self, suite, branch: str, col: str = "c_tier") -> dict:
         """What the branch holds of its own feature and of the spine's
         migrations: loyalty_tier rows, loyalty_event rows, whether
-        customer.c_tier exists, migration_log rows. Recorded as "invariant" rows
-        (kept out of the figures)."""
+        customer.c_tier exists, migration_log rows. Untimed, like the dialect
+        probe: a missing table or column is an answer here (-1), not a
+        recorded failure."""
         def count(sql):
-            r = suite.exec([sql], refs=[branch], label="invariant")[0]
+            r = suite.exec([sql], refs=[branch], label="invariant", timed=False)[0]
             return int(r.rows[0][0]) if r.ok and r.rows else -1
         return {"tiers": count("SELECT COUNT(*) FROM loyalty_tier"),
                 "events": count("SELECT COUNT(*) FROM loyalty_event"),
