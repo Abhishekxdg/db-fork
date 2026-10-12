@@ -1007,9 +1007,20 @@ dies on its first error (in S1 "out of shared memory", PostgreSQL's
 `max_locks_per_transaction` exhausted by a GC transaction touching every
 physical table) and would then block the context's close forever, so the
 shim clears the flag and runs the reclamation synchronously in `gc()`
-(`gc_worker_died`); and the rows a merge applies are re-read from the
+(`gc_worker_died`); the rows a merge applies are re-read from the
 source branch rather than taken from the diff's reported values
-(`diff_values_stale` counts disagreements). Concurrent TPC-C deliveries on
+(`diff_values_stale` counts disagreements); and a bulk `upsert_rows` or
+`delete_keys` that raises a duplicate version key falls back to one
+statement per row through Chronos's own executor
+(`bulk_write_fallback_rows`). The two merge guards came from S6, where the
+first run lost one roll-up increment (a merge wrote a row back to its
+pre-rebase value) and the second run's merge failed on exactly that
+duplicate key; the third run passed every invariant with neither guard
+firing, so both failures are intermittent and are recorded, not explained
+(`run_stats/macro_20261011/logs/data_agent_chronos_run{1,2}.log`). The
+shim's merge is not atomic: it writes table by table into the live target,
+so a failure midway leaves a partial merge, unlike Chronos's staged native
+merge. Concurrent TPC-C deliveries on
 the spine race on the tombstone of the same new_order row and fail with a
 duplicate key, which Chronos retries three times before the driver's own
 retry (`DELETE_ROWS` failures in the stats).

@@ -1350,7 +1350,7 @@ class ChronosToolSuite(DBToolSuite):
             self._check_cancel()
             keys = ops.get("delete") or []
             for i in range(0, len(keys), _CHUNK):
-                sess.delete_keys(table, keys[i:i + _CHUNK])
+                self._bulk(sess, table, meta, keys[i:i + _CHUNK], delete=True)
             n += len(keys)
             rows = ops.get("upsert") or []
             if rows:
@@ -1381,9 +1381,41 @@ class ChronosToolSuite(DBToolSuite):
                 else:
                     rows = [{c: r.get(c) for c in cols} for r in rows]
                 for i in range(0, len(rows), _CHUNK):
-                    sess.upsert_rows(table, rows[i:i + _CHUNK])
+                    self._bulk(sess, table, meta, rows[i:i + _CHUNK])
                 n += len(rows)
         return n
+
+    def _bulk(self, sess, table: str, meta, rows: list, delete: bool = False) -> None:
+        """Chronos's bulk upsert/delete, falling back to one statement per
+        row through its DML executor when the bulk path raises a duplicate
+        version key (it inserts a version at the segment's bound and does
+        not splice an existing one)."""
+        try:
+            if delete:
+                sess.delete_keys(table, rows)
+            else:
+                sess.upsert_rows(table, rows)
+            return
+        except Exception as e:
+            if "duplicate key" not in str(e).lower():
+                raise
+        self.observe("bulk_write_fallback_rows", len(rows))
+        pk = list(meta.pk_columns)
+        for r in rows:
+            params = {f"k{i}": _conv(r[c]) for i, c in enumerate(pk)}
+            where = " AND ".join(f"{_q(c)} = :k{i}" for i, c in enumerate(pk))
+            if delete:
+                sess.execute(f"DELETE FROM {_q(table)} WHERE {where}", params)
+                continue
+            sets = [c for c in meta.columns if c not in pk and c in r]
+            params.update({f"v{i}": _conv(r[c]) for i, c in enumerate(sets)})
+            n = sess.execute(f"UPDATE {_q(table)} SET " + ", ".join(f"{_q(c)} = :v{i}" for i, c in enumerate(sets))
+                             + f" WHERE {where}", params).rowcount
+            if not n:
+                cols = pk + sets
+                vals = [f":k{i}" for i in range(len(pk))] + [f":v{i}" for i in range(len(sets))]
+                sess.execute(f"INSERT INTO {_q(table)} ({', '.join(_q(c) for c in cols)}) VALUES ({', '.join(vals)})",
+                             params)
 
     # ------------------------------------------------------------------
     # Schema reconciliation (merge/rebase/reset)
