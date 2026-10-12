@@ -28,6 +28,14 @@ dependencies = [
     "pandas>=2.3,<3",  # pandas 3 has breaking API changes (plot scripts)
 ]
 
+[project.optional-dependencies]
+# Chronos backend (dblib/chronos.py): built from source, needs libpq-dev,
+# libboost-dev, libsqlite3-dev, python3-dev and a C++17 compiler (see README).
+chronos = [
+    "chronos-core @ git+https://github.com/mitdbg/chronos@607418d4d06ba1a67be0e9e5a7617132f265a87c#subdirectory=packages/chronos-core",
+    "sqlglot>=25",
+]
+
 [dependency-groups]
 dev = ["pytest"]
 

@@ -113,7 +113,8 @@ both under `capabilities` and `implementation`.
 | `xata` | yes | | | | | yes | | | yes |
 | `seekdb` | yes | yes (SCN snapshots) | yes (SQL three-way) | yes | yes | yes | yes | yes | yes |
 | `matrixone` | yes | yes (snapshots) | yes (DATA BRANCH MERGE) | yes | yes (diff-driven) | yes | yes | yes | yes |
-| `file_copy` | yes | | | | | yes | | | yes |
+| `file_copy` | yes (CREATE DATABASE clone) | yes (clone per commit + log table) | yes (SQL three-way over postgres_fdw) | yes | yes (drop + clone from the snapshot) | yes | yes | yes (postgres_fdw) | yes |
+| `chronos` | yes (interval fork, metadata only) | yes (checkpoint + log table) | yes (three-way over Chronos diffs) | yes | yes (diff-driven) | yes (deferred while children live) | yes (checkpoints) | yes (interval views) | |
 
 ### exec()
 
@@ -122,7 +123,8 @@ results = db.exec(script, refs=["feature"], mode="per_ref", label="eval")
 ```
 
 runs `script` on each ref in turn (`mode="per_ref"`), or once with every ref
-addressable from one session (`mode="multi"`, Dolt, SeekDB and MatrixOne only; other
+addressable from one session (`mode="multi"`, Dolt, SeekDB, MatrixOne, file_copy
+over postgres_fdw and chronos over views on its interval tables; other
 backends record it as UNSUPPORTED). A script is a list of SQL statements
 (strings or `(sql, params)`), Python source, or a callable. Python source
 runs with `db` (the session), `params` and `suite` in scope and may define
@@ -230,7 +232,7 @@ workload {
 | Argument | Description |
 |----------|-------------|
 | `scenario` | `rl_env`, `context_mgmt`, `multi_agent`, `dev_agent`, `ops_agent`, `data_agent` |
-| `backend` | `dolt`, `dolt_mysql`, `seekdb`, `matrixone`, `neon`, `xata`, `file_copy` |
+| `backend` | `dolt`, `dolt_mysql`, `seekdb`, `matrixone`, `neon`, `xata`, `file_copy`, `chronos` |
 | `scale_factor` | W warehouses for the generated data (default: the config's) |
 | `--max-runtime-sec N` | runtime cap; default one hour times the largest of the scale factor and the intensity multipliers (3600 s at scale 1, intensity 1), 0 = no cap. A run that reaches it (or gets Ctrl-C / SIGTERM) is recorded as `interrupted` with its rows and stats written |
 | `--op-stall-sec N` | stall limit for one operation: a verb or an exec that has been running longer than this (default 600 s, 0 = off) is cancelled and recorded `FAILED` with a `stalled: cancelled after Ns` note; the run goes on, so later failures and invariant results are recorded too; the e2e stats list the cancelled operations under `stalls` with their outcome (`failed`, or `completed` when it finished before the cancel landed), and a run with a cancelled operation that failed ends with status `incomplete` instead of `completed` |
@@ -314,7 +316,7 @@ Use `scripts/run_single_thread_bench.sh` to measure single-threaded operation la
 
 | Argument | Description |
 |----------|-------------|
-| `backend` | Database backend: `dolt`, `dolt_mysql`, `seekdb`, `matrixone`, `neon`, `xata`, `file_copy` |
+| `backend` | Database backend: `dolt`, `dolt_mysql`, `seekdb`, `matrixone`, `neon`, `xata`, `file_copy`, `chronos` |
 | `sql_dump_path` | Path to SQL dump file (e.g., `db_setup/tpcc_schema.sql`) |
 | `num_branches` | Number of branches to create for testing |
 
@@ -392,7 +394,7 @@ than branches, threads share branches.
 
 | Argument | Description |
 |----------|-------------|
-| `backend` | Database backend: `dolt`, `dolt_mysql`, `seekdb`, `matrixone`, `neon`, `xata`, `file_copy` |
+| `backend` | Database backend: `dolt`, `dolt_mysql`, `seekdb`, `matrixone`, `neon`, `xata`, `file_copy`, `chronos` |
 | `sql_dump_path` | Path to SQL dump file |
 | `--sweep-concurrency` | Fix threads and branches, vary concurrent requests (requires `--threads` and `--branches`; async only) |
 | `--sweep-branches` | Fix threads, vary branches (requires `--threads`) |
@@ -846,6 +848,204 @@ sessions) leaks between clients. Storage is the sum of the branches'
 
 ---
 
+## PostgreSQL file-copy backend — `file_copy`
+
+Plain PostgreSQL (18 or later) where a branch is a database. The one native
+branching primitive is `CREATE DATABASE <child> TEMPLATE <parent> STRATEGY =
+FILE_COPY`; with `file_copy_method = clone` (the run sets it server-wide,
+`FILE_COPY_METHOD`) the data files are reflinked, so on a copy-on-write
+file system (XFS with `reflink=1`, Btrfs, APFS) a clone shares its blocks
+with the template until either side writes. Connection settings come from
+`PGSQL_USER`, `PGSQL_PASSWORD`, `PGSQL_HOST`, `PGSQL_PORT` (also read from
+`.env`). This repository's server is PostgreSQL 18 on an XFS loop volume
+mounted at `/mnt/pgbench` (`sudo -u postgres /usr/lib/postgresql/18/bin/pg_ctl
+-D /mnt/pgbench/pgdata -l /mnt/pgbench/pg.log start`, port 5434).
+
+Everything beyond branch and delete is built on that clone, on
+`postgres_fdw` (one database reading another's tables) and on plain SQL;
+`DBToolSuite.implementation()` records which is which:
+
+- `branch()` (composed): the clone of the parent, plus, for a fork from a
+  branch head, a second clone of the child kept as the merge base (the
+  parent moves on); a fork from a commit uses the commit's snapshot as its
+  base. A template may have no other connection while it is copied, so the
+  backend keeps every connection it opens in a process-wide registry: a
+  clone closes the idle connections to its template (a parked connection
+  reopens on its next use, recorded as a `CONNECT`), waits for the busy
+  ones (a verb or exec in flight) and holds new ones back until the copy is
+  done. The wait is part of the verb's latency; the e2e stats'
+  `backend_observations` count `parked_connections`, `quiesce_waits`,
+  `quiesce_wait_sec` and `clone_retries`.
+- `commit()` (composed): a row in the branch's `_bb_commits` table, then a
+  clone of the branch database as the commit's snapshot (read-only; a
+  commit ref connects to it). A clone costs two checkpoints plus one
+  reflink per data file, with the branch's connections parked meanwhile.
+  `log()` reads the table.
+- `diff()`, `merge()`, `rebase()`, `revert()` (simulated): the same SQL
+  three-way machinery as Neon's (`dblib/pg_merge.py`), on local databases
+  instead of computes. The merge base is the fork or last-rebase snapshot
+  of whichever side descends from the other; `rebase()` first clones the
+  upstream (its head keeps moving under load) and that clone becomes the
+  branch's new base, so commits are not replayed and lineage is not
+  rewritten; `revert()` applies the inverse of (predecessor snapshot ->
+  commit snapshot) and records the result as a commit with its own
+  snapshot.
+- `reset()` (composed): `DROP DATABASE` of the branch, then `CREATE DATABASE
+  ... TEMPLATE <commit snapshot>`; the snapshot's log ends at that commit.
+- `delete()` (native): `DROP DATABASE` of the branch, its bases and its
+  snapshots; a snapshot another branch's log still references (a commit
+  merged into the spine, a fork from a commit) is kept until the run's
+  cleanup, so reverting a deleted candidate's commit still works.
+- Multi-branch queries (simulated): `db.table(ref, t)` imports the other
+  ref's table into the session's database through `postgres_fdw` (once per
+  exec; the foreign-server connection is dropped when the exec ends, since
+  it would otherwise count as a connection to that database).
+
+Storage: with `PGSQL_DATA_DIR` set to the mount point of a volume dedicated
+to the server, storage is the volume's usage minus WAL (`pg_ls_waldir()`),
+which counts shared blocks once (`server` scope); without it, the sum of
+`pg_database_size()` over the run's databases, which counts them once per
+clone. `gc()` is a `CHECKPOINT`. All databases of a run share the prefix
+`<db_name>__`; cleanup (and the start of a run) drops them with `FORCE`.
+
+---
+
+## Chronos backend — `chronos`
+
+[Chronos](https://github.com/mitdbg/chronos) (arXiv:2609.14889) is a
+bolt-on branching library, not a server: every registered table lives once
+in a physical interval table (`_chronos_b_interval_<t>`) whose rows carry a
+half-open visibility interval `[live_lo, live_hi)` and a tombstone; a
+branch owns an interval and reads the versions that contain its branch
+point. A fork is a metadata transaction (the parent's interval is split, no
+data is copied), a read is a range predicate, a write splits the inherited
+version at the writer's interval. The library speaks its own Python API
+(`ChronosBranchContext`: `create_branch`, `checkout` sessions with
+`query`/`execute`, `create_checkpoint`, `diff`, `merge_apply`,
+`delete_branch`) and runs the application's SQL itself over a parsed
+subset. `dblib/chronos.py` is a shim between that API and the suite.
+
+Setup: the backend uses the same PostgreSQL server as `file_copy`
+(`PGSQL_*`), one database per run, and needs the optional dependency
+(`uv sync --extra chronos`, a source build of `chronos-core` pinned to the
+commit the backend was written against; it needs `libpq-dev`, `libboost-dev`,
+`libsqlite3-dev`, `python3-dev` and a C++17 compiler). The run's schema and
+seed data are loaded as ordinary PostgreSQL tables with full SQL; the first
+versioning verb *adopts* them: every table is registered with Chronos (its
+rows copied into the interval table, a table without a primary key gets a
+synthetic `_bb_rowid` key, the original is dropped) — the integration path
+the Chronos documentation describes. From then on every statement goes
+through a Chronos branch session. Chronos runs with
+`enable_schema_branching=True` because the scenarios create tables and
+columns on branches; in that mode Chronos refuses its native
+`merge_apply`, so merge and everything derived from it are built here on
+its native diff and bulk-write primitives. `DBToolSuite.implementation()`
+records which is which:
+
+- `branch()` (composed): `create_checkpoint` on the parent (the fork base,
+  kept for later merges) and `create_branch_from_checkpoint`; a fork from a
+  commit forks from that commit's checkpoint. Both are metadata
+  transactions. Chronos has no checkpoint deletion, so fork bases and
+  commits pin their versions for the run.
+- `commit()` (composed): `create_checkpoint` (an immutable interval split;
+  a commit ref is a read-only session on it) plus a row in the `_bb_log`
+  bookkeeping table, which `log()` reads (simulated: Chronos keeps no
+  commit history).
+- `diff()` (composed): `ChronosBranchContext.diff` between two branches; a
+  commit ref is read through a temporary branch forked from its checkpoint.
+- `merge()`, `rebase()` (simulated): a three-way merge in the shim —
+  native `diff(base, source)` and `diff(base, target)` against the fork or
+  last sync checkpoint, conflicts compared by key, the changes applied with
+  native `upsert_rows`/`delete_keys`, tables and columns added on the
+  source replayed as DDL on the target (a differing key or type is a schema
+  conflict and fails the verb). After a merge or rebase the source gets a
+  sync checkpoint that becomes the next base. `rebase()` is the same merge
+  with the upstream as the source (the branch's own changes are "theirs").
+- `revert()` (simulated): the inverse of the diff between the commit's
+  checkpoint and its predecessor's, applied with the same primitives, then
+  a commit. `reset()` (simulated): the diff from the branch to the commit's
+  checkpoint applied back, with tables and columns added since dropped;
+  Chronos cannot move a branch's read point.
+- `delete()` (native): `delete_branch` (metadata; versions are reclaimed by
+  Chronos's background GC). Chronos deletes a branch's whole subtree, so a
+  branch with live children is tombstoned (hidden) and deleted once they
+  are gone (`deferred_deletes` in `backend_observations`).
+- Multi-branch queries (simulated): `db.table(ref, t)` creates a temporary
+  view over the interval table with the visibility predicate of the ref's
+  branch point — what Chronos itself substitutes for a table — and the
+  SELECT, rewritten by the session for its own branch, runs on a plain
+  connection.
+
+What the six-scenario sweep showed (PostgreSQL 18 on this box, CH scale 1,
+chronos-core 607418d): a fork, checkpoint or delete costs 10 to 25 ms, in
+the range of Dolt's and well below the clone-based backends, and the
+per-statement overhead of Chronos's own DML executor is 2 to 10× plain
+PostgreSQL. Three properties of the design dominate the longer scenarios:
+
+- History accumulates in the live tables. Every write after a checkpoint
+  splits the row into an old and a new version in the same physical table,
+  checkpoints pin the old versions for the run, and SELECTs carry no index
+  on the interval bounds, so analytical queries scan every version. S4
+  (spine checkpoint every 2 s under eight TPC-C clients) had four
+  order_line versions per visible row after twelve minutes, and the spine's
+  CH queries dominated its 41 minutes.
+- Branch-local DDL copies the table. `ALTER TABLE` on a branch creates a new
+  physical table with the rows visible to that branch (S4: one copy of
+  customer per dev branch, one of stock per spine migration).
+- Branch management contends with the branch's writers. Every write holds a
+  `FOR SHARE` lock on its branch's metadata row and `create_branch`,
+  `create_checkpoint` and `delete_branch` need the row exclusively (they
+  also raise `chronos_session_barrier_in_progress` instead of waiting when
+  another one is in flight). The shim retries the barrier and holds a
+  per-branch gate while the management call runs (`gate_waits`,
+  `barrier_retries_*` in `backend_observations`); without it S5's branch
+  deletes starved under the spine load until the stall watchdog cancelled
+  them.
+
+Two more things the shim guards against: the background interval-GC worker
+dies on its first error (in S1 "out of shared memory", PostgreSQL's
+`max_locks_per_transaction` exhausted by a GC transaction touching every
+physical table) and would then block the context's close forever, so the
+shim clears the flag and runs the reclamation synchronously in `gc()`
+(`gc_worker_died`); the rows a merge applies are re-read from the
+source branch rather than taken from the diff's reported values
+(`diff_values_stale` counts disagreements); and a bulk `upsert_rows` or
+`delete_keys` that raises a duplicate version key falls back to one
+statement per row through Chronos's own executor
+(`bulk_write_fallback_rows`). The two merge guards came from S6, where the
+first run lost one roll-up increment (a merge wrote a row back to its
+pre-rebase value) and the second run's merge failed on exactly that
+duplicate key; the third run passed every invariant with neither guard
+firing, so both failures are intermittent and are recorded, not explained
+(`run_stats/macro_20261011/logs/data_agent_chronos_run{1,2}.log`). The
+shim's merge is not atomic: it writes table by table into the live target,
+so a failure midway leaves a partial merge, unlike Chronos's staged native
+merge. Concurrent TPC-C deliveries on
+the spine race on the tombstone of the same new_order row and fail with a
+duplicate key, which Chronos retries three times before the driver's own
+retry (`DELETE_ROWS` failures in the stats).
+
+The SQL shim: SELECTs run as Chronos rewrites them (each registered table
+replaced by its visible-version subquery; joins, CTEs, subqueries and
+window functions pass through to PostgreSQL). DML is executed by Chronos's
+own evaluator over its subset — `INSERT ... VALUES` with a column list,
+`UPDATE` with simple assignments, `DELETE`; no `INSERT ... SELECT`,
+`RETURNING`, `NOW()`, `BETWEEN`, scalar subqueries. A statement it rejects
+is simulated: the shim evaluates it as a SELECT on the branch (PostgreSQL
+computes the new values) and applies the rows with
+`upsert_rows`/`delete_keys` (`simulated_update` etc. in
+`backend_observations`). `CREATE TABLE` is normalised to what Chronos
+accepts (table-level `PRIMARY KEY` made inline; `NOT NULL`, `UNIQUE`,
+`CHECK`, `FOREIGN KEY` and non-constant defaults dropped; a keyless table
+gets `_bb_rowid`), `CREATE VIEW` is simulated by inlining the view's query
+into later SELECTs, a `UNIQUE` index becomes a plain one (Chronos enforces
+no constraints beyond the logical key). Parameters are translated from
+`%s` to Chronos's named form. Storage is `pg_database_size()` of the run's
+database (`database` scope); `gc()` waits for Chronos's background
+reclamation and runs `VACUUM`.
+
+---
+
 ## Environment Variables
 
 Create a `.env` file for backend-specific configuration:
@@ -853,6 +1053,14 @@ Create a `.env` file for backend-specific configuration:
 ```bash
 # Neon API key for programmatic access
 NEON_API_KEY_ORG=your_key_here
+
+# PostgreSQL server of the file_copy backend (PostgreSQL 18, file_copy_method = clone)
+PGSQL_USER=postgres
+PGSQL_PASSWORD=password
+PGSQL_HOST=127.0.0.1
+PGSQL_PORT=5434
+PGSQL_DATA_DIR=/mnt/pgbench   # volume dedicated to the server; storage = its usage minus WAL
+# The chronos backend uses the same server (PGSQL_*), one database per run.
 
 # Database connection strings (if needed)
 DOLT_CONNECTION_STRING=postgresql://user:pass@localhost:5432/dbname
