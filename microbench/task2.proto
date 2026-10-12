@@ -28,6 +28,15 @@ enum OperationType {
   BRANCH_CREATE = 10;
   BRANCH_CONNECT = 11;
   BRANCH_DELETE = 12;
+  // The remaining git-like verbs. Each timed op runs on a state prepared
+  // untimed (see BranchOpConfig).
+  BRANCH_COMMIT = 13;
+  BRANCH_DIFF = 14;
+  BRANCH_LOG = 15;
+  BRANCH_MERGE = 16;
+  BRANCH_REBASE = 17;
+  BRANCH_REVERT = 18;
+  BRANCH_RESET = 19;
 
   // DDL operations (extensible)
   DDL_ADD_INDEX = 20;
@@ -107,6 +116,18 @@ message DdlConfig {
   string check_expression = 10; // for ADD_CHECK, e.g. "quantity > 0"
 }
 
+// Configuration for the git-like verbs (BRANCH_COMMIT .. BRANCH_RESET)
+message BranchOpConfig {
+  // Rows inserted (untimed) into each side the verb then works on: the
+  // commit's working set, the child a diff/merge/rebase carries, the
+  // commit a revert undoes, the changes a reset discards. Default 1.
+  int32 changes_per_op = 1;
+  // Commits made (untimed) on the branch before BRANCH_LOG. Default 10.
+  int32 history_commits = 2;
+  // ``limit`` passed to log(). Default 10.
+  int32 log_limit = 3;
+}
+
 // Single operation benchmark configuration
 message OperationBenchmark {
   OperationType operation = 1;
@@ -119,6 +140,7 @@ message OperationBenchmark {
   // Operation-specific configuration
   RangeConfig range_config = 4;  // For RANGE operations
   DdlConfig ddl_config = 5;      // For DDL operations
+  BranchOpConfig branch_op_config = 7;  // For BRANCH_COMMIT .. BRANCH_RESET
 }
 
 // Main task configuration

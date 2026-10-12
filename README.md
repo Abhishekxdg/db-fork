@@ -331,6 +331,33 @@ Use `scripts/run_single_thread_bench.sh` to measure single-threaded operation la
 | `--num-ops <n>` | Number of operations to perform |
 | `--output-dir <dir>` | Output directory (default: `/tmp/run_stats`) |
 
+##### Operations
+
+| Group | `--operations` names |
+|-------|----------------------|
+| Data | `READ`, `INSERT`, `UPDATE`, `DELETE`, `RANGE_READ`, `RANGE_UPDATE` |
+| Branch | `BRANCH_CREATE`, `BRANCH_CONNECT`, `BRANCH_DELETE`, `BRANCH_COMMIT`, `BRANCH_DIFF`, `BRANCH_LOG`, `BRANCH_MERGE`, `BRANCH_REBASE`, `BRANCH_REVERT`, `BRANCH_RESET` |
+| Schema | the `DDL_*` operations |
+
+The branch group covers the nine verbs of the shared API (`dblib/db_api.py`)
+plus the connection switch. `BRANCH_COMMIT` to `BRANCH_RESET` each build the
+state they need untimed and record only the verb:
+
+| Operation | Untimed preparation | Timed |
+|-----------|---------------------|-------|
+| `BRANCH_COMMIT` | insert rows on the branch | `commit` |
+| `BRANCH_DIFF` | once per branch: a child with committed inserts | `diff(branch, child)` |
+| `BRANCH_LOG` | once per branch: `history_commits` commits | `log(branch, log_limit)` |
+| `BRANCH_MERGE` | a child with committed inserts; the branch commits other rows | `merge(branch, child)` |
+| `BRANCH_REBASE` | same as merge | `rebase(child, branch)` |
+| `BRANCH_REVERT` | insert rows and commit them | `revert` of that commit |
+| `BRANCH_RESET` | two commits of inserted rows | `reset` to the first |
+
+`branch_op_config` in the task config sets `changes_per_op` (rows per
+prepared side, default 1), `history_commits` and `log_limit` (default 10
+each). Merges and rebases never conflict: the two sides insert different
+keys. A verb the backend lacks is recorded as `UNSUPPORTED`.
+
 ##### Examples
 
 ```bash

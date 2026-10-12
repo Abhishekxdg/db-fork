@@ -72,6 +72,13 @@ from microbench.operations import (
     BranchCreateOperation,
     BranchConnectOperation,
     BranchDeleteOperation,
+    BranchCommitOperation,
+    BranchDiffOperation,
+    BranchLogOperation,
+    BranchMergeOperation,
+    BranchRebaseOperation,
+    BranchRevertOperation,
+    BranchResetOperation,
     AddIndexOperation,
     RemoveIndexOperation,
     VacuumOperation,
@@ -88,6 +95,17 @@ from microbench.operations import (
     SetNotNullOperation,
     ExpandContractOperation,
 )
+
+# Git-like verbs measured on a state the operation prepares itself
+VERB_OPERATIONS = frozenset({
+    tp.OperationType.BRANCH_COMMIT,
+    tp.OperationType.BRANCH_DIFF,
+    tp.OperationType.BRANCH_LOG,
+    tp.OperationType.BRANCH_MERGE,
+    tp.OperationType.BRANCH_REBASE,
+    tp.OperationType.BRANCH_REVERT,
+    tp.OperationType.BRANCH_RESET,
+})
 
 # Utility imports
 from microbench.datagen import DynamicDataGenerator
@@ -269,6 +287,10 @@ class BenchmarkConfig:
     @property
     def ddl_config(self) -> tp.DdlConfig:
         return self._proto.operation_benchmark.ddl_config
+
+    @property
+    def branch_op_config(self) -> tp.BranchOpConfig:
+        return self._proto.operation_benchmark.branch_op_config
 
     def __str__(self) -> str:
         return (
@@ -1501,6 +1523,19 @@ class OperationRunner:
             tp.OperationType.DELETE,
         ]:
             return OperationRegistry.create(op_type, table_name=table_name)
+        elif op_type == tp.OperationType.BRANCH_LOG:
+            cfg = self.config.branch_op_config
+            return OperationRegistry.create(
+                op_type, table_name=table_name,
+                changes_per_op=cfg.changes_per_op or 1,
+                history_commits=cfg.history_commits or 10,
+                log_limit=cfg.log_limit or 10,
+            )
+        elif op_type in VERB_OPERATIONS:
+            return OperationRegistry.create(
+                op_type, table_name=table_name,
+                changes_per_op=self.config.branch_op_config.changes_per_op or 1,
+            )
         else:
             # Branch operations and others without parameters
             return OperationRegistry.create(op_type)
@@ -1720,6 +1755,19 @@ class AsyncOperationRunner:
             tp.OperationType.DELETE,
         ]:
             return OperationRegistry.create(op_type, table_name=table_name)
+        elif op_type == tp.OperationType.BRANCH_LOG:
+            cfg = self.config.branch_op_config
+            return OperationRegistry.create(
+                op_type, table_name=table_name,
+                changes_per_op=cfg.changes_per_op or 1,
+                history_commits=cfg.history_commits or 10,
+                log_limit=cfg.log_limit or 10,
+            )
+        elif op_type in VERB_OPERATIONS:
+            return OperationRegistry.create(
+                op_type, table_name=table_name,
+                changes_per_op=self.config.branch_op_config.changes_per_op or 1,
+            )
         else:
             # Branch operations and others without parameters
             return OperationRegistry.create(op_type)
@@ -2421,6 +2469,13 @@ def register_all_operations() -> None:
     OperationRegistry.register(tp.OperationType.BRANCH_CREATE, BranchCreateOperation)
     OperationRegistry.register(tp.OperationType.BRANCH_CONNECT, BranchConnectOperation)
     OperationRegistry.register(tp.OperationType.BRANCH_DELETE, BranchDeleteOperation)
+    OperationRegistry.register(tp.OperationType.BRANCH_COMMIT, BranchCommitOperation)
+    OperationRegistry.register(tp.OperationType.BRANCH_DIFF, BranchDiffOperation)
+    OperationRegistry.register(tp.OperationType.BRANCH_LOG, BranchLogOperation)
+    OperationRegistry.register(tp.OperationType.BRANCH_MERGE, BranchMergeOperation)
+    OperationRegistry.register(tp.OperationType.BRANCH_REBASE, BranchRebaseOperation)
+    OperationRegistry.register(tp.OperationType.BRANCH_REVERT, BranchRevertOperation)
+    OperationRegistry.register(tp.OperationType.BRANCH_RESET, BranchResetOperation)
 
     # DDL operations
     OperationRegistry.register(tp.OperationType.DDL_ADD_INDEX, AddIndexOperation)
