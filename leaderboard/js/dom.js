@@ -134,7 +134,7 @@ function ranksOf(sorted, key, value) {
 // A named system has one identity color, its --sys-* token, for its icon and its chart marks. The stylesheet binds icons
 // by data-system; a chart mark of any other system takes a series color by its position in the data.
 const systemSlug = e => e.system.toLowerCase().replace(/\s+/g, '-');
-const slug = (...words) => words.join('-').toLowerCase().replace(/[^a-z0-9]+/g, '-');  // a stable id from a row's identity
+const slug = (...words) => words.map(w => encodeURIComponent(w)).join(':');  // a stable id from a row's identity; distinct identities never share one
 function seriesColor(e) {
     const named = `--sys-${systemSlug(e)}`;
     return token(named) ? `var(${named})` : `var(--series-${data.indexOf(e) % 4 + 1})`;

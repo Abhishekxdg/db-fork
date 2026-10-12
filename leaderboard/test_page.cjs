@@ -524,7 +524,7 @@ assert.equal(macroEl('run-subtitle').textContent, 'v1.81.2 · box · 2026-10-08'
 macroEl('campaign-c1000000').click();
 assert.equal(macroPage.run('window.location.hash'), '#agent-workflows');
 macroEl('close-run').click();
-assert.equal(macroPage.document.activeElement.id, 'details-dolt-mysql-box', 'Switching runs rebuilds the board, yet closing still returns focus to that row\'s Details');
+assert.equal(macroPage.document.activeElement.id, 'details:dolt_mysql:box', 'Switching runs rebuilds the board, yet closing still returns focus to that row\'s Details');
 assert.equal(macroPage.document.activeElement, detailsOf(rowOf('Dolt')), 'and to the rebuilt button, not the detached one');
 // Screen readers hear the rank, or that there is none, before the name; the hover text says why a row is unranked.
 assert.deepEqual(rowsOf().map(r => classNodes(r.children[0], 'sr-only')[0].textContent), ['Rank 1, ', 'Rank 2, ', 'Rank 1, ']);
@@ -1041,6 +1041,12 @@ assert.equal(shared.run('[state.mode, state.sort, state.sortDesc, countedData().
 assert.deepEqual(bodyRows(shared.byClass('summary')[0]).map(row => nameOf(row).textContent), ['B'], 'The filter in the link applies');
 assert.equal(shared.run('boardHash()'), '#microbench?try=best&sort=data&order=desc&workloads=insert,update&systems=B', 'and the view writes the same link back');
 assert.equal(mount(selectionData, [], null, '#microbench?workloads=nope&sort=bogus').run('[countedData().length, state.sort].join()'), '5,branch', 'Unknown values in a link fall back to the defaults');
+// Row ids keep a row's identity whole: machines named test.box and test-box never share one, so focus returns to the right row.
+const twins = mount([{...entry('A', 0.03, []), machine: 'test.box'}, {...entry('A', 0.05, []), machine: 'test-box'}]);
+const twinIds = bodyRows(twins.byClass('summary')[0]).map(row => classNodes(row, 'details-button')[0].id);
+assert.notEqual(twinIds[0], twinIds[1], 'Distinct rows never share an id');
+twins.document.getElementById(twinIds[1]).click(); twins.el('close-run').click();
+assert.equal(twins.document.activeElement.id, twinIds[1], 'Closing returns focus to the row that opened the details');
 for (const name of ['constructor', 'toString', '__proto__']) assert.equal(mount(selectionData, [], null, `#microbench?sort=${name}`).run('state.sort'), 'branch', `sort=${name} names no score of its own, so the default holds and nothing breaks`);
 // Tied scores share a rank; the next rank skips, as in a competition.
 const tied = mount([entry('A', 0.03, []), entry('B', 0.03, []), entry('C', 0.06, [])]);
