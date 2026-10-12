@@ -105,30 +105,43 @@ preserved as history and excluded from current rankings. Full reruns are needed.
 
 The leaderboard is one card. Its tabs switch between **Macrobench** (the agent
 workflows, first) and **Microbench**; arrow keys, Home and End move between them.
-Under the tabs, a filter bar holds every control for the table below it. On the
-microbench: **First try / Best repeat**, **Rank by**, and one chip per filter
-(hosting, systems, machine, capabilities) that opens a checklist; a dimension with
-a single value has no chip. The microbench table is one per hosting group, with
-rank, system and the three category scores (first query, reads & writes, load),
-each with its elapsed time where it has one and a bar for speed against the
-fastest. Rank by one score at a time with **Rank by** or a score column's header;
-there is no overall score. A row from a mock file is ranked like any other and
+Both boards are plain data tables: a sortable column shows a sort icon in its
+header, and the whole header sorts, fastest first; sorting the sorted column
+again lists it slowest first, with rows that have no value always last. Header
+labels stay within two lines. The last column holds the row's
+**Details** button, and a cell has a background only as heatmap shading where at
+least two values compare. On the microbench, a toolbar above the table holds
+**First try / Best repeat** and one chip per filter (hosting, systems, machine,
+capabilities) that opens a checklist; a dimension with a single value has no
+chip. The microbench table is one per hosting group, with rank, system and the
+three category scores (first query, reads & writes, load), each with its elapsed
+time where it has one; a score is shaded and its best marked only where at least
+two systems have one. Rank by one score at a time from its column header; there
+is no overall score. When the reads & writes score counts fewer than all of its
+workloads, its header says so, for example **Reads & writes (1 of 5)**. The view
+is part of the URL, so a link reopens the same table:
+`#microbench?try=best&sort=data&order=desc&workloads=insert,update&systems=Neon`
+holds the try, the sorted score, its order, the counted workloads and every
+narrowed filter (`hosting`, `systems`, `machines`, `capabilities`); unknown
+values fall back to the defaults. A row from a mock file is ranked like any other and
 carries a **Mock data** flag; production never contains one.
 
 Below the card, the workload heatmap shows every batch time: darker mint means
-closer to the fastest time within that row, and a check marks the fastest. Tick
-read/write workloads there to choose what the reads & writes score counts. A
+closer to the fastest time within that row, and a check marks the fastest; a row
+with only one time has neither. Tick
+read/write workloads there to choose what the reads & writes score counts; at
+least one stays ticked, so the score never silently counts all of them. A
 trade-off plot beside it compares the first-query and reads & writes scores.
 **The operations** defines every operation the way the workflows are defined: a
 picker, a branch-history diagram in the same drawing language (beads are
 commits, open circles are new branch heads, rings are reads, squares are writes),
-what is timed, and each system's batch time. A score column's or workload's **?**
-opens that definition (`#dataset?operation=read`). The dataset table counts,
+what is timed, and each system's batch time. A workload's name in the heatmap
+links to that definition (`#dataset?operation=read`). The dataset table counts,
 checksum and seed, and the scoring rules, are collapsed below it; the bare
 `#dataset` link from the run page opens them.
 
-A row's **Details** button opens its details dialog; nothing else in a row is
-clickable. It starts with **Why this position**: the rank, then every workload's
+A row's **Details** button, in its last column, opens its details dialog;
+nothing else in a row is clickable. It starts with **Why this position**: the rank, then every workload's
 time against the fastest in its group, so the score's arithmetic is visible.
 Every try, the environment and provenance follow; the raw JSON is linked from
 the dialog.
@@ -232,8 +245,10 @@ gets 60 seconds. A cleanup failure retains the journal for a later retry.
 
 ## Page code
 
-The page is static: `index.html`, `styles.css` and six plain scripts in `js/`,
-loaded in this order:
+The page is static: `index.html`, `styles.css`, the two data files the build
+writes (`data.js`, `macro-data.js`) and six plain scripts in `js/`. Every script
+loads at the end of the body, so none blocks the first paint, in this order after
+the data files:
 
 1. `dom.js`: DOM building, number formats, design tokens, and the table and control helpers every board shares.
 2. `details.js`: the details dialog.
@@ -421,16 +436,19 @@ The workflow board has a row per system and a column per workflow, one table
 per comparison group, headed on one line by its machine and how many systems it
 compares. A completed workflow shows its completion time; any other outcome
 shows a drawn status icon and its word. Within the group, systems are ranked by
-one workflow's completion time at a time (the **Rank by** select or a column
-header, also part of the URL: `#agent-workflows?workflow=ops_agent`). Tied times
-share a rank. In every column the fastest time is marked and the column is
-shaded relative to it; a workflow that did not complete is unranked in that
-column only. There is no overall score or weighted average. Rows carry no
+one workflow's completion time at a time, chosen from the column headers (also
+part of the URL: `#agent-workflows?workflow=ops_agent`, with `&order=desc` for
+slowest first). Tied times share a rank.
+A column with at least two completion times marks its fastest and is shaded
+relative to it; a column with one time has no mark and no shading, because
+nothing compares. A workflow that did not complete is unranked in that column
+only. The last column holds how many workflows completed and the row's
+**Details** button. There is no overall score or weighted average. Rows carry no
 badges: every campaign on the board passed validation (below), and a campaign
 that did not is listed under **Runs not on the board** with its reasons. Narrow
 screens scroll the workflow columns past a pinned system column.
 
-Each column's **?** opens the workflow's definition directly below the board
+**The workflows**, directly below the board, defines each workflow
 (`#workflows?workflow=ops_agent`): what it simulates, an animated branch history
 drawn on a Canvas (played once when seen, then held; illustrative, not a trace),
 the branch and history operations it exercises, and the completion times of the

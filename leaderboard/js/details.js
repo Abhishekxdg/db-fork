@@ -1,9 +1,10 @@
 /* The details dialog: one native modal dialog, centered, reused for every row's details. Opening it focuses the
-   scrollable body; closing returns focus to the button that opened it. */
+   scrollable body; closing returns focus to the control that opened it, found by id because the page may have rebuilt
+   that control while the dialog was open. */
 const detailsDialog = el('run-dialog');
 let detailsOpener = null;
 function openDetails(title, subtitle, source, opener) {
-    detailsOpener = opener;
+    detailsOpener = opener.id;
     el('run-title').textContent = title; el('run-subtitle').replaceChildren(parts(subtitle.split(' · ')));
     el('run-source').hidden = !source; if (source) el('run-source').href = source; else el('run-source').removeAttribute('href');
     const body = el('run-body'); body.replaceChildren();
@@ -18,7 +19,7 @@ function showDetails() {
 }
 function wireDetails() {
     el('close-run').addEventListener('click', () => detailsDialog.close());
-    detailsDialog.addEventListener('close', () => { if (detailsOpener) detailsOpener.focus(); });
+    detailsDialog.addEventListener('close', () => { const opener = el(detailsOpener); if (opener) opener.focus(); });
     detailsDialog.addEventListener('click', event => {  // a click on the backdrop, outside the panel, closes it
         if (event.target !== detailsDialog) return;
         const box = detailsDialog.getBoundingClientRect();

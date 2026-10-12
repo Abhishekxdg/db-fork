@@ -39,7 +39,7 @@ class Element {
     getBoundingClientRect() { return {left: 20, right: 44, top: 20, bottom: 44, width: 344, height: 310}; }
     scrollIntoView() { this.scrolledIntoView = (this.scrolledIntoView ?? 0) + 1; }
     addEventListener(type, callback) { (this.listeners[type] ?? (this.listeners[type] = [])).push(callback); }
-    click() { for (const callback of this.listeners.click ?? []) callback(); }
+    click() { const event = {target: this, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }}; for (const callback of this.listeners.click ?? []) callback(event); return event; }
     change() { for (const callback of this.listeners.change ?? []) callback(); }
     focus() { this.ownerDocument.activeElement = this; }
     child(tag) { const node = new Element(tag, this.ownerDocument); this.append(node); return node; }
@@ -90,6 +90,7 @@ class FakeObserver {
 }
 function mount(data = [], excluded = [], macro = null, hash = '', phase = 'local', {reduced = false, canvas = true, throwing = false, width = 900} = {}) {
     const elements = new Map(), timers = [], listeners = {}, frames = [], observers = {intersection: [], resize: []}, clock = {now: 1000};
+    const location = {hash};  // the page writes its own state with history.replaceState, which updates the hash without an entry
     const media = {matches: reduced, listeners: [], addEventListener(type, callback) { this.listeners.push(callback); }, removeEventListener(type, callback) { this.listeners = this.listeners.filter(c => c !== callback); },
         change(matches) { this.matches = matches; for (const callback of [...this.listeners]) callback({matches}); }};
     const document = {
@@ -119,7 +120,7 @@ function mount(data = [], excluded = [], macro = null, hash = '', phase = 'local
         performance: {now: () => clock.now}, getComputedStyle: () => ({getPropertyValue: computed}),
         IntersectionObserver: class extends FakeObserver { constructor(callback, options) { super(callback, options, observers.intersection); } },
         ResizeObserver: class extends FakeObserver { constructor(callback, options) { super(callback, options, observers.resize); } },
-        window: {addEventListener() {}, location: {hash}, innerWidth: 1440, innerHeight: 1000, devicePixelRatio: 2, matchMedia: query => query.includes('prefers-reduced-motion') ? media : {matches: false, addEventListener() {}, removeEventListener() {}}}});
+        window: {addEventListener() {}, location, history: {replaceState: (state, title, url) => { location.hash = url; }}, innerWidth: 1440, innerHeight: 1000, devicePixelRatio: 2, matchMedia: query => query.includes('prefers-reduced-motion') ? media : {matches: false, addEventListener() {}, removeEventListener() {}}}});
     const run = source => vm.runInContext(source, context);
     const byClass = name => classNodes(elements.get('groups'), name);
     for (const script of scripts) run(script);
@@ -173,7 +174,7 @@ assert.equal(classNodes(elements.get('dataset-tables'), 'dataset-target')[0].chi
 assert.equal(elements.get('dataset-hash').textContent, suite.dataset.sha256);
 run("window.location.hash = '#dataset'; reveal()");
 assert.equal(elements.get('dataset-details').open, true, 'The run page link opens the dataset details');
-assert.match(elements.get('updated').textContent, /2026-09-30/);
+assert.equal(elements.get('updated').textContent, 'Last run 2026-09-30');
 
 // The operations are defined like the workflows: a grouped picker, one stage with a drawn diagram, what is timed and the measured batch times.
 const opList = elements.get('selectors-operation');
@@ -212,8 +213,10 @@ key(page, 'tab-macro', 'ArrowRight');
 assert.equal(run('state.suite'), 'micro'); assert.equal(document.activeElement.id, 'tab-micro');
 const at = marker => { const index = html.indexOf(marker); assert.ok(index >= 0, marker); return index; };
 assert.ok(at('id="macro-view"') < at('id="micro-view"'), 'The macrobench comes first');
-assert.ok(at('id="selectors-suite"') < at('id="macro-rank"') && at('id="macro-rank"') < at('id="macro-groups"'), 'Tabs, then the filter bar, then the table, in one card');
-assert.ok(at('id="sort-metric"') < at('id="chip-hosted"') && at('id="chip-tag"') < at('id="groups"'), 'Every microbench control sits in the filter bar above its tables');
+assert.ok(at('id="selectors-suite"') < at('id="macro-groups"'), 'Tabs, then the table, in one card');
+assert.ok(at('id="selectors-mode"') < at('id="chip-hosted"') && at('id="chip-tag"') < at('id="groups"'), 'Every microbench filter sits in the toolbar above its tables');
+assert.doesNotMatch(html, /<select|Rank by/, 'Sorting is the column headers\' job, as in any data table; there is no separate rank control');
+assert.match(html, /<div class="header-actions"><a class="button" href="https:\/\/github\.com\/elaineang\/db-fork">GitHub[^<]*<span aria-hidden="true">↗<\/span><\/a><a class="button button-primary" id="nav-run" href="run\.html">Run a benchmark<\/a><\/div>/, 'Run a benchmark is the header\'s call to action');
 assert.ok(at('id="macro-groups"') < at('id="workflows"') && at('id="workflows"') < at('id="macro-guide"'), 'The board, then the definitions of its columns, then the methodology');
 assert.ok(at('id="groups"') < at('id="breakdowns"') && at('id="breakdowns"') < at('id="dataset"') && at('id="dataset"') < at('id="methodology"'), 'Microbench results, their breakdown, then what is measured');
 
@@ -226,48 +229,61 @@ for (const mode of ['first', 'best']) {
     assert.equal(byClass('summary').length, 1, 'One ranking table per hosting group');
     assert.deepEqual(tableScores(page), [[['×1.00', '×1.00', '×1.00'], ['×1.75', '×1.75', '×2.00']]], 'Branch, reads/writes and load scores side by side');
     const table = byClass('summary')[0];
-    assert.deepEqual(headRow(table).map(firstText), ['System', 'First query', 'Reads & writes', 'Load']);
-    assert.deepEqual(headRow(table).map(th => th.getAttribute('aria-sort')), [null, 'ascending', null, null], 'The rank is explicitly tied to the first-query score');
-    assert.deepEqual(headRow(table).map(th => classNodes(th, 'help-trigger').length), [0, 1, 1, 1], 'Each score column links to its definition');
-    for (const row of bodyRows(table)) { assert.equal(row.children.length, 4); assert.equal(row.children[0].tag, 'th'); assert.equal(row.children[0].scope, 'row'); for (const td of row.children.slice(1)) assert.equal(td.tag, 'td'); }
+    assert.deepEqual(headRow(table).map(th => th.textContent.replace('?', '')), ['System', 'First query', 'Reads & writes', 'Load', 'Details'], 'The last column is the row action');
+    assert.deepEqual(headRow(table).map(th => th.getAttribute('aria-sort')), [null, 'ascending', null, null, null], 'The rank is explicitly tied to the first-query score');
+    assert.equal(classNodes(table, 'help-trigger').length, 0, 'A header only sorts; the definitions live below the board');
+    assert.deepEqual(headRow(table).map(th => classNodes(th, 'sort-icon').length), [0, 1, 1, 1, 0], 'Every sortable header shows that it sorts');
+    for (const row of bodyRows(table)) { assert.equal(row.children.length, 5); assert.equal(classNodes(row.children[4], 'details-button').length, 1); assert.equal(row.children[0].tag, 'th'); assert.equal(row.children[0].scope, 'row'); for (const td of row.children.slice(1)) assert.equal(td.tag, 'td'); }
     assert.deepEqual(bodyRows(table).map(row => classNodes(row, 'rank-number')[0].textContent), ['1', '2']);
     assert.deepEqual(bodyRows(table).map(row => nameOf(row).textContent), ['Tagless', 'Measured']);
     assert.deepEqual(bodyRows(table).map(row => classNodes(row, 'system-meta')[0].children.filter(c => typeof c !== 'string').map(c => c.className)), [['nowrap', 'nowrap'], ['nowrap', 'nowrap']], 'Meta lines wrap between items, never inside one');
     assert.deepEqual(byClass('score-time').map(e => e.textContent), ['0.030s', 'composite', '0.030s', '0.060s', 'composite', '0.060s'], 'A single-workload score shows its elapsed time; a composite says so');
-    assert.deepEqual(byClass('score-bar').map(b => b.children[0].style.width), ['100.0%', '100.0%', '100.0%', '57.1%', '57.1%', '50.0%'], 'Bars are speed against the fastest: full length is ×1');
+    assert.deepEqual(byClass('score-cell').map(td => td.style['--strength']), ['0.130', '0.130', '0.130', '0.087', '0.087', '0.080'], 'Scores are shaded against the best in their column, as on the workflow board');
+    assert.deepEqual(byClass('score-cell').map(td => classNodes(td, 'best-mark').length), [1, 1, 1, 0, 0, 0], 'The best score in each column is marked');
+    assert.equal(byClass('bar').length, 0, 'No bars in the table: a cell is its value');
     assert.ok(table.getAttribute('aria-label').includes('ranked by First query score'));
     assert.match(byClass('group-count')[0].textContent, /^2 systems · ranked by First query · lower is better$/);
     const region = byClass('scroll')[0];
-    assert.equal(region.children[0], table, 'The table scrolls inside its own bounded region'); assert.equal(region.getAttribute('role'), 'region'); assert.equal(region.tabIndex, 0);
+    assert.equal(region.children[0], table, 'The table scrolls inside its own bounded region'); assert.equal(region.getAttribute('role'), 'region');
+    assert.equal(region.tabIndex, -1, 'A region that fits is not a tab stop');
+    Object.assign(region, {scrollWidth: 900, clientWidth: 400}); run('syncScrollHints()');
+    assert.deepEqual([region.tabIndex, region.parent?.hidden ?? byClass('scroll-hint')[0].hidden], [0, false], 'A region that overflows becomes a tab stop, with its hint');
+    Object.assign(region, {scrollWidth: 400}); run('syncScrollHints()');
     // The evidence behind the scores sits right under the card: the workload heatmap and the trade-off plot.
     const matrix = inside(page, 'breakdowns', 'heatmap')[0];
     assert.equal(inside(page, 'breakdowns', 'breakdown').length, 1); assert.equal(inside(page, 'breakdowns', 'chart-panel').length, 1);
     assert.equal(inside(page, 'breakdowns', 'breakdown-title').length, 0, 'One group needs no breakdown heading');
     const tradeoffs = inside(page, 'breakdowns', 'chart-point');
     for (const axis of ['x', 'y']) tradeoffs.forEach((point, i) => assert.ok(Math.abs(Number(point.getAttribute(`data-${axis}-score`)) - [1, 1.75][i]) < 1e-12));
+    const ticks = classNodes(inside(page, 'breakdowns', 'chart-panel')[0], 'chart-tick').map(t => t.textContent);
+    assert.deepEqual(ticks, ['×1', '×1.1', '×1.2', '×1.5', '×2', '×1', '×1.1', '×1.2', '×1.5', '×2'], 'Each logarithmic axis gets its own range and readable ticks');
     assert.equal(bodyRows(matrix).length, suite.rows.length + 2);
     assert.equal(descendants(matrix).filter(e => e.tag === 'input' && e.type === 'checkbox').length, 5, 'Inclusion checkboxes stay in the workload matrix');
     for (const th of headRow(matrix).slice(1)) assert.match(th.title, /^test · 2026-/);
     assert.equal(classNodes(matrix, 'bar').length, 0, 'Timing cells show raw times, never bars or another ratio');
-    assert.deepEqual(heatmapColors(page), Array.from({length: suite.rows.length + 2}, () => ['0.225', '0.130']).flat());
+    assert.deepEqual(heatmapColors(page), Array.from({length: suite.rows.length + 2}, () => ['0.130', '0.080']).flat());
     assert.equal(classNodes(matrix, 'best-mark').length, suite.rows.length + 2, 'Fastest cells have a non-color indicator');
-    assert.equal(classNodes(matrix, 'help-trigger').length, suite.rows.length + 2, 'Every workload links to its definition');
+    assert.deepEqual(classNodes(matrix, 'workload-link').map(a => a.href), [...suite.rows.map(r => `#dataset?operation=${r.op}`), '#dataset?operation=load', '#dataset?operation=provision'], 'Every workload name links to its definition');
+    assert.equal(classNodes(matrix, 'help-trigger').length, 0, 'No "?" tab stops between the checkboxes');
     for (const t of [...byClass('summary'), matrix]) {
         assert.ok(t.getAttribute('aria-label'), 'Tables have accessible names');
         for (const th of descendants(t).filter(e => e.tag === 'th')) assert.ok(['col', 'row'].includes(th.scope));
     }
     assert.match(elements.get('operation-facts').children[1].textContent, new RegExp(`the board shows the ${mode === 'first' ? 'first try' : 'best repeat'}$`), 'The definition says which try the board shows');
 }
-// The rank metric is a select in the filter bar and also each score column's header; the other scores stay in place.
-select(page, 'sort-metric', 'load');
-assert.deepEqual(headRow(byClass('summary')[0]).map(th => th.getAttribute('aria-sort')), [null, null, null, 'ascending']);
+// The rank metric is chosen from the score column headers; the other scores stay in place.
+click('sort-load-no');
+assert.deepEqual(headRow(byClass('summary')[0]).map(th => th.getAttribute('aria-sort')), [null, null, null, 'ascending', null]);
 assert.ok(byClass('summary')[0].getAttribute('aria-label').includes('ranked by Load score'));
 click('sort-data-no');
 assert.equal(run('state.sort'), 'data'); assert.equal(document.activeElement.id, 'sort-data-no', 'A header keeps focus after ranking by it');
-assert.deepEqual(headRow(byClass('summary')[0]).map(th => th.getAttribute('aria-sort')), [null, null, 'ascending', null]);
-assert.equal(elements.get('sort-metric').value, 'data', 'Header and select show the same rank metric');
+assert.deepEqual(headRow(byClass('summary')[0]).map(th => th.getAttribute('aria-sort')), [null, null, 'ascending', null, null]);
+click('sort-data-no');
+assert.deepEqual(headRow(byClass('summary')[0]).map(th => th.getAttribute('aria-sort')), [null, null, 'descending', null, null], 'Sorting the sorted score again flips the order');
+assert.deepEqual(bodyRows(byClass('summary')[0]).map(row => nameOf(row).textContent), ['Measured', 'Tagless']);
+click('sort-data-no');
 assert.match(byClass('summary')[0].children[1].children[0].children[2].title, /composite of several workloads/);
-select(page, 'sort-metric', 'branch');
+click('sort-branch-no');
 assert.deepEqual(run('Object.keys(SORTS)'), run('Object.keys(VIEWS)'), 'Every rank metric is an existing category score; there is no invented overall score');
 
 assert.equal(run("pick([0.3, 0.2, 0.1], 'first')"), 0.3);
@@ -279,12 +295,13 @@ assert.equal(run('seconds(0.017746)'), '0.017746s');
 assert.deepEqual([1, 2, 3, 4, 11, 12, 13, 21, 22, 101].map(n => run(`ordinal(${n})`)), ['1st', '2nd', '3rd', '4th', '11th', '12th', '13th', '21st', '22nd', '101st']);
 assert.match(byClass('group-heading')[0].textContent, /^Self-hosted/);
 // A "?" opens the definition below the board and moves focus there.
-inside(page, 'breakdowns', 'help-trigger').find(b => b.getAttribute('aria-label') === 'What Point read times').click();
+// Following a link: the hash changes, the section opens on the linked definition and keyboard focus moves there.
+const follow = (page, hash) => { page.run(`window.location.hash = ${JSON.stringify(hash)}`); page.run('{ const before = routeKey(); applyHash(); if (before !== routeKey()) render(); reveal(true); }'); };
+elements.get('dataset').getBoundingClientRect = () => ({top: 2400});  // the definitions sit far below the board
+follow(page, inside(page, 'breakdowns', 'workload-link').find(a => a.textContent === 'Point read').href);
 assert.equal(run('state.op'), 'read'); assert.equal(run('window.location.hash'), '#dataset?operation=read');
 assert.ok(elements.get('dataset').scrolledIntoView >= 1); assert.equal(document.activeElement.id, 'operation-read');
-assert.equal(classNodes(byClass('summary')[0], 'help-trigger')[0].getAttribute('aria-label'), 'What Time to first query times');
-classNodes(byClass('summary')[0], 'help-trigger').find(b => b.getAttribute('aria-label') === 'How the reads & writes score works').click();
-assert.equal(elements.get('methodology').open, true); assert.equal(document.activeElement.id, 'methodology-summary', 'The composite score explains itself in the scoring rules');
+assert.equal(descendants(elements.get('breakdowns')).find(e => e.id === 'row-3-no').getAttribute('aria-label'), 'Count Point read in the reads & writes score', 'A checkbox without a visible label still says what it counts');
 
 // The details dialog: why this position first, then every try, the environment, and provenance behind a disclosure.
 const [firstRow, secondRow] = bodyRows(byClass('summary')[0]);
@@ -301,6 +318,9 @@ assert.equal(bodyRows(why).length, 3 + suite.rows.length + 2, 'Each category, th
 assert.deepEqual(classNodes(why, 'why-category').map(tr => tr.children[0].textContent), ['First query', 'Reads & writes', 'Load']);
 assert.equal(classNodes(why, 'ratio-value')[0].textContent, '×1.75'); assert.equal(classNodes(why, 'ratio-value').at(-2).textContent, '×2.00', 'Load ratios use no shift');
 assert.match(why.textContent, /Branch createnot in score/, 'Workloads outside the score are named, never silently counted');
+const whyBars = classNodes(why, 'time-bar');
+assert.equal(whyBars.length, suite.rows.length + 2, 'Every compared workload has a time bar');
+assert.deepEqual([whyBars[0].children[0].style.width, whyBars[0].children[1].style.left], ['100.0%', '50.0%'], 'The slower system fills its bar; the tick marks the fastest, as every bar on the page does');
 const attempts = classNodes(elements.get('run-body'), 'run-timings')[0];
 assert.equal(bodyRows(attempts).length, suite.rows.length);
 assert.equal(bodyRows(attempts)[0].children.length, suite.tries + 2);
@@ -317,7 +337,7 @@ const mockRows = bodyRows(mocked.byClass('summary')[0]);
 assert.deepEqual(mockRows.map(r => nameOf(r).textContent), ['Preview', 'Measured']);
 assert.deepEqual(mockRows.map(r => classNodes(r, 'flag').map(f => [f.textContent, f.title])), [[['Mock data', 'Illustrative only']], []]);
 assert.equal(classNodes(mocked.el('breakdowns'), 'chart-point').length, 2, 'and charted');
-assert.match(mocked.el('updated').textContent, /^2026-09-30$/, 'A mock date never claims a fresh run');
+assert.equal(mocked.el('updated').textContent, 'Last run 2026-09-30', 'A mock date never claims a fresh run');
 classNodes(mockRows[0], 'details-button')[0].click();
 assert.match(mocked.el('run-subtitle').textContent, / · mock data$/);
 assert.equal(classNodes(mocked.el('run-body'), 'notice')[0].textContent, 'Illustrative only');
@@ -373,7 +393,6 @@ assert.equal(macroEl('micro-view').hidden, true); assert.equal(macroEl('macro-vi
 assert.doesNotMatch(scripts.join('\n') + html, /preset|smoke|ineligible|comparable campaign|not comparable|uncommitted/i, 'The page has no preset, smoke or comparability vocabulary at all');
 assert.equal(macroPage.run('state.rank'), 'rl_env', 'Ranked by the first workflow until the viewer picks another');
 assert.equal(macroPage.run('state.workflow'), 'rl_env', 'The definition selection is separate state');
-assert.equal(macroEl('macro-filters').hidden, false); assert.deepEqual(macroEl('macro-rank').children.map(o => o.textContent), NAMES_6);
 assert.equal(macroPage.document.getElementById('status-legend'), null, 'No status key: every status is spelled out in its cell');
 assert.deepEqual(macroEl('selectors-suite').children.map(b => b.getAttribute('aria-selected')), ['true', 'false']);
 assert.equal(macroEl('nav-board').href, '#agent-workflows'); assert.equal(macroEl('nav-workflows').href, '#workflows?workflow=rl_env');
@@ -383,9 +402,9 @@ assert.deepEqual(classNodes(macroEl('macro-groups'), 'group-heading').map(h => [
     [['Test CPU', '2 systems · 8 CPUs · 16 GiB · Darwin 27.0.0 arm64 · box · revision 0000000'], ['Other CPU', '1 system · 4 CPUs · 8 GiB · Darwin 27.0.0 arm64 · box2 · revision 1111111']]);
 for (const table of boards()) {
     assert.deepEqual(headRow(table).map(firstText), ['System', ...NAMES_6, 'Completed'], 'Workflows are columns, named by the job; the upstream id is secondary');
-    assert.deepEqual(headRow(table).slice(1, 7).map(th => classNodes(th, 'wf-id')[0].textContent), ['S1', 'S2', 'S3', 'S4', 'S5', 'S6']);
+    assert.deepEqual(headRow(table).slice(1, 7).map(th => [th.children.length, classNodes(th, 'sort-label')[0].textContent, classNodes(th, 'sort-button')[0].title]), NAMES_6.map(name => [1, name, name]), 'A header is one sort button: its label, clamped to two lines, with the full name as its title');
     assert.deepEqual(headRow(table).map(th => th.getAttribute('aria-sort')), [null, 'ascending', null, null, null, null, null, null]);
-    assert.equal(classNodes(table, 'sort-button').length, 6); assert.equal(classNodes(table, 'help-trigger').length, 6, 'Every column links to its definition');
+    assert.equal(classNodes(table, 'sort-button').length, 6); assert.equal(classNodes(table, 'sort-icon').length, 6, 'Every workflow header shows that it sorts'); assert.equal(classNodes(table, 'help-trigger').length, 0, 'A header only sorts; the definitions live below the board');
     assert.equal(table.getAttribute('aria-label'), 'Agent workflows: completion time per system and workflow, ranked by Evaluate agent rollouts');
     for (const row of bodyRows(table)) { assert.equal(row.children.length, 8); assert.equal(row.children[0].tag, 'th'); assert.equal(row.children[0].scope, 'row'); for (const td of row.children.slice(1)) assert.equal(td.tag, 'td'); }
 }
@@ -397,14 +416,18 @@ for (const row of rowsOf()) {
     assert.equal(nameOf(row).tag, 'span');
     assert.deepEqual(descendants(row).filter(e => e.tag === 'button').map(b => [b.className, b.textContent, b.getAttribute('aria-label'), b.getAttribute('aria-haspopup')]),
         [['details-button', 'Details', `${nameOf(row).textContent} details`, 'dialog']]);
+    assert.ok(descendants(row.children.at(-1)).includes(detailsOf(row)), 'Details sits last, beside the completion count');
     assert.equal(row.listeners.click, undefined);
 }
 // Every cell says what happened: a time for a completed workflow, a drawn status with its word otherwise. Each column marks and shades against its own fastest time.
 assert.deepEqual(KEYS.map(k => cellText('Dolt', k)), Array(6).fill('10.000s'));
 assert.deepEqual(KEYS.map(k => cellText('Doltgres', k)), ['20.000s', 'IncompleteUnsupported: MERGE, REBASE', 'Failed', 'Timed out', '5.000s', '20.000s'], 'One deduplicated unsupported-operation note');
 assert.deepEqual(KEYS.map(k => classNodes(cellOf('Doltgres', k), 'best-mark').length), [0, 0, 0, 0, 1, 0], 'Each column marks its own fastest time');
-assert.deepEqual(KEYS.map(k => cellOf('Dolt', k).style['--strength']), ['0.225', '0.225', '0.225', '0.225', '0.130', '0.225'], 'and shades against it');
-assert.deepEqual(KEYS.map(k => cellOf('Doltgres', k).style['--strength']), ['0.130', undefined, undefined, undefined, '0.225', '0.130'], 'A status is never shaded');
+assert.deepEqual(KEYS.map(k => classNodes(cellOf('Dolt', k), 'best-mark').length), [1, 0, 0, 0, 0, 1], 'A time with nothing to compare against is never the fastest');
+assert.deepEqual(KEYS.map(k => cellOf('Dolt', k).style['--strength']), ['0.130', undefined, undefined, undefined, '0.080', '0.130'], 'Only a column that compares two times is shaded');
+assert.equal(classNodes(rowOf('MatrixOne'), 'best-mark').length + rowOf('MatrixOne').children.filter(td => td.style['--strength']).length, 0, 'A group of one compares nothing');
+assert.ok(rowsOf().every(r => r.children.slice(1).every(td => !/\bsorted\b/.test(td.className))), 'No column is tinted for being sorted');
+assert.deepEqual(KEYS.map(k => cellOf('Doltgres', k).style['--strength']), ['0.080', undefined, undefined, undefined, '0.130', '0.080'], 'A status is never shaded');
 assert.equal(cellOf('Doltgres', 'dev_agent').title, 'timed_out reason', 'The reason is one hover away; the partial time is in the details');
 assert.equal(classNodes(cellOf('Doltgres', 'context_mgmt'), 'status-icon')[0].tag, 'svg', 'Status icons are drawn, not glyphs');
 assert.deepEqual(rowsOf().map(r => classNodes(r, 'done-count')[0].textContent), ['6 / 6', '3 / 6', '3 / 6']);
@@ -457,12 +480,18 @@ assert.equal(macroEl('run-source').href, 'dolt/macro/20261010/campaign_c2000000.
 assert.equal(classNodes(macroEl('run-body'), 'verdict')[0].textContent, '2nd of 2 by Evaluate agent rollouts: 20.000s, ×2.00 the fastest.');
 const workflowItems = () => classNodes(macroEl('run-body'), 'why-item');
 assert.deepEqual(workflowItems().map(item => [item.tag, classNodes(item, 'why-name')[0].children[0].textContent]), NAMES_6.map(name => ['details', name]), 'Every workflow, in suite order, each a disclosure');
-assert.deepEqual(workflowItems().map(item => item.className), ['why-item sorted', ...Array(5).fill('why-item')], 'The ranked workflow is highlighted');
 assert.deepEqual(workflowItems().map(item => classNodes(item.children[0], 'why-value')[0].textContent),
     ['20.000s2nd of 2', 'Incompleteincomplete reason', 'Failedfailed reason', 'Timed outtimed_out reason', '5.000s1st of 2', '20.000s2nd of 2']);
 assert.equal(classNodes(macroEl('run-body'), 'bar-tick').length, 3, 'Each timed workflow bar marks the fastest time');
 const incompleteText = workflowItems()[1].textContent;
 for (const word of ['Incomplete', 'incomplete reason', 'Partial elapsed 12.500s, not a completion time', 'Setup time1.500s', 'Work units', 'Correctness checks', 'Every check (2)', 'Unsupported: MERGE:not implemented, MERGE:timed out, REBASE', 'Attempt record', 'Workload identity SHA-256']) assert.ok(incompleteText.includes(word), word);
+// Each reason appears once in an open workflow: its row names the first, the body lists only the others.
+const occurrences = (text, part) => text.split(part).length - 1;
+assert.equal(occurrences(incompleteText, 'incomplete reason'), 1, 'The open body does not repeat the reason its row names');
+const twoReasons = structuredClone(macroData); twoReasons.campaigns[1].attempts.multi_agent.outcome.reasons = ['first cause', 'second cause'];
+const twoPage = mount(data, [], twoReasons, '#agent-workflows');
+detailsOf(rowOf('Doltgres', twoPage)).click();
+assert.deepEqual(['first cause', 'second cause'].map(reason => occurrences(classNodes(twoPage.el('run-body'), 'why-item')[2].textContent, reason)), [1, 1], 'Each of several reasons appears once');
 const workBar = classNodes(workflowItems()[0], 'stack-bar')[0];
 assert.equal(workBar.getAttribute('aria-label'), 'Work units: 8 succeeded of 8'); assert.equal(workBar.children.length, 1, 'Only parts with a count get a segment');
 assert.doesNotMatch(workflowItems()[0].textContent, /Expected units/, 'Valid counters are drawn once, not listed again');
@@ -472,7 +501,7 @@ assert.match(bodyRows(opsTable)[4].textContent, /native · dolt_merge.*not exerc
 assert.match(bodyRows(opsTable)[0].textContent, /8 ok.*0\.400s/);
 assert.equal(descendants(workflowItems()[1]).find(e => e.tag === 'a').href, 'dolt_mysql/macro/20261010/bb_00000021.json', 'Each attempt links its raw record');
 const dialogText = macroEl('run-body').textContent;
-assert.match(dialogText, /3 of 6 workflows completed.*ProvenanceCampaignc2000000Comparison groupabc123def456Git commit0{40}/s);
+assert.match(dialogText, /3 of 6 workflows completed.*ProvenanceRun IDc2000000Comparison groupabc123def456Git commit0{40}/s);
 assert.doesNotMatch(dialogText, /parquet|\.runs|comparab|preset|uncommitted|cleanup (failed|unknown)|server stop/i, 'Private artifacts are never linked, and a validated run carries no caveat');
 macroEl('run-body').scrollTop = 500;
 macroEl('close-run').click();
@@ -500,15 +529,25 @@ assert.equal(macroEl('run-subtitle').textContent, 'v1.81.2 · box · 2026-10-08'
 macroEl('campaign-c1000000').click();
 assert.equal(macroPage.run('window.location.hash'), '#agent-workflows');
 macroEl('close-run').click();
+assert.equal(macroPage.document.activeElement.id, 'details-dolt-mysql-box', 'Switching runs rebuilds the board, yet closing still returns focus to that row\'s Details');
+assert.equal(macroPage.document.activeElement, detailsOf(rowOf('Dolt')), 'and to the rebuilt button, not the detached one');
+// Screen readers hear the rank, or that there is none, before the name; the hover text says why a row is unranked.
+assert.deepEqual(rowsOf().map(r => classNodes(r.children[0], 'sr-only')[0].textContent), ['Rank 1, ', 'Rank 2, ', 'Rank 1, ']);
+assert.equal(classNodes(rowOf('Dolt'), 'rank-number')[0].getAttribute('aria-hidden'), 'true');
+assert.equal(macroEl('nav-run').href, 'run.html#agent-workflows', 'Run a benchmark opens the wizard on the suite in view');
+// A header link to the section already in the URL fires no hashchange, so it reveals and focuses the section itself.
+macroPage.run("window.location.hash = '#workflows?workflow=rl_env'");
+assert.equal(macroEl('nav-workflows').click().defaultPrevented, true);
+assert.equal(macroPage.document.activeElement.id, 'workflow-rl_env', 'Focus moves to the linked definition');
+macroPage.run("window.location.hash = '#agent-workflows'");
+assert.equal(macroEl('nav-board').click().defaultPrevented, true);
+assert.equal(macroPage.document.activeElement.id, 'leaderboard-title', 'The Leaderboard link lands on the board');
+macroPage.run("window.location.hash = '#microbench'");
+assert.equal(macroEl('nav-board').click().defaultPrevented, false, 'A link to another hash is left to the browser and the hashchange handler');
+macroPage.run("window.location.hash = '#agent-workflows'");
 // Runs that failed validation are listed below the board with their reason, never on it.
 assert.match(macroEl('macro-excluded').textContent, /Runs not on the board2.*failed validation: run from uncommitted sources.*not a JSON object/);
 assert.equal(descendants(macroEl('macro-excluded')).find(e => e.tag === 'a').href, 'dolt/macro/20261010/campaign_deadbeef.json', 'Development links the excluded file');
-// A column's "?" opens the workflow's definition below the board.
-classNodes(boards()[0], 'help-trigger').find(b => b.getAttribute('aria-label') === 'What Recover from a bad deployment does').click();
-assert.equal(macroPage.run('state.workflow'), 'ops_agent'); assert.equal(macroPage.run('window.location.hash'), '#workflows?workflow=ops_agent');
-assert.ok(macroEl('workflows').scrolledIntoView >= 1); assert.equal(macroPage.document.activeElement.id, 'workflow-ops_agent', 'Focus lands on the definition it opened');
-assert.equal(macroPage.run('state.rank'), 'rl_env', 'Opening a definition never re-ranks the board');
-macroPage.run("state.workflow = 'rl_env'; render()");
 
 
 // Ranking: ties share a rank and the next rank skips; a workflow that did not complete is unranked in that column only.
@@ -518,23 +557,32 @@ const rankedData = {suite: macroData.suite, excluded: [], campaigns: [timed('d00
 const ranked = mount(data, [], rankedData, '#agent-workflows');
 const rankedRows = () => rowsOf(ranked), rankedBoard = () => boards(ranked)[0];
 assert.equal(boards(ranked).length, 1, 'One comparison group, one table');
-assert.deepEqual(classNodes(ranked.el('macro-groups'), 'group-heading')[0].children.map(c => c.textContent), ['Test CPU', '4 systems · 8 CPUs · 16 GiB · Darwin 27.0.0 arm64 · box'], 'One group needs no revision to tell it apart');
+assert.deepEqual(classNodes(ranked.el('macro-groups'), 'group-heading')[0].children.map(c => c.textContent), ['Test CPU', '4 systems · 8 CPUs · 16 GiB · Darwin 27.0.0 arm64 · box', 'SlowerFaster'], 'One group needs no revision to tell it apart, and its shading has a key');
 assert.deepEqual(rankedRows().map(r => [nameOf(r).textContent, classNodes(r, 'rank-number')[0].textContent]), [['Dolt', '1'], ['Tie', '1'], ['Doltgres', '3'], ['Late', '—']], 'Tied times share a rank; the next rank skips; a failed workflow is listed last, unranked');
+assert.deepEqual([classNodes(rankedRows()[3].children[0], 'sr-only')[0].textContent, rankedRows()[3].children[0].title], ['Not ranked, ', 'Not ranked by Evaluate agent rollouts: Failed'], 'An unranked row says so, and why');
 assert.deepEqual(rankedRows().map(r => classNodes(r.children[1], 'best-mark').length), [1, 1, 0, 0]);
-assert.deepEqual(rankedRows().map(r => r.children[1].style['--strength']), ['0.225', '0.225', '0.130', undefined]);
+assert.deepEqual(rankedRows().map(r => r.children[1].style['--strength']), ['0.130', '0.130', '0.080', undefined]);
 assert.deepEqual(rankedRows().map(r => classNodes(r.children[2], 'best-mark').length), [0, 0, 0, 1], 'The run that failed one workflow is still the fastest in another');
 assert.deepEqual(headRow(rankedBoard()).map(th => th.getAttribute('aria-sort')), [null, 'ascending', null, null, null, null, null, null]);
 // The rank metric: a select in the filter bar and each workflow header; the definitions below keep their own selection.
-select(ranked, 'macro-rank', 'ops_agent');
+ranked.document.getElementById('rank-ops_agent-aaaa11112222').click();
 assert.equal(ranked.run('window.location.hash'), '#agent-workflows?workflow=ops_agent');
 assert.deepEqual(headRow(rankedBoard()).map(th => th.getAttribute('aria-sort')), [null, null, null, null, null, 'ascending', null, null]);
 assert.equal(ranked.run('state.workflow'), 'rl_env', 'Ranking never changes the definition selection');
-select(ranked, 'macro-rank', 'rl_env');
+ranked.document.getElementById('rank-rl_env-aaaa11112222').click();
 assert.equal(ranked.run('window.location.hash'), '#agent-workflows');
 ranked.document.getElementById('rank-context_mgmt-aaaa11112222').click();
 assert.equal(ranked.run('state.rank'), 'context_mgmt'); assert.equal(ranked.document.activeElement.id, 'rank-context_mgmt-aaaa11112222');
 assert.deepEqual(rankedRows().map(r => [nameOf(r).textContent, classNodes(r, 'rank-number')[0].textContent]), [['Late', '1'], ['Dolt', '2'], ['Doltgres', '3'], ['Tie', '4']]);
 ranked.document.getElementById('rank-rl_env-aaaa11112222').click();
+ranked.document.getElementById('rank-rl_env-aaaa11112222').click();
+assert.equal(ranked.run('window.location.hash'), '#agent-workflows?order=desc', 'Sorting the sorted column again flips the order');
+assert.equal(headRow(rankedBoard())[1].getAttribute('aria-sort'), 'descending');
+assert.equal(ranked.document.getElementById('rank-rl_env-aaaa11112222').getAttribute('aria-label'), 'Evaluate agent rollouts, sorted slowest first; sort fastest first');
+assert.deepEqual(rankedRows().map(r => [nameOf(r).textContent, classNodes(r, 'rank-number')[0].textContent]), [['Doltgres', '3'], ['Tie', '1'], ['Dolt', '1'], ['Late', '—']], 'Slowest first keeps each rank, and a workflow without a time stays last');
+assert.equal(mount(data, [], rankedData, '#agent-workflows?workflow=ops_agent&order=desc').run('[state.rank, state.rankDesc].join()'), 'ops_agent,true', 'The order is part of the link');
+ranked.document.getElementById('rank-rl_env-aaaa11112222').click();
+assert.equal(ranked.run('window.location.hash'), '#agent-workflows');
 detailsOf(rankedRows()[2]).click();
 assert.equal(classNodes(ranked.el('run-body'), 'verdict')[0].textContent, '3rd of 3 by Evaluate agent rollouts: 20.000s, ×2.00 the fastest.');
 assert.deepEqual(classNodes(ranked.el('run-body'), 'why-row').map(b => classNodes(b, 'row-meta').at(-1).textContent), ['3rd of 3', '3rd of 4', '3rd of 4', '3rd of 4', '3rd of 4', '3rd of 4']);
@@ -544,8 +592,22 @@ assert.equal(classNodes(ranked.el('run-body'), 'verdict')[0].textContent, 'Not r
 assert.equal(classNodes(ranked.el('run-body'), 'bar-tick').length, 5, 'Its five timed workflows still show the fastest time');
 ranked.el('close-run').click();
 const results = classNodes(ranked.el('workflow-results'), 'result-bars')[0];
-assert.deepEqual(results.children.map(li => li.children[0].children[1].textContent), ['Dolt', 'Tie', 'Doltgres'], 'A definition shows the measured times, fastest first');
+assert.deepEqual(results.children.map(li => li.children[0].children[1].textContent), ['Dolt', 'Tie', 'Doltgres', 'Late'], 'A definition shows the measured times, fastest first');
+assert.equal(results.children[3].children[2].textContent, 'Failed', 'A system that did not complete the workflow is named with its outcome, never left out');
 assert.equal(classNodes(results, 'best-mark').length, 2);
+assert.equal(classNodes(results, 'bar-tick').length, 3, 'Each bar is a time against the slowest, with a tick at the fastest');
+// A lone time has nothing to beat: no fastest mark, no bar, and no claim that it is the fastest.
+const alone = mount(data, [], {suite: macroData.suite, excluded: [], campaigns: [timed('f0000001', 'Solo', 'solo', [7, 7, 7, 7, 7, 7]), timed('f0000002', 'Broken', 'broken', [0, 0, 0, 0, 0, 0], Array(6).fill('failed'))]}, '#workflows');
+const aloneResults = classNodes(alone.el('workflow-results'), 'result-bars')[0];
+assert.deepEqual([classNodes(aloneResults, 'best-mark').length, classNodes(aloneResults, 'time-bar').length], [0, 0]);
+assert.equal(classNodes(alone.el('macro-groups'), 'heat-key').length, 0, 'Nothing is shaded, so there is no key');
+classNodes(rowsOf(alone)[0], 'details-button')[0].click();
+assert.equal(classNodes(alone.el('run-body'), 'verdict')[0].textContent, '1st of 1 by Evaluate agent rollouts: 7.000s, the only completed time in this comparison.');
+assert.deepEqual(classNodes(alone.el('run-body'), 'why-row').map(b => classNodes(b, 'row-meta').at(-1).textContent), Array(6).fill('the only completed time'));
+assert.equal(classNodes(alone.el('run-body'), 'time-bar').length, 0);
+alone.el('close-run').click();
+classNodes(rowsOf(alone)[1], 'details-button')[0].click();
+assert.equal(classNodes(alone.el('run-body'), 'verdict')[0].className, 'verdict verdict-unranked', 'A missing rank does not wear the accent');
 assert.equal(classNodes(mount(data, [], {suite: macroData.suite, campaigns: [], excluded: []}, '#workflows').el('workflow-results'), 'fine')[0].textContent, 'No results yet.');
 macroEl('tab-micro').click();
 assert.equal(macroPage.run('window.location.hash'), '#microbench');
@@ -561,12 +623,12 @@ const picker = macroEl('selectors-workflow');
 assert.deepEqual(picker.children.map(b => b.textContent), NAMES_6.map((name, i) => name + ['S1 RL environment', 'S2 Context management', 'S3 Multi-agent', 'S4 Dev agent', 'S5 Ops agent', 'S6 Data agent'][i]), 'A picker named by the job, upstream id below');
 assert.deepEqual(picker.children.map(b => b.getAttribute('aria-label')), ['Evaluate agent rollouts (S1 RL environment)', 'Manage context history (S2 Context management)', 'Coordinate multiple agents (S3 Multi-agent)', 'Develop against live data (S4 Dev agent)', 'Recover from a bad deployment (S5 Ops agent)', 'Ingest and merge data (S6 Data agent)']);
 assert.equal(picker.children[0].getAttribute('aria-pressed'), 'true');
-assert.equal(macroEl('workflow-name').textContent, 'Evaluate agent rollouts'); assert.equal(macroEl('workflow-id').textContent, 'Upstream scenario S1 RL environment');
+assert.equal(macroEl('workflow-name').textContent, 'Evaluate agent rollouts'); assert.equal(macroEl('workflow-id').textContent, 'S1 RL environment');
 assert.equal(macroEl('workflow-caption').textContent, 'Try several repair paths from a faulty task state, compare their results, then discard the branches.');
 assert.deepEqual(macroEl('workflow-ops').children.map(li => li.textContent), ['branch from a recorded commit', 'commit checkpoints', 'read across branches', 'diff', 'delete']);
 assert.equal(macroEl('workflow-text').tag, 'details', 'The full text description is an optional disclosure');
 assert.equal(classNodes(macroEl('workflows'), 'workflow-table').length + classNodes(macroEl('workflows'), 'summary').length, 0, 'No results table inside the definitions');
-assert.doesNotMatch(html.slice(at('id="workflows"'), at('id="macro-guide"')), /selectors-suite|macro-rank|<table/, 'No result controls in the definitions markup');
+assert.doesNotMatch(html.slice(at('id="workflows"'), at('id="macro-guide"')), /selectors-suite|sort-button|<table/, 'No result controls in the definitions markup');
 macroEl('workflow-ops_agent').click();
 assert.equal(macroPage.run('window.location.hash'), '#workflows?workflow=ops_agent');
 assert.equal(macroPage.document.activeElement.id, 'workflow-ops_agent', 'Choosing a workflow keeps focus on it');
@@ -605,7 +667,6 @@ for (const [macro, note] of [[null, 'no workflow data built'], [{suite: macroDat
     const empty = mount(data, [], macro, '#agent-workflows');
     assert.equal(emptyRow(empty).textContent, 'No published results yet. Results appear here once a validated run is published.', note);
     assert.equal(descendants(emptyRow(empty)).filter(e => e.tag === 'a').length, 0, `${note}: no instruction to run anything`);
-    assert.equal(empty.el('macro-filters').hidden, true, `${note}: nothing to rank`);
     empty.document.getElementById('tab-micro').click();
     assert.equal(classNodes(empty.el('groups'), 'score-value').length, 6, `${note}: the microbench still renders`);
 }
@@ -629,7 +690,7 @@ assert.equal(prod.elements.get('nav-run').removed, true, 'The run wizard is not 
 assert.equal(prod.elements.get('doc-nav').href, 'https://github.com/elaineang/db-fork/blob/main/leaderboard/README.md');
 assert.equal(prod.elements.get('doc-macro').href, 'https://github.com/elaineang/db-fork/blob/main/leaderboard/README.md#agent-workflows');
 assert.equal(rowsOf(prod).length, 3);
-prod.document.getElementById('macro-rank').value = 'data_agent'; prod.document.getElementById('macro-rank').change();
+prod.document.getElementById('rank-data_agent-abc123def456').click();
 assert.equal(prod.run('window.location.hash'), '#agent-workflows?workflow=data_agent');
 assert.equal(descendants(prod.elements.get('macro-excluded')).find(e => e.tag === 'a'), undefined, 'Production never links a file it does not serve');
 assert.equal(mount(data, [], macroData, '', 'prod').run('state.suite'), 'macro', 'Production opens on the agent workflows');
@@ -639,7 +700,7 @@ assert.equal(emptyRow(prodEmpty).textContent, 'No published results yet. Results
 prodEmpty.document.getElementById('tab-micro').click();
 assert.equal(prodEmpty.elements.get('empty-title').textContent, 'No published results yet');
 assert.equal(prodEmpty.elements.get('empty-description').textContent, 'Microbenchmark results appear here once they are published. 1 run without a result is listed below.');
-assert.equal(prodEmpty.elements.get('updated').textContent, 'No published runs');
+assert.equal(prodEmpty.elements.get('updated').textContent, 'No published runs yet');
 assert.match(prodEmpty.elements.get('excluded').textContent, /Runs without a result.*server did not start/, 'A published error record stays visible');
 assert.equal(prodEmpty.el('excluded-panel').open, true, 'With no result at all, the reasons start open');
 
@@ -916,10 +977,11 @@ assert.throws(() => commandsFor(['neon'], 'bench-01', 'US\tEast'), /location/);
 vm.runInContext('delete SYSTEMS.neon', wizardContext);
 
 
-// Selecting data rows changes only the reads/writes score; selecting none restores all rows.
+// Selecting data rows changes only the reads/writes score, the board names the subset it counts, and the last ticked
+// workload cannot be unticked: there is no silent "none means all".
 const selectionData = [entry('A', 0.03, []), entry('B', 0.06, [])];
 selectionData[1].result[3] = [0.15, 0.15, 0.15];
-const selection = mount(selectionData), allScores = tableScores(selection);
+const selection = mount(selectionData, [], null, '#microbench'), allScores = tableScores(selection);
 const selectRow = (index, checked) => {
     const checkbox = selection.document.getElementById(`row-${index}-no`);
     checkbox.checked = checked; checkbox.change();
@@ -928,8 +990,21 @@ const selectRow = (index, checked) => {
 for (let i = 4; i < suite.rows.length; i++) selectRow(i, false);
 assert.deepEqual(tableScores(selection), [[[allScores[0][0][0], '×1.00', allScores[0][0][2]], [allScores[0][1][0], '×4.00', allScores[0][1][2]]]]);
 assert.match(classNodes(classNodes(selection.el('breakdowns'), 'heatmap')[0], 'row-meta')[4].textContent, /not in score$/, 'An unticked workload says it is not in the score');
-selectRow(3, false);
+assert.equal(headRow(selection.byClass('summary')[0])[2].textContent, 'Reads & writes (1 of 5)', 'The score names the subset it counts');
+assert.equal(selection.run('window.location.hash'), '#microbench?workloads=read', 'and the link carries it');
+const last = selection.document.getElementById('row-3-no');
+assert.deepEqual([last.checked, last.disabled, last.title], [true, true, 'The score counts at least one workload'], 'The last ticked workload cannot be unticked');
+selectRow(4, true);
+assert.ok(!selection.document.getElementById('row-3-no').disabled, 'With two counted, either can be unticked again');
+for (let i = 4; i < suite.rows.length; i++) selectRow(i, true);
 assert.deepEqual(tableScores(selection), allScores);
+assert.equal(selection.run('window.location.hash'), '#microbench', 'The default view keeps the plain link');
+// A shared link restores the whole view: try, sort, order, counted workloads and filters.
+const shared = mount(selectionData, [], null, '#microbench?try=best&sort=data&order=desc&workloads=insert,update&systems=B');
+assert.equal(shared.run('[state.mode, state.sort, state.sortDesc, countedData().map(r => r.op), Object.entries(state.system).map(([k, v]) => k + v)].join(" ")'), 'best data true insert,update Afalse,Btrue');
+assert.deepEqual(bodyRows(shared.byClass('summary')[0]).map(row => nameOf(row).textContent), ['B'], 'The filter in the link applies');
+assert.equal(shared.run('boardHash()'), '#microbench?try=best&sort=data&order=desc&workloads=insert,update&systems=B', 'and the view writes the same link back');
+assert.equal(mount(selectionData, [], null, '#microbench?workloads=nope&sort=bogus').run('[countedData().length, state.sort].join()'), '5,branch', 'Unknown values in a link fall back to the defaults');
 // Tied scores share a rank; the next rank skips, as in a competition.
 const tied = mount([entry('A', 0.03, []), entry('B', 0.03, []), entry('C', 0.06, [])]);
 assert.deepEqual(tied.byClass('rank-number').map(e => [e.textContent, e.className]), [['1', 'rank-number rank-leader'], ['1', 'rank-number rank-leader'], ['3', 'rank-number']]);
@@ -966,7 +1041,7 @@ for (const excluded of [[], stale]) {
     assert.equal(empty.elements.get('empty-title').textContent, 'No published results yet');
     assert.equal(empty.elements.get('clear-empty-filters').hidden, true);
     assert.equal(empty.elements.get('shown').textContent, '0 systems');
-    assert.equal(empty.elements.get('updated').textContent, 'No published runs');
+    assert.equal(empty.elements.get('updated').textContent, 'No published runs yet');
     assert.equal(empty.byClass('summary').length, 0); assert.equal(classNodes(empty.el('breakdowns'), 'panel').length, 0);
     assert.equal(classNodes(empty.el('operation-results'), 'fine')[0].textContent, 'No results yet.', 'The definitions still explain every operation');
     if (excluded.length) {
@@ -980,20 +1055,20 @@ assert.equal(grouped.byClass('summary').length, 2, 'One ranking table per hostin
 assert.deepEqual(grouped.byClass('group-heading').map(h => h.children[0].textContent), ['Self-hosted', 'Managed service']);
 assert.equal(classNodes(grouped.el('breakdowns'), 'heatmap').length, 2);
 assert.deepEqual(classNodes(grouped.el('breakdowns'), 'breakdown-title').map(h => h.textContent), ['Self-hosted', 'Managed service'], 'Two groups name their breakdowns');
-assert.deepEqual(heatmapColors(grouped), Array(20).fill('0.225'), 'Hosted and local heatmap scales stay separate');
+assert.deepEqual(heatmapColors(grouped), Array(20).fill(undefined), 'Hosted and local scales stay separate, and a group of one compares nothing, so nothing is shaded');
 for (const score of grouped.byClass('score-value')) assert.equal(score.textContent, '×1.00', 'Local and hosted baselines remain independent');
 for (const point of classNodes(grouped.el('breakdowns'), 'chart-point')) {
     assert.equal(point.getAttribute('data-x-score'), '1', 'Chart baselines stay within the hosting group');
     assert.equal(point.getAttribute('data-y-score'), '1');
 }
 assert.deepEqual(classNodes(grouped.el('operation-results'), 'result-group').map(g => g.children[0].textContent), ['Self-hosted', 'Managed service'], 'Operation times keep the hosting groups apart');
-const zeroData = [entry('Zero', 1, []), entry('Missing', 1, [])];
+const zeroData = [entry('Zero', 1, []), entry('One', 1, []), entry('Missing', 1, [])];
 zeroData[0].result = suite.rows.map(() => [0, 0, 0]);
-zeroData[1].result = suite.rows.map(() => [null, null, null]);
+zeroData[2].result = suite.rows.map(() => [null, null, null]);
 const zeros = mount(zeroData);
 const timingRows = bodyRows(classNodes(zeros.el('breakdowns'), 'heatmap')[0]);
 for (const row of timingRows.slice(0, suite.rows.length)) {
-    assert.equal(classNodes(row, 'cell-best')[0].style['--strength'], '0.225', 'Zero is a valid fastest timing');
+    assert.equal(classNodes(row, 'cell-best')[0].style['--strength'], '0.130', 'Zero is a valid fastest timing');
     assert.equal(classNodes(row, 'cell-missing')[0].style['--strength'], undefined, 'Missing values are not heatmap values');
 }
 for (const strength of heatmapColors(zeros).filter(Boolean)) {

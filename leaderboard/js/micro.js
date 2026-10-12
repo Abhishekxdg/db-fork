@@ -21,13 +21,14 @@ const loadRow = {op: 'load', label: 'Load', title: 'Load the SQL dump into the n
 const provisionRow = {op: 'provision', label: 'Provisioning', title: 'Create the empty database or hosted service before loading data. Recorded separately and never included in the ranking.', shift: 0, value: e => e.provision_time};
 const allRows = [...suiteRows, loadRow, provisionRow];
 const VIEWS = {
-    branch: {label: 'First query', rows: suiteRows.slice(0, 3), ranked: rows => rows.slice(0, 1)},
-    data: {label: 'Reads & writes', rows: suiteRows.slice(3), ranked: rows => {
-        const ticked = rows.filter(r => state.ticked.has(r)); return ticked.length ? ticked : rows;
-    }},
-    load: {label: 'Load', rows: [loadRow, provisionRow], ranked: rows => rows.slice(0, 1)},
+    branch: {rows: suiteRows.slice(0, 3), ranked: rows => rows.slice(0, 1)},
+    data: {rows: suiteRows.slice(3), ranked: rows => rows.filter(r => state.ticked.has(r))},  // the last ticked workload cannot be unticked
+    load: {rows: [loadRow, provisionRow], ranked: rows => rows.slice(0, 1)},
 };
 const SORTS = {branch: 'First query', data: 'Reads & writes', load: 'Load'};
+// A score's name as the board shows it: the reads & writes score names its subset whenever it counts fewer than all workloads.
+const countedData = () => VIEWS.data.ranked(VIEWS.data.rows);
+const sortName = key => key === 'data' && countedData().length < VIEWS.data.rows.length ? `${SORTS.data} (${countedData().length} of ${VIEWS.data.rows.length})` : SORTS[key];
 const HOSTING = {no: 'Self-hosted', yes: 'Managed service'};
 const tryLabel = (capital = false) => (state.mode === 'first' ? ['first try', 'First try'] : ['best repeat', 'Best repeat'])[+capital];
 const FILTERS = {
@@ -42,11 +43,11 @@ const nameOf = e => data.filter(x => x.system === e.system && x.hosted === e.hos
 const CHIPS = {hosted: k => HOSTING[k], system: k => k, machine: k => k, tag: k => k};
 function resetFilters() {
     for (const key in CHIPS) for (const value in state[key]) state[key][value] = true;
-    render(); el('choice-mode-' + state.mode).focus();
+    writeHash(boardHash()); render(); el('choice-mode-' + state.mode).focus();
 }
 function filterOption(id, text, checked, toggle) {
     const box = node('input'); box.type = 'checkbox'; box.id = `filter-${id}`; box.checked = checked;
-    box.addEventListener('change', () => { toggle(); render(); el(box.id).focus(); });
+    box.addEventListener('change', () => { toggle(); writeHash(boardHash()); render(); el(box.id).focus(); });
     const item = node('label', 'chip-option'); item.append(box, ` ${text}`);
     return item;
 }
@@ -66,12 +67,7 @@ function wireMicro() {
     for (const chip of chips) chip.addEventListener('toggle', () => { if (chip.open) for (const other of chips) if (other !== chip) other.open = false; });
     document.addEventListener('click', event => { for (const chip of chips) if (chip.open && !chip.contains(event.target)) chip.open = false; });
     document.addEventListener('keydown', event => { if (event.key === 'Escape') for (const chip of chips) if (chip.open) { chip.open = false; chip.querySelector('summary').focus(); } });
-    bindSelect('sort-metric', value => { state.sort = value in SORTS ? value : 'branch'; });
 }
-const operationButton = row => definitionButton(`What ${row.label} times`, () => showOperation(row.op));
-const scoreButton = () => definitionButton('How the reads & writes score works', () => {
-    el('methodology').open = true; el('methodology').scrollIntoView({block: 'start'}); el('methodology-summary').focus({preventScroll: true});
-});
 
 // Scores: each workload's time against the fastest in its group, (time + shift) / (fastest + shift), and a
 // category score is the geometric mean of its counted workloads' ratios.
@@ -101,25 +97,30 @@ function microContext(measured) {
     return {measured, best, scores, ranks};
 }
 
-// One table per comparable hosting group: three category scores side by side, ranked by one chosen score only.
+// One data table per hosting group: three category scores side by side, sorted by one score from its header, and the
+// row's Details in the last column. A score is shaded and its fastest marked only where at least two systems have one.
 function summaryTable(title, ctx) {
     const {measured, scores, ranks} = ctx, rank = ranks[state.sort], by = scores[state.sort];
-    const order = [...by.scored.map(s => s.e), ...measured.filter(e => !rank.has(e))];
-    const {table, body} = dataTable('board summary', `${title}: systems ranked by ${SORTS[state.sort]} score, lower is better`, [colHead('System', 'system-col'),
-        ...Object.entries(SORTS).map(([key, text]) => sortHeader(text, key === state.sort, () => { state.sort = key; }, `sort-${key}-${measured[0].hosted}`, key === 'data' ? scoreButton() : operationButton(VIEWS[key].rows[0])))]);
+    const order = sortedRows(by.scored.map(s => s.e), measured.filter(e => !rank.has(e)), state.sortDesc);
+    const {table, body} = dataTable('board summary', `${title}: systems ranked by ${sortName(state.sort)} score, lower is better`, [colHead('System', 'system-col'),
+        ...Object.keys(SORTS).map(key => sortHeader(sortName(key), key === state.sort, state.sortDesc, descending => { state.sort = key; state.sortDesc = descending; writeHash(boardHash()); }, `sort-${key}-${measured[0].hosted}`)), colHead(node('span', 'sr-only', 'Details'), 'action-col')]);
     for (const e of order) {
         const tr = body.insertRow();
-        const th = systemHeader(rank.get(e), e, nameOf(e), [e.machine, e.date], opener => showRun(e, opener, ctx), e.mock ? [flag('Mock data', e.basis || 'Illustrative numbers, not a measurement')] : []); tr.append(th);
+        const th = systemHeader(rank.get(e), e, nameOf(e), [e.machine, e.date], e.mock ? [flag('Mock data', e.basis || 'Illustrative numbers, not a measurement')] : []); tr.append(th);
         if (!rank.has(e)) th.title = `Not ranked by ${SORTS[state.sort]}: ${missingText(by, e)}`;
         for (const key of Object.keys(SORTS)) {
-            const td = tr.insertCell(); td.className = 'score-cell' + (key === state.sort ? ' sorted' : '');
+            const td = tr.insertCell(); td.className = 'score-cell';
             const hit = scores[key].scored.find(s => s.e === e);
             if (!hit) { td.append(node('span', 'cell-absent', '—')); td.title = `No ${SORTS[key]} score: ${missingText(scores[key], e)}`; continue; }
             const usable = scores[key].usable, single = usable.length === 1 ? usable[0].value(e) : null;  // only a one-workload score has one elapsed time
-            const line = node('span', 'score-line'); line.append(node('span', 'score-value', `×${hit.score.toFixed(2)}`), node('span', 'score-time', single === null ? 'composite' : seconds(single)));
-            td.append(line, bar(1 / hit.score, 'bar score-bar'));
+            const line = node('span', 'score-line'), comparison = scores[key].scored.length >= 2;
+            if (comparison && hit.score === scores[key].scored[0].score) line.append(bestMark('Fastest in this score'));
+            line.append(node('span', 'score-value', `×${hit.score.toFixed(2)}`), node('span', 'score-time', single === null ? 'composite' : seconds(single)));
+            if (comparison) shade(td, scores[key].scored[0].score, hit.score);
+            td.append(line);
             td.title = `Unrounded ${SORTS[key]} score: ${hit.score}${single === null ? ' · composite of several workloads, no single elapsed time' : ''}`;
         }
+        const action = tr.insertCell(); action.className = 'action-cell'; action.append(detailsButton(nameOf(e), opener => showRun(e, opener, ctx), slug('details', e.hosted, e.system, e.machine)));
     }
     return table;
 }
@@ -133,17 +134,21 @@ function heatmap(ctx) {
     for (const row of allRows) {
         const tr = body.insertRow(), name = node('div', 'workload-name');
         if (row === suiteRows[3] || row === loadRow) tr.className = 'workload-divider';
+        const link = node('a', 'workload-link', row.label); link.href = `#dataset?operation=${row.op}`;  // a workload's name leads to its definition
         if (VIEWS.data.rows.includes(row)) {
             const box = node('input'); box.type = 'checkbox'; box.checked = state.ticked.has(row); box.id = `row-${suiteRows.indexOf(row)}-${measured[0].hosted}`;
-            box.addEventListener('change', () => { box.checked ? state.ticked.add(row) : state.ticked.delete(row); render(); el(box.id).focus(); });
-            const wrap = node('label'); wrap.append(box, ` ${row.label}`); name.append(wrap);
-        } else name.append(node('span', '', row.label));
-        name.append(operationButton(row));
+            box.setAttribute('aria-label', `Count ${row.label} in the reads & writes score`);
+            if (box.checked && countedData().length === 1) { box.disabled = true; box.title = 'The score counts at least one workload'; }
+            box.addEventListener('change', () => { box.checked ? state.ticked.add(row) : state.ticked.delete(row); writeHash(boardHash()); render(); el(box.id).focus(); });
+            name.append(box);
+        }
+        name.append(link);
         tr.append(rowHead([name, node('span', 'row-meta', (row.batch ? `×${fmt(row.batch)}` : 'Setup') + (ranked.includes(row) ? '' : ' · not in score'))], 'row-label'));
+        const comparison = compared(measured.map(e => row.value(e)));
         for (const e of measured) {
-            const value = row.value(e), td = tr.insertCell(), fastest = value !== null && value === best.get(row);
+            const value = row.value(e), td = tr.insertCell(), fastest = comparison && value !== null && value === best.get(row);
             td.className = value === null ? 'cell-missing' : fastest ? 'cell-best' : '';
-            if (value !== null) { shade(td, best.get(row), value); td.title = `${value}s${fastest ? ' · Fastest in this row' : ''}`; }
+            if (value !== null) { if (comparison) shade(td, best.get(row), value); td.title = `${value}s${fastest ? ' · Fastest in this row' : ''}`; }
             if (fastest) td.append(bestMark('Fastest in this row'));
             td.append(node('span', 'metric-value', seconds(value)));
         }
@@ -151,42 +156,47 @@ function heatmap(ctx) {
     return table;
 }
 function chartPoint(e, x, y, description, attributes, ctx) {
-    const point = svgNode('g', {class: 'chart-point', tabindex: 0, role: 'button', 'aria-haspopup': 'dialog', 'aria-label': `${label(e)}: ${description}. View run details.`, ...attributes});
+    const point = svgNode('g', {id: slug('point', e.hosted, e.system, e.machine), class: 'chart-point', tabindex: 0, role: 'button', 'aria-haspopup': 'dialog', 'aria-label': `${label(e)}: ${description}. View run details.`, ...attributes});
     point.append(svgNode('title', {}, `${label(e)} · ${description}`), svgNode('circle', {cx: x, cy: y, r: 13, class: 'chart-hit'}), svgNode('circle', {cx: x, cy: y, r: 5, class: 'chart-dot', style: `fill: ${seriesColor(e)}`}));
     point.addEventListener('click', () => showRun(e, point, ctx));
     point.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); showRun(e, point, ctx); } });
     return point;
 }
-function chartLimit(value) {
-    const power = 10 ** Math.floor(Math.log10(value || 1));
-    return [1, 2, 5, 10].find(factor => factor * power >= value) * power;
+// Scores are ratios, so both axes are logarithmic, each with its own range: one system's slow first query must not flatten
+// every reads & writes score onto the floor. Ticks fall on 1, 2 and 5 per decade, thinned until at most six remain.
+function logTicks(maximum) {
+    const steps = [1, 1.1, 1.2, 1.5, 2, 3, 5, 10, 20, 30, 50, 100, 200, 300, 500, 1000];
+    const top = steps.find(t => t >= maximum * 1.02) ?? maximum * 1.02, within = steps.filter(t => t <= top);
+    const mantissa = t => Number((t / 10 ** Math.floor(Math.log10(t))).toFixed(3));
+    return [[1, 1.1, 1.2, 1.5, 2, 3, 5], [1, 2, 5], [1, 5], [1]].map(keep => within.filter(t => t === top || keep.includes(mantissa(t)))).find(ticks => ticks.length <= 6);
 }
-// Category trade-offs: the table's own scores on two axes, lower-left is faster on both.
+// Category trade-offs: the table's own scores on two axes, lower-left is faster on both. The drawing is sized close to
+// the space it gets, so its text stays legible from phone to desktop.
 function tradeoffChart(ctx) {
     const {measured, scores} = ctx, card = node('figure', 'panel chart-panel');
     const branch = new Map(scores.branch.scored.map(({e, score}) => [e, score]));
     const points = scores.data.scored.filter(({e, score}) => branch.has(e) && Number.isFinite(score)).map(({e, score}) => ({e, x: branch.get(e), y: score}));
     card.append(node('h3', '', 'Trade-offs'), node('p', 'panel-note', 'First-query score against reads & writes score. Lower-left is faster on both.'));
     if (!points.length) { card.append(node('p', 'chart-empty', 'Complete first-query and read/write scores are needed for this comparison.')); return card; }
-    const maximum = chartLimit(Math.max(...points.flatMap(p => [p.x, p.y])) * 1.05);
-    const x = value => 72 + (value - 1) / (maximum - 1 || 1) * 320, y = value => 198 - (value - 1) / (maximum - 1 || 1) * 156;
-    const svg = svgNode('svg', {class: 'benchmark-chart', viewBox: '0 0 440 270', role: 'group', 'aria-label': 'Performance trade-offs. Category scores; lower is better on both axes.'});
-    svg.append(svgNode('text', {x: 58, y: 15, class: 'chart-axis-label'}, 'Reads & writes score'));
-    for (const tick of [1, (maximum + 1) / 2, maximum]) {
-        svg.append(svgNode('line', {x1: x(tick), x2: x(tick), y1: 28, y2: 212, class: 'chart-grid'}), svgNode('line', {x1: 58, x2: 410, y1: y(tick), y2: y(tick), class: 'chart-grid'}),
-            svgNode('text', {x: x(tick), y: 235, 'text-anchor': 'middle', class: 'chart-tick'}, `×${Number(tick.toFixed(2))}`), svgNode('text', {x: 49, y: y(tick) + 4, 'text-anchor': 'end', class: 'chart-tick'}, `×${Number(tick.toFixed(2))}`));
-    }
-    svg.append(svgNode('text', {x: 234, y: 262, 'text-anchor': 'middle', class: 'chart-axis-label'}, 'First-query score'));
+    const xTicks = logTicks(Math.max(...points.map(p => p.x))), yTicks = logTicks(Math.max(...points.map(p => p.y)));
+    const left = 52, right = 306, top = 34, bottom = 178, scale = (ticks, value, from, to) => from + Math.log(value) / Math.log(ticks.at(-1)) * (to - from);
+    const x = value => scale(xTicks, value, left, right), y = value => scale(yTicks, value, bottom, top);
+    const svg = svgNode('svg', {class: 'benchmark-chart', viewBox: '0 0 320 236', role: 'group', 'aria-label': 'Performance trade-offs. Category scores on logarithmic axes; lower is better on both.'});
+    svg.append(svgNode('text', {x: 8, y: 16, class: 'chart-axis-label'}, 'Reads & writes score'));
+    for (const tick of xTicks) svg.append(svgNode('line', {x1: x(tick), x2: x(tick), y1: top, y2: bottom, class: 'chart-grid'}), svgNode('text', {x: x(tick), y: bottom + 20, 'text-anchor': 'middle', class: 'chart-tick'}, `×${tick}`));
+    for (const tick of yTicks) svg.append(svgNode('line', {x1: left, x2: right, y1: y(tick), y2: y(tick), class: 'chart-grid'}), svgNode('text', {x: left - 8, y: y(tick) + 4, 'text-anchor': 'end', class: 'chart-tick'}, `×${tick}`));
+    svg.append(svgNode('text', {x: (left + right) / 2, y: 228, 'text-anchor': 'middle', class: 'chart-axis-label'}, 'First-query score'));
     for (const p of points) svg.append(chartPoint(p.e, x(p.x), y(p.y), `first-query score ×${p.x.toFixed(3)}, reads & writes score ×${p.y.toFixed(3)}`, {'data-x-score': p.x, 'data-y-score': p.y}, ctx));
     const legend = node('div', 'chart-legend');
     for (const p of points) { const item = node('span', 'chart-key'), dot = node('span', 'chart-swatch'); dot.style.backgroundColor = seriesColor(p.e); dot.setAttribute('aria-hidden', 'true'); item.append(dot, node('span', '', nameOf(p.e))); legend.append(item); }
-    card.append(svg, legend, node('p', 'panel-note', `${tryLabel(true)} · ×1 is the fastest.${points.length < measured.length ? ' Incomplete results are omitted.' : ''}`));
+    card.append(svg, legend, node('p', 'panel-note', `${tryLabel(true)} · ×1 is the fastest · logarithmic axes.${points.length < measured.length ? ' Incomplete results are omitted.' : ''}`));
     return card;
 }
 // One board group inside the card: its heading, the ranking table, and a note for every score that could not be computed.
 function boardGroup(title, ctx) {
     const section = node('section', 'board-group'), heading = node('div', 'group-heading');
-    heading.append(node('h2', '', title), node('span', 'group-count', `${plural(ctx.measured.length, 'system')} · ranked by ${SORTS[state.sort]} · lower is better`));
+    heading.append(node('h2', '', title), node('span', 'group-count', `${plural(ctx.measured.length, 'system')} · ranked by ${sortName(state.sort)} · lower is better`));
+    if (Object.values(ctx.scores).some(s => s.scored.length >= 2)) heading.append(heatKey('Shading: darker mint is closer to the best score in its column'));
     section.append(heading, scrolling(summaryTable(title, ctx)));
     const notes = Object.entries(ctx.scores).flatMap(([key, result]) => [
         ...result.dropped.length ? [`${SORTS[key]}: no measurements for ${result.dropped.map(r => r.label).join(', ')}.`] : [],
@@ -199,9 +209,7 @@ function breakdown(title, ctx, named) {
     const section = node('section', 'breakdown-group');
     if (named) section.append(node('h2', 'breakdown-title', title));
     const grid = node('div', 'breakdown'), matrix = node('figure', 'panel heatmap-panel'), caption = node('div', 'panel-head');
-    const key = node('span', 'heat-key'); key.setAttribute('role', 'img'); key.setAttribute('aria-label', 'Heatmap: darker mint is closer to the fastest time within each row');
-    key.append(node('span', '', 'Slower'), node('span', 'heat-ramp'), node('span', '', 'Faster'));
-    caption.append(node('h3', '', 'Workload breakdown'), key);
+    caption.append(node('h3', '', 'Workload breakdown'), heatKey('Shading: darker mint is closer to the fastest time within each row'));
     matrix.append(caption, node('p', 'panel-note', 'Batch totals in seconds, shaded within each row. Tick read/write workloads to choose what the reads & writes score includes.'), scrolling(heatmap(ctx), 'Scroll sideways to compare systems.'));
     grid.append(matrix, tradeoffChart(ctx)); section.append(grid);
     return section;
@@ -212,17 +220,14 @@ function showRun(e, opener, ctx) {
     const body = openDetails(e.system, `${HOSTING[e.hosted]} · ${e.machine} · ${e.date} · ${e.version ? `v${e.version}` : 'version not recorded'}${e.mock ? ' · mock data' : ''}`, e.source, opener);
     if (e.mock) body.append(node('p', 'notice', e.basis || 'Illustrative data, not a measured run.'));
     whyMicro(body, e, ctx);
-    detailsSection(body, 'Every try', `Batch totals in seconds. Best repeat is the faster of tries 2 and 3; both must succeed. The shaded column is the leaderboard's current selection.`);
+    detailsSection(body, 'Every try', `Batch totals in seconds. Best repeat is the faster of tries 2 and 3; both must succeed. The column marked used is the leaderboard's current selection.`);
     const selected = state.mode === 'first' ? 0 : suite.tries;
     const {table, body: rows} = dataTable('detail-table run-timings', `${e.system} timings for all attempts`,
-        ['Workload', ...Array.from({length: suite.tries}, (_, i) => `Try ${i + 1}`), 'Best repeat'].map((text, i) => colHead(text, i - 1 === selected ? 'selected-attempt' : '')));
+        ['Workload', ...Array.from({length: suite.tries}, (_, i) => `Try ${i + 1}`), 'Best repeat'].map((text, i) => i - 1 === selected ? `${text} · used` : text));
     suiteRows.forEach((row, i) => {
         const tr = rows.insertRow(), name = node('div', 'workload-name'); name.append(node('span', '', row.label));
         tr.append(rowHead([name, node('span', 'row-meta', `×${fmt(row.batch)}`)]));
-        [...e.result[i], pick(e.result[i], 'best')].forEach((value, index) => {
-            const td = tr.insertCell(); td.className = index === selected ? 'selected-attempt' : '';
-            td.append(node('span', value === null ? 'cell-missing' : 'metric-value', seconds(value)));
-        });
+        for (const value of [...e.result[i], pick(e.result[i], 'best')]) tr.insertCell().append(node('span', value === null ? 'cell-missing' : 'metric-value', seconds(value)));
     });
     body.append(scrolling(table));
     detailsSection(body, 'Environment');
@@ -237,26 +242,26 @@ function whyMicro(body, e, ctx) {
     const {measured, best, scores, ranks} = ctx, ranked = scores[state.sort].scored.length, hit = scores[state.sort].scored.find(s => s.e === e);
     const fastest = scores[state.sort].scored[0];
     const head = detailsSection(body, 'Why this position');
-    head.append(node('p', 'verdict', hit ? `${ordinal(ranks[state.sort].get(e))} of ${ranked} by ${SORTS[state.sort]}, score ×${hit.score.toFixed(2)}${fastest.e !== e ? `; the leader, ${nameOf(fastest.e)}, has ×${fastest.score.toFixed(2)}` : ''}. ×1 is the fastest time in every counted workload.`
-        : `Not ranked by ${SORTS[state.sort]}: ${missingText(scores[state.sort], e)}.`));
+    head.append(node('p', hit ? 'verdict' : 'verdict verdict-unranked', hit ? `${ordinal(ranks[state.sort].get(e))} of ${ranked} by ${sortName(state.sort)}, score ×${hit.score.toFixed(2)}${fastest.e !== e ? `; the leader, ${nameOf(fastest.e)}, has ×${fastest.score.toFixed(2)}` : ''}. ×1 is the fastest time in every counted workload.`
+        : `Not ranked by ${sortName(state.sort)}: ${missingText(scores[state.sort], e)}.`));
     const {table, body: tbody} = dataTable('detail-table why-table', `${e.system}: each workload against the fastest in its group`, ['Workload', 'This system', 'Fastest', 'Ratio']);
     for (const [key, text] of Object.entries(SORTS)) {
         const view = VIEWS[key], inScore = view.ranked(view.rows), score = scores[key].scored.find(s => s.e === e), r = ranks[key].get(e);
-        const group = tbody.insertRow(); group.className = 'why-category' + (key === state.sort ? ' sorted' : '');
+        const group = tbody.insertRow(); group.className = 'why-category';
         group.append(rowHead(text));
         const cell = group.insertCell(); cell.colSpan = 3;
         cell.append(node('span', 'score-value', score ? `×${score.score.toFixed(2)}` : '—'), node('span', 'row-meta', score ? `${ordinal(r)} of ${scores[key].scored.length}` : missingText(scores[key], e)));
         for (const row of view.rows) {
-            const value = row.value(e), fast = best.get(row), ratio = ratioOf(row, value, fast), tr = tbody.insertRow();
+            const value = row.value(e), fast = best.get(row), ratio = ratioOf(row, value, fast), tr = tbody.insertRow(), times = measured.map(m => row.value(m));
             tr.append(rowHead([node('span', '', row.label), node('span', 'row-meta', inScore.includes(row) ? '' : 'not in score')], 'row-label'));
             tr.insertCell().append(node('span', value === null ? 'cell-missing' : 'metric-value', seconds(value)));
             tr.insertCell().append(node('span', 'metric-value muted', fast === null ? '—' : seconds(fast)));
             const r2 = tr.insertCell(); r2.className = 'ratio-cell';
             if (ratio === null) r2.append(node('span', 'cell-absent', '—'));
-            else { r2.append(node('span', 'ratio-value', `×${ratio.toFixed(2)}`), bar(1 / ratio, 'bar ratio-bar')); }
+            else { r2.append(node('span', 'ratio-value', `×${ratio.toFixed(2)}`)); if (compared(times)) r2.append(timeBar(value, Math.max(...times.filter(t => t !== null)), fast)); }
         }
     }
-    body.append(scrolling(table), node('p', 'fine', `${plural(measured.length, 'system')} in this group · ${tryLabel()} · bars show speed against the fastest, full length is the fastest.`));
+    body.append(scrolling(table), node('p', 'fine', `${plural(measured.length, 'system')} in this group · ${tryLabel()} · each bar is this system's time against the slowest; the tick marks the fastest.`));
 }
 
 
@@ -298,15 +303,10 @@ function operationResults(row, groups) {
     const blocks = groups.map(({title, ctx}) => {
         const values = ctx.measured.map(e => ({e, t: row.value(e)})), timed = values.filter(x => x.t !== null).sort((a, b) => a.t - b.t);
         const block = node('div', 'result-group'); if (groups.length > 1) block.append(node('h5', '', title));
-        block.append(resultBars(`${row.label}: batch time per system, ${title}`, timed, values.filter(x => x.t === null).map(x => x.e), nameOf));
+        block.append(resultBars(`${row.label}: batch time per system, ${title}`, timed, values.filter(x => x.t === null).map(x => ({e: x.e, word: 'Failed'})), nameOf));
         return block;
     });
     el('operation-results').replaceChildren(...blocks.length ? [...blocks, node('p', 'fine', `Lower is faster · ${tryLabel()}`)] : [node('p', 'fine', 'No results yet.')]);
-}
-// A score column's or workload's "?" opens that operation's definition below the board and moves focus to it.
-function showOperation(op) {
-    state.op = op; writeHash(operationHash()); render();
-    el('dataset').scrollIntoView({block: 'start'}); el(`operation-${op}`).focus({preventScroll: true});
 }
 function renderOperations(groups) {
     if (!allRows.some(r => r.op === state.op)) state.op = allRows[0].op;
@@ -338,12 +338,11 @@ function renderDataset() {
     el('suite-badge').textContent = suite.suite;
     el('method').textContent = `seed ${suite.seed} · ${suite.chain_length}-branch chain · isolated writes`;
     const latest = data.filter(e => !e.mock).map(e => e.date).sort().at(-1);  // a mock's date never claims a fresh run
-    el('updated').textContent = latest || 'No published runs'; el('updated').title = 'Latest measured run';
+    el('updated').textContent = latest ? `Last run ${latest}` : 'No published runs yet';
 }
 function renderMicro() {
     renderChips();
-    choice(el('selectors-mode'), {first: 'First try', best: 'Best repeat'}, 'mode');
-    el('sort-metric').replaceChildren(...Object.entries(SORTS).map(([k, text]) => option(k, `${text} score`))); el('sort-metric').value = state.sort;
+    choice(el('selectors-mode'), {first: 'First try', best: 'Best repeat'}, 'mode', () => writeHash(boardHash()));
     const shown = data.filter(e => Object.values(FILTERS).every(f => f(e))), filtered = Object.keys(CHIPS).some(k => Object.values(state[k]).some(v => !v));
     el('reset-filters').hidden = !filtered;
     el('shown').textContent = `${plural(shown.length, 'system')}${filtered ? ' · filtered' : ''}`;

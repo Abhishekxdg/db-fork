@@ -122,14 +122,16 @@ function groupStats(g, key) {
     const timed = g.rows.map(c => ({c, t: completion(c, key)})).filter(x => x.t !== null).sort((a, b) => a.t - b.t);
     return {timed, fastest: timed.length ? timed[0].t : null, rank: ranksOf(timed, 'c', 't')};
 }
-// A cell is its result and nothing else: a time, marked and shaded against the fastest in its column, or the workflow's status.
+// A cell is its result and nothing else: a time, marked and shaded against the fastest in its column when the column
+// compares at least two times, or the workflow's status.
 function macroCell(tr, c, key, stats) {
     const status = statusOf(c, key), a = c.attempts[key], t = completion(c, key), td = tr.insertCell(), value = node('span', 'wf-value');
-    td.className = `wf-cell status-${status}` + (key === state.rank ? ' sorted' : '');
+    td.className = `wf-cell status-${status}`;
     if (t !== null) {
-        if (t === stats.fastest) value.append(bestMark('Fastest in this workflow'));
+        const comparison = compared(stats.timed.map(x => x.t));
+        if (comparison && t === stats.fastest) value.append(bestMark('Fastest in this workflow'));
         value.append(node('span', 'metric-value', seconds(t)));
-        shade(td, stats.fastest, t);
+        if (comparison) shade(td, stats.fastest, t);
     } else value.append(statusIcon(status), node('span', 'wf-status', STATUS[status].label));
     td.append(value);
     const unsupported = unsupportedOps(a.evidence);
@@ -137,27 +139,29 @@ function macroCell(tr, c, key, stats) {
     if (a.outcome.reasons.length) td.title = a.outcome.reasons.join('; ');
     else if (status === 'timed_out') td.title = 'The deadline ended the attempt; its partial elapsed time is in the details';
 }
-// The workflow board: a row per campaign, a column per workflow, ranked by one chosen workflow's completion time.
+// The workflow board, a data table: a row per campaign, a column per workflow, sorted by one workflow's completion time from
+// its header, and a last column with how many workflows completed beside the row's Details button.
 function macroTable(g, keys, empty = null) {
     const stats = Object.fromEntries(keys.map(k => [k, groupStats(g, k)])), sortable = g.rows.length > 0;
     const {table, head, body} = dataTable('board workflow-table', `Agent workflows: completion time per system and workflow${sortable ? `, ranked by ${workflow(state.rank).name}` : ''}`, [colHead('System', 'system-col')]);
     for (const key of keys) {
-        const th = sortable ? sortHeader(workflow(key).name, key === state.rank, () => { state.rank = key; writeHash(boardHash()); }, `rank-${key}-${g.group}`) : colHead(workflow(key).name);
-        const meta = node('span', 'wf-meta'); meta.append(node('span', 'wf-id', SCENARIOS[key].split(' ')[0]), definitionButton(`What ${workflow(key).name} does`, () => showDefinition(key)));
-        th.classList.add('wf-col'); th.append(meta); head.append(th);
+        const th = sortable ? sortHeader(workflow(key).name, key === state.rank, state.rankDesc, descending => { state.rank = key; state.rankDesc = descending; writeHash(boardHash()); }, `rank-${key}-${g.group}`) : colHead(workflow(key).name);
+        th.classList.add('wf-col'); head.append(th);
     }
-    head.append(colHead('Completed', 'done-col'));
+    head.append(colHead('Completed', 'done-col'));  // with the row's Details, the table's action column
     const ranked = stats[state.rank] || groupStats(g, state.rank);
-    const order = [...ranked.timed.map(x => x.c), ...g.rows.filter(c => !ranked.rank.has(c)).sort((a, b) => a.system.localeCompare(b.system) || a.machine.localeCompare(b.machine))];
+    const order = sortedRows(ranked.timed.map(x => x.c), g.rows.filter(c => !ranked.rank.has(c)).sort((a, b) => a.system.localeCompare(b.system) || a.machine.localeCompare(b.machine)), state.rankDesc);
     for (const c of order) {
         const tr = body.insertRow();
-        tr.append(systemHeader(ranked.rank.get(c), c, c.system, [`v${c.version}`, c.started.slice(0, 10)], opener => showCampaign(c, opener)));
+        const th = systemHeader(ranked.rank.get(c), c, c.system, [`v${c.version}`, c.started.slice(0, 10)]); tr.append(th);
+        if (!ranked.rank.has(c)) th.title = `Not ranked by ${workflow(state.rank).name}: ${STATUS[statusOf(c, state.rank)].label}`;
         for (const key of keys) macroCell(tr, c, key, stats[key]);
         const cell = tr.insertCell(); cell.className = 'done-cell';
         const verified = keys.filter(k => statusOf(c, k) === 'verified').length, strip = node('span', 'status-strip');
         strip.setAttribute('role', 'img'); strip.setAttribute('aria-label', `${verified} of ${keys.length} workflows completed`);
         for (const k of keys) { const seg = node('span', `strip-seg status-${statusOf(c, k)}`); seg.title = `${workflow(k).name}: ${STATUS[statusOf(c, k)].label}`; strip.append(seg); }
-        cell.append(node('span', 'done-count', `${verified} / ${keys.length}`), strip);
+        const summary = node('span', 'done-summary'), line = node('span', 'done-line'); summary.append(node('span', 'done-count', `${verified} / ${keys.length}`), strip);
+        line.append(summary, detailsButton(c.system, opener => showCampaign(c, opener), slug('details', c.folder, c.machine))); cell.append(line);
     }
     if (!g.rows.length && empty) { const tr = body.insertRow(); tr.className = 'empty-row'; const td = tr.insertCell(); td.setAttribute('colspan', String(keys.length + 2)); td.append(empty); }
     return scrolling(table, 'Scroll sideways to see every workflow.');
@@ -171,13 +175,14 @@ function macroGroup(g, keys, total) {
     const box = node('section', 'board-group'), heading = node('div', 'group-heading'), c = g.rows[0];
     heading.append(node('h2', '', (c.environment || {}).cpu || c.machine),
         parts([plural(g.rows.length, 'system'), ...machineParts(c), total > 1 ? `revision ${c.commit.slice(0, 7)}` : null], 'group-count'));
+    if (keys.some(k => groupStats(g, k).timed.length >= 2)) heading.append(heatKey('Shading: darker mint is closer to the fastest completion time in its column'));
     box.append(heading, macroTable(g, keys));
     return box;
 }
 // Where a campaign came from: sources, runtime and machine.
 function provenance(c) {
     const env = c.environment || {};
-    return [['Campaign', c.campaign_id], ['Comparison group', c.group], ['Git commit', c.commit], ['Source SHA-256', c.source_sha256],
+    return [['Run ID', c.campaign_id], ['Comparison group', c.group], ['Git commit', c.commit], ['Source SHA-256', c.source_sha256],
         ['Dependency lock SHA-256', c.lock_sha256], ['Python', c.python], ['Platform', c.platform], ['CPU', env.cpu || 'unknown'],
         ['CPU count', env.cpus ?? 'unknown'], ['Memory', gib(env.memory_bytes, 1) || 'unknown'], ['Started', c.started], ['Finished', c.finished]];
 }
@@ -185,12 +190,10 @@ let macroGroupsShown = [];
 function renderMacro() {
     const keys = Object.keys(SCENARIOS);
     if (!keys.includes(state.rank)) state.rank = keys[0];
-    el('macro-rank').replaceChildren(...keys.map(k => option(k, workflow(k).name))); el('macro-rank').value = state.rank;
     const slots = campaignSlots(), campaigns = [...slots.values()].flat();
     state.campaign = new Set([...state.campaign].filter(id => campaigns.some(c => c.campaign_id === id)));  // an id from another build never lingers in the URL
     const chosen = [...slots.values()].map(list => list.find(c => state.campaign.has(c.campaign_id)) || list[0]);
     macroGroupsShown = groupsOf(chosen);
-    el('macro-filters').hidden = !chosen.length;
     // Without any campaign the table shell stays, with one honest row: no fabricated result.
     el('macro-groups').replaceChildren(...macroGroupsShown.length ? macroGroupsShown.map(g => macroGroup(g, keys, macroGroupsShown.length))
         : [macroTable({group: '', rows: []}, keys, node('span', 'empty-cell', 'No published results yet. Results appear here once a validated run is published.'))]);
@@ -204,8 +207,8 @@ function showCampaign(c, opener) {
     const g = macroGroupsShown.find(x => x.rows.includes(c)) || {group: c.group, rows: [c]};
     const keys = Object.keys(SCENARIOS), rankStats = groupStats(g, state.rank);
     const body = openDetails(c.system, `v${c.version} · ${c.machine} · ${c.started.slice(0, 10)}`, c.source, opener);
-    const r = rankStats.rank.get(c), t = completion(c, state.rank), reason = c.attempts[state.rank].outcome.reasons[0];
-    body.append(node('p', 'verdict', r ? `${ordinal(r)} of ${rankStats.timed.length} by ${workflow(state.rank).name}: ${seconds(t)}${t === rankStats.fastest ? ', the fastest' : rankStats.fastest > 0 ? `, ×${(t / rankStats.fastest).toFixed(2)} the fastest` : ''}.`
+    const r = rankStats.rank.get(c), t = completion(c, state.rank), reason = c.attempts[state.rank].outcome.reasons[0], alone = rankStats.timed.length === 1;
+    body.append(node('p', r ? 'verdict' : 'verdict verdict-unranked', r ? `${ordinal(r)} of ${rankStats.timed.length} by ${workflow(state.rank).name}: ${seconds(t)}${alone ? ', the only completed time in this comparison' : t === rankStats.fastest ? ', the fastest' : rankStats.fastest > 0 ? `, ×${(t / rankStats.fastest).toFixed(2)} the fastest` : ''}.`
         : `Not ranked by ${workflow(state.rank).name}: ${STATUS[statusOf(c, state.rank)].label}${reason ? `, ${reason}` : ''}.`));
     detailsSection(body, 'Workflows', `${coverageText(c)}. Bars share one scale per workflow and the tick marks the fastest time in this comparison. Open a workflow for its evidence.`);
     const list = node('div', 'why-list');
@@ -234,15 +237,13 @@ function showCampaign(c, opener) {
 // One workflow in the details: its time and rank against the fastest, or its status and first reason; open for the evidence.
 function workflowDetails(c, key, stats) {
     const status = statusOf(c, key), time = completion(c, key);
-    const item = node('details', 'why-item' + (key === state.rank ? ' sorted' : '')), summary = node('summary', 'why-row');
+    const item = node('details', 'why-item'), summary = node('summary', 'why-row');
     const name = node('span', 'why-name'); name.append(node('strong', '', workflow(key).name), node('span', 'row-meta', SCENARIOS[key]));
     const value = node('span', 'why-value');
     if (time !== null) {
-        const slowest = Math.max(...stats.timed.map(x => x.t));
-        value.append(node('span', 'metric-value', seconds(time)), node('span', 'row-meta', `${ordinal(stats.rank.get(c))} of ${stats.timed.length}`));
-        const track = bar(slowest ? time / slowest : 1, 'bar time-bar');
-        if (slowest) { const tick = node('span', 'bar-tick'); tick.style.left = `${(stats.fastest / slowest * 100).toFixed(1)}%`; track.append(tick); }
-        name.append(track);
+        const slowest = Math.max(...stats.timed.map(x => x.t)), comparison = stats.timed.length >= 2;
+        value.append(node('span', 'metric-value', seconds(time)), node('span', 'row-meta', comparison ? `${ordinal(stats.rank.get(c))} of ${stats.timed.length}` : 'the only completed time'));
+        if (comparison && slowest) name.append(timeBar(time, slowest, stats.fastest));
     } else value.append(chip(status), node('span', 'row-meta', c.attempts[key].outcome.reasons[0] || ''));
     summary.append(name, value, icon(ICON.chevron, 'icon why-chevron'));
     item.append(summary, attemptBody(c.attempts[key]));
@@ -253,11 +254,11 @@ function workflowDetails(c, key, stats) {
 function attemptBody(a) {
     const e = a.evidence || {}, child = a.child || {}, box = node('div', 'why-body'), outcome = node('dl', 'outcome');
     const fact = (term, value, note) => { const pair = node('div'), dd = node('dd'); dd.append(typeof value === 'string' ? node('span', 'outcome-value', value) : value, node('span', 'row-meta', note)); pair.append(node('dt', '', term), dd); outcome.append(pair); };
-    fact('Status', chip(a.outcome.status), a.outcome.reasons.length ? a.outcome.reasons[0] : 'All required work verified');
+    fact('Status', chip(a.outcome.status), a.outcome.status === 'verified' ? 'All required work verified' : '');  // a failure's first reason already heads this workflow's row
     fact('Completion time', a.outcome.status === 'verified' ? timeOf(a.outcome.completion_sec) : '—', a.outcome.status === 'verified' ? 'Workflow running time including the stop of background traffic; schema and seed setup and database cleanup excluded' : typeof a.outcome.elapsed_sec !== 'number' ? 'No elapsed time recorded' : `Partial elapsed ${seconds(a.outcome.elapsed_sec)}, not a completion time`);
     fact('Setup time', timeOf(a.outcome.setup_sec), 'Schema and seed data, before the clock starts');
     box.append(outcome);
-    if (a.outcome.reasons.length > 1) box.append(tagList(a.outcome.reasons, 'attempt-reasons'));
+    if (a.outcome.reasons.length > 1) box.append(tagList(a.outcome.reasons.slice(1), 'attempt-reasons'));  // the others, each named once
     const work = e.work && typeof e.work === 'object' ? e.work : {}, errors = Array.isArray(e.worker_errors) ? e.worker_errors : null, verbs = e.failed_verbs && typeof e.failed_verbs === 'object' ? e.failed_verbs : {};
     const tallyOf = v => v && typeof v === 'object' ? Object.entries(v).map(([k, n]) => `${k} ×${n}`).join(', ') || 'none' : 'malformed, not a tally';
     const counts = node('div', 'stacks');
@@ -304,8 +305,10 @@ function attemptBody(a) {
     if (e.metrics && typeof e.metrics === 'object') opParts.push(metaGrid(Object.entries(e.metrics).filter(([, v]) => typeof v !== 'object').map(([k, v]) => [k, typeof v === 'number' ? Number(v.toFixed(4)) : v])));
     const unsupported = unsupportedOps(e);
     box.append(node('p', 'fine', unsupported.length ? `Unsupported in this attempt: ${unsupported.join(', ')}.` : `${VERBS.filter(v => record(opCounts[v.toUpperCase()]).ok).length} of ${VERBS.length} branch verbs exercised successfully.`), disclosure('Verbs, SQL breakdown and metrics', ...opParts));
-    const raw = node('a', 'text-link', 'Raw attempt JSON ↗'); raw.href = a.source; raw.target = '_blank'; raw.rel = 'noopener';
-    const log = child.log_tail ? [node('p', 'fine', 'Last lines of the child log'), node('pre', 'log-tail', child.log_tail)] : [];
+    const raw = node('a', 'text-link', 'Raw attempt JSON '); raw.href = a.source; raw.target = '_blank'; raw.rel = 'noopener';
+    const arrow = node('span', '', '↗'); arrow.setAttribute('aria-hidden', 'true'); raw.append(arrow, node('span', 'sr-only', ' (opens in a new tab)'));
+    const tail = node('pre', 'log-tail', child.log_tail); tail.tabIndex = 0; tail.setAttribute('aria-label', 'Last lines of the child log');  // it scrolls, so a keyboard must reach it
+    const log = child.log_tail ? [node('p', 'fine', 'Last lines of the child log'), tail] : [];
     box.append(disclosure('Attempt record', metaGrid([['Attempt', a.attempt_id], ['Date', a.date], ['Workload identity SHA-256', a.config_sha256], ['Base config SHA-256', a.base_config_sha256],
         ['Child ended', a.child ? `${child.ended}${child.exit_code === null ? '' : ` (exit code ${child.exit_code})`}` : 'no record'], ['Runtime cap', a.child ? `${child.deadline_sec}s${ENDINGS[child.ended] ? ` · ${ENDINGS[child.ended]}` : ''}` : null],
         ['Launch error', child.error], ['Seed', e.seed]]), ...log, raw));
@@ -314,7 +317,6 @@ function attemptBody(a) {
 function renderStatusRules() {
     for (const [status, rule] of Object.entries(STATUS_RULES)) { const pair = node('div'), term = node('dt'); term.append(chip(status)); pair.append(term, node('dd', '', rule)); el('status-rules').append(pair); }
 }
-function wireMacro() { bindSelect('macro-rank', value => { state.rank = value in SCENARIOS ? value : Object.keys(SCENARIOS)[0]; writeHash(boardHash()); }); }
 
 // ---------------------------------------------------------------- Workflow definitions
 const DIAGRAM_HEIGHTS = {rl_env: 360, context_mgmt: 400, multi_agent: 352, dev_agent: 352, ops_agent: 376, data_agent: 400};  // CSS px of each 2x PNG
@@ -379,21 +381,16 @@ function workflowResults(key) {
     const g = macroGroupsShown[0], box = el('workflow-results');
     if (!g) { box.replaceChildren(node('p', 'fine', 'No results yet.')); return; }
     const {timed} = groupStats(g, key);
-    if (!timed.length) { box.replaceChildren(node('p', 'fine', 'No completion time for this workflow yet.')); return; }
-    const list = resultBars(`${workflow(key).name}: completion time per system`, timed.map(({c, t}) => ({e: c, t})));
+    const missing = g.rows.filter(c => completion(c, key) === null).map(c => ({e: c, word: STATUS[statusOf(c, key)].label}));
+    const list = resultBars(`${workflow(key).name}: completion time per system`, timed.map(({c, t}) => ({e: c, t})), missing);
     const note = node('p', 'fine'); note.append(parts(['Lower is faster', (g.rows[0].environment || {}).cpu, ...machineParts(g.rows[0])])); box.replaceChildren(list, note);
-}
-// A column's "?" opens that workflow's definition below the board and moves focus to it.
-function showDefinition(key) {
-    state.workflow = key; writeHash(workflowsHash()); render();
-    el('workflows').scrollIntoView({block: 'start'}); el(`workflow-${key}`).focus({preventScroll: true});
 }
 function renderExplainer(keys) {
     if (!keys.includes(state.workflow)) state.workflow = keys[0];
     el('selectors-workflow').replaceChildren(...keys.map(k => explorerOption(`workflow-${k}`, workflow(k).name, SCENARIOS[k], `${workflow(k).name} (${SCENARIOS[k]})`,
         state.workflow === k, () => { state.workflow = k; writeHash(workflowsHash()); })));
     const current = workflow(state.workflow);
-    el('workflow-name').textContent = current.name; el('workflow-id').textContent = `Upstream scenario ${SCENARIOS[state.workflow]}`;
+    el('workflow-name').textContent = current.name; el('workflow-id').textContent = SCENARIOS[state.workflow];
     el('workflow-caption').textContent = current.caption || ''; el('workflow-caption').hidden = !current.caption;
     el('workflow-ops').replaceChildren(...(current.ops || []).map(op => node('li', '', op))); el('workflow-ops-block').hidden = !current.ops;
     el('workflow-alt').textContent = current.alt || ''; el('workflow-text').hidden = !current.alt;

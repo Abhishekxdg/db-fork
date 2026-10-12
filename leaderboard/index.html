@@ -8,41 +8,34 @@
 <title>BranchBench leaderboard</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='10' fill='%23428c80'/%3E%3Cpath d='M13 10v20m0-10h7q7 0 7-7v-3' fill='none' stroke='white' stroke-width='3'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="styles.css">
-<script src="data.js"></script>
-<script src="macro-data.js"></script>
 </head>
 <body>
 <a class="skip-link" href="#main-content">Skip to content</a>
-<div class="dashboard">
 <header class="site-header shell">
     <a class="brand" href="#leaderboard" aria-label="BranchBench home">
         <svg class="brand-mark" width="38" height="38" viewBox="0 0 38 38" aria-hidden="true"><rect width="38" height="38" rx="10" fill="currentColor"/><path d="M12 9v20m0-10h7q7 0 7-7V9"/><g><circle cx="12" cy="9" r="3"/><circle cx="12" cy="29" r="3"/><circle cx="26" cy="9" r="3"/></g></svg>
         <span class="brand-name">BranchBench<span class="brand-period">.</span></span>
     </a>
-    <nav class="header-nav" aria-label="Main navigation"><a class="nav-link" id="nav-board" href="#agent-workflows">Leaderboard</a><a class="nav-link" id="nav-workflows" href="#workflows">Workflows</a><a class="nav-link" id="nav-operations" href="#dataset">Operations</a><a class="nav-link" id="doc-nav" href="README.md">Methodology <span aria-hidden="true">↗</span></a><a class="nav-link" id="nav-run" href="run.html">Run a benchmark</a></nav>
-    <a class="button source-link" href="https://github.com/elaineang/db-fork">GitHub <span aria-hidden="true">↗</span></a>
+    <nav class="header-nav" aria-label="Main navigation"><a class="nav-link" id="nav-board" href="#agent-workflows">Leaderboard</a><a class="nav-link" id="nav-workflows" href="#workflows">Workflows</a><a class="nav-link" id="nav-operations" href="#dataset">Operations</a><a class="nav-link" id="doc-nav" href="README.md">Methodology <span aria-hidden="true">↗</span></a></nav>
+    <div class="header-actions"><a class="button" href="https://github.com/elaineang/db-fork">GitHub <span aria-hidden="true">↗</span></a><a class="button button-primary" id="nav-run" href="run.html">Run a benchmark</a></div>
 </header>
 <main class="shell" id="main-content">
 <section id="leaderboard" aria-labelledby="leaderboard-title">
-    <h1 class="page-title" id="leaderboard-title">Leaderboard</h1>
+    <h1 class="page-title" id="leaderboard-title" tabindex="-1">Leaderboard</h1>
     <div class="board-card">
         <div class="suite-tabs" id="selectors-suite" role="tablist" aria-label="Benchmark suite"></div>
         <div class="suite-view" id="macro-view" role="tabpanel" aria-labelledby="tab-macro">
-            <div class="filter-bar" id="macro-filters">
-                <label class="chip chip-select" for="macro-rank"><span class="chip-label">Rank by</span><select id="macro-rank"></select></label>
-            </div>
             <div id="macro-groups"></div>
         </div>
         <div class="suite-view" id="micro-view" role="tabpanel" aria-labelledby="tab-micro" hidden>
             <div class="filter-bar">
                 <div class="segmented" role="group" aria-label="Try selection"><div id="selectors-mode"></div></div>
-                <label class="chip chip-select" for="sort-metric"><span class="chip-label">Rank by</span><select id="sort-metric"></select></label>
                 <details class="chip" id="chip-hosted"><summary><span class="chip-label">Hosting</span> <span class="chip-value" id="value-hosted"></span></summary><div class="chip-menu" id="selectors-hosted" role="group" aria-label="Hosting"></div></details>
                 <details class="chip" id="chip-system"><summary><span class="chip-label">Systems</span> <span class="chip-value" id="value-system"></span></summary><div class="chip-menu" id="selectors-system" role="group" aria-label="Systems"></div></details>
                 <details class="chip" id="chip-machine"><summary><span class="chip-label">Machine</span> <span class="chip-value" id="value-machine"></span></summary><div class="chip-menu" id="selectors-machine" role="group" aria-label="Machine"></div></details>
                 <details class="chip" id="chip-tag"><summary><span class="chip-label">Capabilities</span> <span class="chip-value" id="value-tag"></span></summary><div class="chip-menu" id="selectors-tag" role="group" aria-label="Capabilities"></div></details>
                 <button class="chip-reset" id="reset-filters" type="button" hidden>Reset filters</button>
-                <p class="filter-meta"><span id="shown" aria-live="polite"></span> · Last run <span id="updated"></span></p>
+                <p class="filter-meta"><span id="shown" aria-live="polite"></span> · <span id="updated"></span></p>
             </div>
             <div class="empty-state" id="empty-state" hidden><div><h2 class="empty-title" id="empty-title"></h2><p class="empty-description" id="empty-description"></p></div><button class="button" id="clear-empty-filters" type="button" hidden>Reset filters</button></div>
             <div id="groups"></div>
@@ -51,7 +44,7 @@
 
     <div class="suite-more" id="macro-more">
         <section class="explorer-section" id="workflows" aria-labelledby="workflows-title">
-            <div class="section-head"><h2 id="workflows-title">The workflows</h2><p>Jobs an AI agent runs against a branching database. Pick one to watch its branch history.</p></div>
+            <div class="section-head"><h2 id="workflows-title" tabindex="-1">The workflows</h2><p>Jobs an AI agent runs against a branching database. Pick one to watch its branch history.</p></div>
             <div class="explorer">
                 <div class="explorer-list" id="selectors-workflow" role="group" aria-label="Workflow"></div>
                 <article class="explorer-stage" aria-labelledby="workflow-name">
@@ -67,7 +60,7 @@
             </div>
         </section>
         <details class="disclosure" id="macro-guide">
-            <summary>How workflows are timed and judged</summary>
+            <summary id="macro-guide-summary">How workflows are timed and judged</summary>
             <div class="disclosure-body">
                 <dl class="rule-list">
                     <div><dt>Completion time</dt><dd>Starts once the schema and seed data are in place. Stops when the last workflow step has finished and any background traffic has stopped. Setup and database cleanup are recorded separately.</dd></div>
@@ -76,7 +69,7 @@
                     <div><dt>Shading</dt><dd>A darker cell is closer to the fastest time in its column; the check marks the fastest.</dd></div>
                 </dl>
                 <dl class="status-rules" id="status-rules"></dl>
-                <p class="fine"><a class="text-link" id="doc-macro" href="README.md#agent-workflows">Full methodology ↗</a></p>
+                <p class="fine"><a class="text-link" id="doc-macro" href="README.md#agent-workflows">Full methodology <span aria-hidden="true">↗</span></a></p>
             </div>
         </details>
         <div id="macro-excluded"></div>
@@ -86,7 +79,7 @@
         <div id="breakdowns"></div>
         <div id="excluded"></div>
         <section class="explorer-section" id="dataset" aria-labelledby="dataset-title">
-            <div class="section-head"><h2 id="dataset-title">The operations</h2><p>Branch, read and write operations on a small CH-benCHmark-style seed, not the full benchmark suites. Pick one to watch what is timed.</p></div>
+            <div class="section-head"><h2 id="dataset-title" tabindex="-1">The operations</h2><p>Branch, read and write operations on a small CH-benCHmark-style seed, not the full benchmark suites. Pick one to watch what is timed.</p></div>
             <div class="explorer">
                 <div class="explorer-list" id="selectors-operation" role="group" aria-label="Operation"></div>
                 <article class="explorer-stage" aria-labelledby="operation-name">
@@ -119,7 +112,7 @@
                 <div class="disclosure-body">
                     <dl class="rule-list">
                         <div><dt>First query</dt><dd>Time to first query on a new branch.</dd></div>
-                        <div><dt>Reads &amp; writes</dt><dd>Geometric mean of the selected workloads' ratios. None selected means all.</dd></div>
+                        <div><dt>Reads &amp; writes</dt><dd>Geometric mean of the ticked workloads' ratios. At least one workload is always counted, and the column header names the count.</dd></div>
                         <div><dt>Load</dt><dd>Load time only; provisioning is excluded.</dd></div>
                         <div><dt>Best repeat</dt><dd>The faster of tries 2 and 3; both must succeed.</dd></div>
                         <div><dt>Rank</dt><dd>By the chosen score only. Tied scores share a rank. There is no overall score.</dd></div>
@@ -130,19 +123,20 @@
             </details>
         </section>
     </div>
-    <noscript><p>Enable JavaScript to view results. <a href="https://github.com/elaineang/db-fork/blob/main/leaderboard/README.md">Methodology ↗</a></p></noscript>
+    <noscript><p>Enable JavaScript to view results. <a href="https://github.com/elaineang/db-fork/blob/main/leaderboard/README.md">Methodology <span aria-hidden="true">↗</span></a></p></noscript>
 </section>
 </main>
 <footer class="site-footer shell"><span>BranchBench <span aria-hidden="true">·</span> Open benchmarks, every attempt published.</span><a id="doc-footer" href="README.md#what-is-measured">How we measure <span aria-hidden="true">↗</span></a></footer>
-</div>
 <dialog id="run-dialog" class="dialog" aria-labelledby="run-title" aria-describedby="run-subtitle">
     <header class="dialog-head">
         <div class="dialog-title"><h2 id="run-title"></h2><p id="run-subtitle"></p></div>
         <button class="close-run" id="close-run" type="button" aria-label="Close details"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8m0-8l-8 8"/></svg></button>
     </header>
     <div class="dialog-body" id="run-body" tabindex="0" role="region" aria-label="Result details"></div>
-    <footer class="dialog-foot"><span>Every attempt, nothing hidden.</span><a class="text-link" id="run-source" target="_blank" rel="noopener">Raw summary JSON ↗</a></footer>
+    <footer class="dialog-foot"><span>Every attempt, nothing hidden.</span><a class="text-link" id="run-source" target="_blank" rel="noopener">Raw record JSON <span aria-hidden="true">↗</span><span class="sr-only"> (opens in a new tab)</span></a></footer>
 </dialog>
+<script src="data.js"></script>
+<script src="macro-data.js"></script>
 <script src="js/dom.js"></script>
 <script src="js/details.js"></script>
 <script src="js/scenes.js"></script>
