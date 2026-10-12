@@ -1,7 +1,7 @@
 /* Branch-history scenes drawn on a 2D Canvas: the workflow definitions and the operation definitions share one
    drawing language. x is a fraction of the drawable width, a lane is one branch row, times are seconds of one
    sequence that plays once when the scene is seen and then holds. Lines and curves grow from an existing commit,
-   beads are commits, open circles are new branch heads, rings are reads, squares are writes, and a ref chip moves on
+   beads are commits, open circles are new branch heads, diamonds are reads, squares are writes, and a ref chip moves on
    its own and never adds a commit. Nothing is measured: spacing and counts are illustrative. Lane colors, ink and
    type come from the stylesheet's tokens. */
 const SCENE_SECONDS = 4.5;
@@ -11,7 +11,7 @@ const D = (lane, x, t, fade) => ({kind: 'dot', lane, x, t, fade});
 const R = (name, lane, at, end, below) => ({kind: 'ref', name, lane, at, end, below});  // at: [[t, x, lane?], ...]; the chip glides between keyframes
 const T = (lane, x, t, text, above, align = 'center') => ({kind: 'text', lane, x, t, text, above, align});
 const H = (lane, x, t, fade) => ({kind: 'head', lane, x, t, fade});  // a new branch head with no commit of its own
-const Q = (lane, x, t, n = 1) => ({kind: 'read', lane, x, t, n});  // rows read at a head: n rings for a range
+const Q = (lane, x, t, n = 1) => ({kind: 'read', lane, x, t, n});  // rows read at a head: n diamonds for a range
 const W = (lane, x, t, n = 1) => ({kind: 'write', lane, x, t, n});  // rows written: n squares for a range
 const run = (lane, points, fade) => points.flatMap(([x, t, dot = true], i) => [...(i ? [L(lane, points[i - 1][0], x, points[i - 1][1], t, fade)] : []), ...(dot ? [D(lane, x, t, fade)] : [])]);
 const easeInOut = p => p < .5 ? 4 * p ** 3 : 1 - (-2 * p + 2) ** 3 / 2;
@@ -27,6 +27,56 @@ function compileScene(raw) {
     }
     return {lanes, items: raw.items};
 }
+// Every mark of the finished scene as a box, so a ref chip or a label can be placed where nothing else is drawn.
+function sceneBoxes(spec, X, Y, r, stroke) {
+    const boxes = [], pad = stroke / 2 + 2, box = (x0, y0, x1, y1) => boxes.push([Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1)]);
+    for (const item of spec.items) {
+        if (item.kind === 'line') box(X(item.x1), Y(item.lane) - pad, X(item.x2), Y(item.lane) + pad);
+        else if (item.kind === 'curve') {
+            const x1 = X(item.x1), y1 = Y(item.from), x2 = X(item.x2), y2 = Y(item.to), at = u => [x1 + (x2 - x1) * u, y1 + (y2 - y1) * u * u * (3 - 2 * u)];
+            for (let i = 0; i < 24; i++) { const [ax, ay] = at(i / 24), [bx, by] = at((i + 1) / 24); box(ax - pad, ay - pad, bx + pad, by + pad); }
+        } else if (['dot', 'head'].includes(item.kind)) { const x = X(item.x), y = Y(item.lane), e = r + 3; box(x - e, y - e, x + e, y + e); }
+        else if (item.kind === 'read' || item.kind === 'write') { const x = X(item.x), y = Y(item.lane) + 20, half = (item.n - 1) * 5.5 + 7; box(x - half, y - 7, x + half, y + 7); }
+    }
+    return boxes;
+}
+const meets = (a, b) => a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3];
+// A ref chip sits on its side of the lane at each of its keyframes. One that would cover a line, a mark or another chip
+// slides along the lane to the nearest clear spot, then tries the other side, so a narrow scene never draws a name
+// across the history.
+function placeChips(ctx, spec, boxes, X, Y, w, h, font) {
+    const offsets = new Map(), taken = [];
+    ctx.font = font;
+    for (const item of spec.items) {
+        if (item.kind !== 'ref') continue;
+        const width = ctx.measureText(item.name).width + 14, own = [], side = item.below ? 20 : -20;
+        const spots = [side, -side].flatMap(dy => [0, 8, -8, 16, -16, 24, -24, 32, -32, 48, -48].map(dx => ({dx, dy})));
+        offsets.set(item, item.at.map(([, x, lane = item.lane]) => {
+            const box = ({dx, dy}) => { const cx = Math.min(Math.max(X(x) + dx, width / 2 + 2), w - width / 2 - 2), cy = Y(lane) + dy; return [cx - width / 2 - 2, cy - 12, cx + width / 2 + 2, cy + 12]; };
+            const spot = spots.find(at => { const b = box(at); return b[1] >= 0 && b[3] <= h && ![...boxes, ...taken].some(o => meets(b, o)); }) || spots[0];
+            own.push(box(spot)); return spot;
+        }));
+        taken.push(...own);
+    }
+    return {offsets, boxes: taken};
+}
+// A label goes to the free spot closest to where the scene puts it: its own side of the lane first, then a little further
+// out, then the other side, sliding along the lane as needed. A label with no free spot is left out, never drawn over the
+// history; the caption and the text version carry every step.
+function placeLabels(ctx, spec, boxes, X, Y, w, h, gutter) {
+    const placed = new Map(), free = b => b[0] >= gutter && b[2] <= w - 2 && b[1] >= 2 && b[3] <= h - 2 && !boxes.some(o => meets(b, o));
+    ctx.font = `12px ${token('--sans')}`;
+    for (const item of spec.items) {
+        if (item.kind !== 'text') continue;
+        const width = ctx.measureText(item.text).width, side = item.above ? -1 : 1, spots = [];
+        for (const [flip, out] of [[1, 16], [1, 24], [1, 32], [1, 44], [-1, 16], [-1, 24], [-1, 32], [-1, 44]]) for (const dx of [0, 12, -12, 24, -24, 40, -40, 64, -64, 96, -96, 140, -140, 200, -200, 280, -280]) spots.push({dy: side * flip * out, dx, cost: Math.abs(dx) + (out - 16) * 2 + (flip < 0 ? 60 : 0)});
+        spots.sort((a, b) => a.cost - b.cost);
+        const at = ({dx, dy}) => { const x = X(item.x) + dx, y = Y(item.lane) + dy, left = item.align === 'center' ? x - width / 2 : item.align === 'right' ? x - width : x; return {x, y, b: [left - 3, y - 9, left + width + 3, y + 9]}; };
+        const spot = spots.map(at).find(s => free(s.b));
+        if (spot) { boxes.push(spot.b); placed.set(item, spot); }
+    }
+    return placed;
+}
 function drawScene(ctx, spec, w, h, t, compact) {
     const ink = token('--ink'), muted = token('--muted'), paper = token('--surface'), font = token('--sans');
     const index = Object.fromEntries(spec.lanes.map((l, i) => [l.id, i])), laneOf = id => spec.lanes[index[id]];
@@ -36,7 +86,11 @@ function drawScene(ctx, spec, w, h, t, compact) {
     const gutter = Math.ceil(Math.max(...spec.lanes.flatMap(l => [ctx.measureText(l.name).width, l.sub ? ctx.measureText(l.sub).width * 11 / px : 0]))) + 16;
     const pad = compact ? 8 : 16, gap = (h - 68) / Math.max(1, spec.lanes.length - 1);
     const X = f => gutter + pad + f * (w - gutter - 2 * pad), Y = id => spec.lanes.length === 1 ? h / 2 : 34 + index[id] * gap;
-    const r = compact ? 3.5 : 4.5, stroke = compact ? 1.5 : 2;
+    const r = compact ? 3.5 : 4.5, stroke = compact ? 1.5 : 2, labels = !compact, key = `${w}x${h}`;  // a compact scene keeps lane names and refs only; a wider one adds every label that has room
+    if (spec.layoutKey !== key) {  // computed once per size from the finished scene, so a chip or label never jumps while the scene plays
+        const marks = sceneBoxes(spec, X, Y, r, stroke), chips = placeChips(ctx, spec, marks, X, Y, w, h, `600 11.5px ${font}`), lanes = spec.lanes.map(l => [0, Y(l.id) - 16, gutter, Y(l.id) + 16]);
+        spec.offsets = chips.offsets; spec.layout = labels ? placeLabels(ctx, spec, [...marks, ...chips.boxes, ...lanes], X, Y, w, h, gutter) : new Map(); spec.layoutKey = key;
+    }
     ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.textBaseline = 'middle';
     for (const item of spec.items) {
         if (item.kind === 'line' || item.kind === 'curve') {
@@ -55,29 +109,30 @@ function drawScene(ctx, spec, w, h, t, compact) {
             const p = easeOut(portion(t, item.t, item.t + .3)); if (!p) continue;
             ctx.globalAlpha = soft(item, t); ctx.strokeStyle = laneOf(item.lane).color; ctx.fillStyle = paper; ctx.lineWidth = stroke;
             ctx.beginPath(); ctx.arc(X(item.x), Y(item.lane), (r + 1) * p, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
-        } else if (item.kind === 'read' || item.kind === 'write') {  // rows read (rings) or written (squares), drawn just under the head they touch
+        } else if (item.kind === 'read' || item.kind === 'write') {  // rows read (open diamonds) or written (squares), drawn just under the head they touch
             const p = easeOut(portion(t, item.t, item.t + .35)); if (!p) continue;
             ctx.globalAlpha = p; ctx.strokeStyle = ctx.fillStyle = laneOf(item.lane).color; ctx.lineWidth = 1.5;
             for (let i = 0; i < item.n; i++) {
                 const x = X(item.x) + (i - (item.n - 1) / 2) * 11, y = Y(item.lane) + 20;
                 ctx.beginPath();
-                if (item.kind === 'read') { ctx.arc(x, y, 4.5, 0, Math.PI * 2); ctx.stroke(); } else ctx.fillRect(x - 4, y - 4, 8, 8);
+                if (item.kind === 'read') { ctx.moveTo(x, y - 4.5); ctx.lineTo(x + 4.5, y); ctx.lineTo(x, y + 4.5); ctx.lineTo(x - 4.5, y); ctx.closePath(); ctx.stroke(); } else ctx.fillRect(x - 4, y - 4, 8, 8);
             }
         }
     }
     for (const item of spec.items) {
-        if (item.kind !== 'text' || w < 900) continue;  // scenes under 900px keep lane names and refs only; the caption and text description carry the rest
+        if (item.kind !== 'text') continue;
         const a = portion(t, item.t, item.t + .35); if (!a) continue;
+        const spot = spec.layout.get(item); if (!spot) continue;
         ctx.globalAlpha = a; ctx.fillStyle = muted; ctx.font = `12px ${font}`; ctx.textAlign = item.align;
-        ctx.fillText(item.text, X(item.x), Y(item.lane) + (item.above ? -16 : 16));
+        ctx.fillText(item.text, spot.x, spot.y);
     }
     for (const item of spec.items) {
         if (item.kind !== 'ref') continue;
         let a = portion(t, item.at[0][0] - .25, item.at[0][0]); if (item.end !== undefined) a *= 1 - portion(t, item.end, item.end + .35); if (!a) continue;
-        const keys = item.at.map(([time, x, lane = item.lane]) => ({time, x, lane})), next = keys.findIndex(k => k.time > t), i = next === -1 ? keys.length : next;
+        const offsets = spec.offsets.get(item), keys = item.at.map(([time, x, lane = item.lane], k) => ({time, lane, x: X(x) + offsets[k].dx, y: Y(lane) + offsets[k].dy})), next = keys.findIndex(k => k.time > t), i = next === -1 ? keys.length : next;
         const from = keys[Math.max(0, i - 1)], to = keys[Math.min(keys.length - 1, i)], p = i === 0 || i === keys.length ? 1 : easeInOut(portion(t, from.time, to.time));
-        const x = X(from.x) + (X(to.x) - X(from.x)) * p, y = Y(from.lane) + (Y(to.lane) - Y(from.lane)) * p;
-        ctx.font = `600 11.5px ${font}`; const width = ctx.measureText(item.name).width + 14, height = 20, cy = item.below ? y + 10 + height / 2 : y - 10 - height / 2;
+        const x = from.x + (to.x - from.x) * p, cy = from.y + (to.y - from.y) * p;  // the chip's center: beside its commit, as placed for this size
+        ctx.font = `600 11.5px ${font}`; const width = ctx.measureText(item.name).width + 14, height = 20;
         const cx = Math.min(Math.max(x, width / 2 + 2), w - width / 2 - 2);  // the chip, border included, stays inside the canvas; the commit it names does not move
         ctx.globalAlpha = a; ctx.fillStyle = paper; ctx.strokeStyle = laneOf(to.lane).color; ctx.lineWidth = 1.25;
         ctx.beginPath(); ctx.roundRect(cx - width / 2, cy - height / 2, width, height, 6); ctx.fill(); ctx.stroke();

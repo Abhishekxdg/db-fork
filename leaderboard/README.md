@@ -134,7 +134,7 @@ least one stays ticked, so the score never silently counts all of them. A
 trade-off plot beside it compares the first-query and reads & writes scores.
 **The operations** defines every operation the way the workflows are defined: a
 picker, a branch-history diagram in the same drawing language (beads are
-commits, open circles are new branch heads, rings are reads, squares are writes),
+commits, open circles are new branch heads, diamonds are reads, squares are writes),
 what is timed, and each system's batch time. A workload's name in the heatmap
 links to that definition (`#dataset?operation=read`). The dataset table counts,
 checksum and seed, and the scoring rules, are collapsed below it; the bare
@@ -450,7 +450,11 @@ screens scroll the workflow columns past a pinned system column.
 
 **The workflows**, directly below the board, defines each workflow
 (`#workflows?workflow=ops_agent`): what it simulates, an animated branch history
-drawn on a Canvas (played once when seen, then held; illustrative, not a trace),
+drawn on a Canvas (played once when seen, then held; illustrative, not a trace;
+each label is placed clear of every line, commit, mark and ref chip, and a label
+with no clear spot is left out, and the caption and **Read the history as text**
+carry every step; a ref chip that would cross a line slides along its lane or
+moves to its other side),
 the branch and history operations it exercises, and the completion times of the
 comparable systems for that workflow.
 

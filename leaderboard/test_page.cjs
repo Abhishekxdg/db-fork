@@ -53,7 +53,7 @@ class Element {
         if (this.tag !== 'canvas' || type !== '2d' || this.ownerDocument.noCanvas) return null;
         if (!this.ctx) {
             const target = {ops: [], measureText: text => ({width: String(text).length * 6.5})};
-            this.ctx = new Proxy(target, {get: (t, name) => name in t ? t[name] : (...args) => { t.ops.push([name, args]); }, set: (t, name, value) => { t[name] = value; return true; }});
+            this.ctx = new Proxy(target, {get: (t, name) => name in t ? t[name] : (...args) => { t.ops.push([name, args, {font: t.font, align: t.textAlign, lineWidth: t.lineWidth}]); }, set: (t, name, value) => { t[name] = value; return true; }});
         }
         return this.ctx;
     }
@@ -728,7 +728,7 @@ for (const key of KEYS) assert.equal(scenePage.run(`DIAGRAM_HEIGHTS.${key}`) * 2
 assert.equal(canvas.width, 1800); assert.equal(canvas.height, (68 + 3 * 76) * 2, 'The backing store is the CSS size times the device pixel ratio');
 assert.equal(canvas.style.width, '900px');
 const ops = () => canvas.getContext('2d').ops, count = name => ops().filter(([op]) => op === name).length;
-assert.deepEqual(ops()[0], ['setTransform', [2, 0, 0, 2, 0, 0]]);
+assert.deepEqual(ops()[0].slice(0, 2), ['setTransform', [2, 0, 0, 2, 0, 0]]);
 assert.equal(count('clearRect'), 1, 'The first frame is drawn at once, before any animation');
 assert.equal(scenePage.pendingFrames().length, 0, 'Nothing animates until the scene is visible');
 assert.equal(scenePage.observers.intersection.length, 1); assert.equal(scenePage.observers.intersection[0].targets[0], canvas);
@@ -814,9 +814,55 @@ assert.equal(canvasOf(mount(data, [], macroData, '#workflows', 'local', {reduced
 const fonts = canvasOf(narrow).getContext('2d').font;
 assert.match(String(fonts), /^(600 )?1[1-9](\.\d+)?px /, 'Text never shrinks below 11px');
 assert.deepEqual(canvasOf(narrow).getContext('2d').ops.filter(([op]) => op === 'fillText').map(([, args]) => args[0]), [...narrow.run('SCENES.data_agent.items.filter(i => i.kind === "ref" && !(i.end !== undefined && i.end + .35 <= SCENE_SECONDS)).map(i => i.name)'), ...narrow.run('SCENES.data_agent.lanes.flatMap(l => [l[1], l[2]])')], 'Ref chips and lane names stay; the explanatory labels are left to the caption');
-assert.equal(canvasOf(still).getContext('2d').ops.filter(([op, args]) => op === 'fillText' && /reset/.test(args[0])).length, 1, 'The 900px frame carries its few labels once; the 600px redraw, though not compact, drops them');
+const labelsIn = ops => ops.filter(([op, , st]) => op === 'fillText' && /^12px/.test(st.font)).map(([, args]) => args[0]);
+const stillOps = canvasOf(still).getContext('2d').ops, redraw = stillOps.map(([op]) => op).lastIndexOf('clearRect');
+assert.equal(labelsIn(stillOps.slice(0, redraw)).length, still.run('SCENES.ops_agent.items.filter(i => i.kind === "text").length'), 'The 900px frame draws every label');
+assert.deepEqual(labelsIn(stillOps.slice(redraw + 1)), labelsIn(stillOps.slice(0, redraw)).filter(text => !/^reset/.test(text)), 'The 600px redraw, not compact, keeps every label that has room and leaves out the one that has none');
 const chips = canvasOf(mount(data, [], macroData, '#workflows?workflow=data_agent', 'local', {reduced: true, width: 240})).getContext('2d').ops.filter(([op]) => op === 'roundRect').map(([, [x, , width]]) => [x, x + width]);
 assert.ok(chips.length >= 1 && chips.every(([left, right]) => left >= 1.25 && right <= 240 - 1.25), `Every ref chip, border included, lies inside a 240px canvas: ${JSON.stringify(chips)}`);
+// Legibility: in every scene's finished frame, no text touches a line, curve, commit, read or write mark, another ref
+// chip or another text, from phone widths, where only lane names and ref chips are drawn, to the widest. The fake canvas measures 6.5px per character.
+const overlapsIn = ops => {
+    const frame = ops.slice(ops.map(([op]) => op).lastIndexOf('clearRect') + 1), segs = [], dots = [], rects = [], texts = [];
+    let path = [], cur = null;
+    for (const [op, args, st] of frame) {
+        if (op === 'beginPath') path = [];
+        else if (op === 'moveTo') cur = args;
+        else if (op === 'lineTo') { path.push({seg: [...cur, ...args], pad: st.lineWidth / 2}); cur = args; }
+        else if (op === 'arc') path.push({dot: args.slice(0, 3)});
+        else if (op === 'roundRect') path.push({chip: [args[0], args[1], args[0] + args[2], args[1] + args[3]]});
+        else if (op === 'stroke') { segs.push(...path.filter(p => p.seg)); dots.push(...path.filter(p => p.dot).map(p => p.dot)); }
+        else if (op === 'fill') { dots.push(...path.filter(p => p.dot).map(p => p.dot)); rects.push(...path.filter(p => p.chip).map(p => p.chip)); }
+        else if (op === 'fillRect') rects.push([args[0], args[1], args[0] + args[2], args[1] + args[3]]);
+        else if (op === 'fillText') {
+            const width = String(args[0]).length * 6.5, px = Number(st.font.match(/([\d.]+)px/)[1]), left = st.align === 'center' ? args[1] - width / 2 : st.align === 'right' ? args[1] - width : args[1];
+            texts.push({text: args[0], box: [left, args[2] - px * .55, left + width, args[2] + px * .55]});
+        }
+    }
+    const near = (b, x, y, pad) => x >= b[0] - pad && x <= b[2] + pad && y >= b[1] - pad && y <= b[3] + pad;
+    const meet = (a, b) => a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3];
+    const chipOf = t => rects.find(r => near(r, (t.box[0] + t.box[2]) / 2, (t.box[1] + t.box[3]) / 2, 0));
+    const found = [];
+    for (const [i, t] of texts.entries()) {
+        const own = chipOf(t);
+        if (segs.some(({seg: [x1, y1, x2, y2], pad}) => Array.from({length: 21}, (_, k) => k / 20).some(u => near(t.box, x1 + (x2 - x1) * u, y1 + (y2 - y1) * u, pad + 1)))) found.push(`${t.text} touches a line`);
+        if (dots.some(([x, y, r]) => near(t.box, x, y, r + 1))) found.push(`${t.text} touches a commit or mark`);
+        if (rects.some(r => r !== own && meet(t.box, r))) found.push(`${t.text} touches a chip or mark`);
+        for (const u of texts.slice(i + 1)) if (!(own && chipOf(u) === own) && meet(t.box, u.box)) found.push(`${t.text} touches ${u.text}`);
+    }
+    return found;
+};
+for (const width of [328, 400, 520, 600, 760, 900, 1000, 1300]) {
+    for (const key of page.run('Object.keys(SCENES)')) {
+        const shown = mount(data, [], macroData, `#workflows?workflow=${key}`, 'local', {reduced: true, width});
+        assert.deepEqual(overlapsIn(canvasOf(shown).getContext('2d').ops), [], `${key} at ${width}px: every label sits clear of the drawing`);
+    }
+    for (const op of page.run('allRows.map(r => r.op)')) {
+        const shown = mount(data, [], macroData, `#dataset?operation=${op}`, 'local', {reduced: true});
+        shown.el('operation-scene').clientWidth = width; for (const observer of shown.observers.resize) observer.callback();
+        assert.deepEqual(overlapsIn(shown.el('operation-scene').children[0].getContext('2d').ops), [], `${op} at ${width}px: every label sits clear of the drawing`);
+    }
+}
 // Without a 2D context, whether getContext returns null or throws, the host itself shows the PNG with its full text and nothing is scheduled.
 for (const [options, note] of [[{canvas: false}, 'getContext returns null'], [{throwing: true}, 'getContext throws']]) {
     const fallback = mount(data, [], macroData, '#workflows?workflow=dev_agent', 'local', options);
