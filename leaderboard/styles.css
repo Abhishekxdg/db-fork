@@ -382,7 +382,7 @@ code { font: .92em/1.5 var(--mono); }
 .dotplot-line { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--mint-track); }
 .dotplot-ref { background: var(--line-hover); }  /* the reference value, such as ×1: no warm-up */
 .dotplot-row { display: grid; flex: 1; grid-template-columns: var(--dot-label) minmax(0, 1fr); align-items: center; min-height: 26px; }
-.dotplot-label { padding-right: 10px; overflow: hidden; color: var(--ink-2); font-size: 13px; line-height: 1.3; text-overflow: ellipsis; white-space: nowrap; }
+.dotplot-label { padding-right: 10px; color: var(--ink-2); font-size: 13px; line-height: 1.3; }
 .dotplot-track { position: relative; align-self: stretch; margin-right: 10px; }
 .dotplot-track::before { content: ""; position: absolute; top: 50%; left: 0; right: 0; height: 1px; background: var(--line-soft); }  /* the row's guide */
 .dotplot-dot { position: absolute; width: 9px; height: 9px; margin: -4.5px 0 0 -4.5px; border-radius: 50%; box-shadow: 0 0 0 2px var(--surface); }

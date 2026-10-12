@@ -197,6 +197,7 @@ function renderMacro() {
     // Without any campaign the table shell stays, with one honest row: no fabricated result.
     el('macro-groups').replaceChildren(...macroGroupsShown.length ? macroGroupsShown.map(g => macroGroup(g, keys, macroGroupsShown.length))
         : [macroTable({group: '', rows: []}, keys, node('span', 'empty-cell', 'No published results yet. Results appear here once a validated run is published.'))]);
+    el('macro-breakdowns').replaceChildren(...macroGroupsShown.map(g => macroBreakdown(g, macroGroupsShown.length > 1)));
     el('macro-excluded').replaceChildren(...MACRO.excluded.length ? [excludedPanel('macro-excluded-panel', 'Runs not on the board',
         MACRO.excluded.map(x => ({label: `${x.system} / ${x.source.split('/').at(-1)}`, href: PROD ? null : x.source, reason: x.reason})))] : []);  // production never links a file it does not serve
     renderExplainer(keys);
@@ -316,6 +317,68 @@ function attemptBody(a) {
 }
 function renderStatusRules() {
     for (const [status, rule] of Object.entries(STATUS_RULES)) { const pair = node('div'), term = node('dt'); term.append(chip(status)); pair.append(term, node('dd', '', rule)); el('status-rules').append(pair); }
+}
+
+// ---------------------------------------------------------------- Evidence across systems, below the card
+// An attempt's per-operation counts, or null when it recorded none or any entry is malformed: such an attempt counts nowhere.
+function opCounts(a) {
+    const counts = a.evidence && a.evidence.op_status_counts;
+    const valid = n => n && ['ok', 'failed', 'unsupported'].every(k => counter(n[k])) && typeof n.ok_seconds === 'number' && Number.isFinite(n.ok_seconds) && n.ok_seconds >= 0;
+    return counts && typeof counts === 'object' && Object.values(counts).every(valid) ? counts : null;
+}
+// Branch operations: each system's mean time per successful call over every workflow it ran, so an operation that failed
+// and ended a workflow early still shows, with its failures under its time. A row is an operation some system here called.
+function verbTable(campaigns) {
+    const totals = campaigns.map(c => Object.fromEntries(VERBS.map(verb => [verb, Object.values(c.attempts).map(opCounts).filter(Boolean).map(counts => counts[verb.toUpperCase()]).filter(Boolean)
+        .reduce((t, n) => ({ok: t.ok + n.ok, failed: t.failed + n.failed, unsupported: t.unsupported + n.unsupported, seconds: t.seconds + n.ok_seconds}), {ok: 0, failed: 0, unsupported: 0, seconds: 0})])));
+    const {table, body} = dataTable('heatmap', 'Branch operations: mean time per successful call, per system', ['Operation', ...campaigns.map(c => {
+        const identity = node('span', 'system-identity'); identity.append(systemIcon(c), node('span', 'system-name', c.system));
+        const th = colHead(identity); th.title = `${c.machine} · ${c.started.slice(0, 10)}`;
+        return th;
+    })]);
+    for (const verb of VERBS) {
+        const cells = totals.map(t => t[verb]), means = cells.map(n => n.ok ? n.seconds / n.ok : null), comparison = compared(means), fastest = Math.min(...means.filter(m => m !== null));
+        if (!cells.some(n => n.ok + n.failed + n.unsupported)) continue;
+        const tr = body.insertRow(); tr.append(rowHead(verb[0].toUpperCase() + verb.slice(1), 'row-label'));
+        cells.forEach((n, i) => {
+            const td = tr.insertCell(), mean = means[i], calls = n.ok + n.failed + n.unsupported, best = comparison && mean === fastest;
+            td.className = mean !== null ? best ? 'cell-best' : '' : calls ? 'cell-missing' : 'cell-absent';
+            td.title = calls ? `${fmt(n.ok)} of ${plural(calls, 'call')} succeeded${n.ok ? `, ${seconds(n.seconds)} in all` : ''}` : 'Not called in any workflow';
+            if (mean !== null && comparison) shade(td, fastest, mean);
+            if (best) td.append(bestMark('Fastest in this row'));
+            td.append(node('span', 'metric-value', mean !== null ? `${(mean * 1000).toFixed(1)} ms` : !calls ? 'Not called' : n.failed ? 'Failed' : 'Unsupported'));
+            const problems = [n.failed ? `${fmt(n.failed)} failed` : '', n.unsupported ? `${fmt(n.unsupported)} unsupported` : ''].filter(Boolean);
+            if (problems.length) td.append(node('span', 'wf-note', `${problems.join(', ')} of ${plural(calls, 'call')}`));
+        });
+    }
+    if (!body.children.length) { const tr = body.insertRow(); tr.className = 'empty-row'; const td = tr.insertCell(); td.setAttribute('colspan', String(campaigns.length + 1)); td.append(node('span', 'empty-cell', 'No branch operations recorded.')); }
+    return table;
+}
+// Time in branch operations: for each completed workflow, the share of its operation time spent in the nine branch
+// operations rather than in agent steps. Operation time adds up concurrent workers' calls, so only the share compares.
+function shareChart(campaigns) {
+    const card = node('figure', 'panel dotplot-panel'), keys = Object.keys(SCENARIOS);
+    card.append(node('h3', '', 'Time in branch operations'), node('p', 'panel-note', 'Share of each completed workflow\'s operation time spent in branch operations; the rest is agent steps.'));
+    const rows = keys.map(key => ({label: workflow(key).name, dots: campaigns.flatMap(c => {
+        const counts = statusOf(c, key) === 'verified' && opCounts(c.attempts[key]);
+        if (!counts) return [];
+        const branch = VERBS.reduce((sum, verb) => sum + (counts[verb.toUpperCase()]?.ok_seconds ?? 0), 0), total = branch + (counts.EXEC?.ok_seconds ?? 0);
+        return total ? [{e: c, value: branch / total, title: `${c.system} · ${workflow(key).name}: ${Math.round(branch / total * 100)}% in branch operations, ${seconds(branch)} of ${seconds(total)}`}] : [];
+    })}));
+    const shares = rows.flatMap(r => r.dots.map(d => d.value)), percent = v => `${Math.round(v * 100)}%`;
+    if (!shares.length) { card.append(node('p', 'chart-empty', 'No completed workflow recorded its operation time.')); return card; }
+    const shown = campaigns.filter(c => rows.some(r => r.dots.some(d => d.e === c))), gaps = rows.some(r => r.dots.length < campaigns.length);
+    card.append(dotPlot(`Share of operation time in branch operations across ${plural(keys.length, 'workflow')}, from ${percent(Math.min(...shares))} to ${percent(Math.max(...shares))}.`, rows, campaigns,
+        [0, 0.25, 0.5, 0.75, 1].map(v => ({value: v, text: percent(v)})), v => `${(v * 100).toFixed(2)}%`),
+        chartLegend(shown), node('p', 'panel-note', `Operation time adds up every worker's calls, so it can exceed the completion time.${gaps ? ' A workflow that did not complete has no dot.' : ''}`));
+    return card;
+}
+// The evidence behind a comparison group, below the card: its branch operations beside where its operation time goes,
+// systems in name order.
+function macroBreakdown(g, named) {
+    const c = g.rows[0], campaigns = [...g.rows].sort((a, b) => a.system.localeCompare(b.system));
+    return breakdownSection(named ? [(c.environment || {}).cpu, c.machine, `revision ${c.commit.slice(0, 7)}`].filter(Boolean).join(' · ') : null, 'Branch operations',
+        'Mean time per successful call over every workflow each system ran, shaded within each row.', verbTable(campaigns), [shareChart(campaigns)]);
 }
 
 // ---------------------------------------------------------------- Workflow definitions

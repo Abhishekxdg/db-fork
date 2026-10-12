@@ -216,7 +216,7 @@ assert.ok(at('id="selectors-suite"') < at('id="macro-groups"'), 'Tabs, then the 
 assert.ok(at('id="selectors-mode"') < at('id="chip-hosted"') && at('id="chip-tag"') < at('id="groups"'), 'Every microbench filter sits in the toolbar above its tables');
 assert.doesNotMatch(html, /<select|Rank by/, 'Sorting is the column headers\' job, as in any data table; there is no separate rank control');
 assert.match(html, /<div class="header-actions"><a class="button" href="https:\/\/github\.com\/elaineang\/db-fork">GitHub[^<]*<span aria-hidden="true">↗<\/span><\/a><a class="button button-primary" id="nav-run" href="run\.html">Run a benchmark<\/a><\/div>/, 'Run a benchmark is the header\'s call to action');
-assert.ok(at('id="macro-groups"') < at('id="workflows"') && at('id="workflows"') < at('id="macro-guide"'), 'The board, then the definitions of its columns, then the methodology');
+assert.ok(at('id="macro-groups"') < at('id="macro-breakdowns"') && at('id="macro-breakdowns"') < at('id="workflows"') && at('id="workflows"') < at('id="macro-guide"'), 'The board, its evidence, then the definitions of its columns, then the methodology');
 assert.ok(at('id="groups"') < at('id="breakdowns"') && at('id="breakdowns"') < at('id="dataset"') && at('id="dataset"') < at('id="methodology"'), 'Microbench results, their breakdown, then what is measured');
 
 // The microbench board: one table per comparable group, ranked by one chosen score, every category score beside it with a speed bar.
@@ -454,6 +454,41 @@ assert.doesNotMatch(css, /\.(wf|done|score|ratio|system)-cell\s*(,[^{]*)?\{[^}]*
 assert.match(css, /\.board \.system-col, \.board \.system-cell \{ position: sticky; left: 0;/, 'Narrow screens scroll the workflows past a pinned system column');
 assert.doesNotMatch(css, /data-label|attr\(data-label\)/, 'No stacked-card labels');
 assert.match(css, /\.status-chip \{[^}]*overflow-wrap: anywhere/); assert.doesNotMatch(css, /\.status-chip[^{]*\{[^}]*word-break: break-all/, 'Status words wrap at word boundaries, never letter by letter');
+// Below the card, each comparison group's evidence: its branch operations timed per call, beside the share of each
+// completed workflow's operation time they take.
+assert.deepEqual(classNodes(macroEl('macro-breakdowns'), 'breakdown-title').map(h => h.textContent), ['Test CPU · box · revision 0000000', 'Other CPU · box2 · revision 1111111'], 'One breakdown per comparison group, each named');
+{
+    const solo = classNodes(macroEl('macro-breakdowns'), 'breakdown-group')[1];
+    assert.equal(classNodes(solo, 'heat').length + classNodes(solo, 'best-mark').length, 0, 'A group of one compares nothing');
+    assert.deepEqual([...new Set(classNodes(solo, 'dotplot-dot').map(d => d.style.backgroundColor))], ['var(--sys-other)'], 'A system without its own color takes the neutral one');
+    const dolt = campaign('d1000000', 'Dolt', 'dolt_mysql', '2026-10-10T12:00:00+00:00', six('0000011', V, Array(6).fill(10)));
+    const pg = campaign('d2000000', 'Doltgres', 'dolt', '2026-10-10T11:00:00+00:00', six('0000012', ['verified', 'failed', 'failed', 'failed', 'verified', 'verified'], [20, 0, 0, 0, 5, 20]));
+    for (const a of Object.values(pg.attempts)) a.evidence.op_status_counts.BRANCH.ok_seconds = 0.8;  // 100 ms a call against Dolt's 50
+    dolt.attempts.dev_agent.evidence.op_status_counts.REBASE = {ok: 9, failed: 4, unsupported: 0, ok_seconds: 1.8};
+    pg.attempts.dev_agent.evidence.op_status_counts.REBASE = {ok: 0, failed: 12, unsupported: 0, ok_seconds: 0};
+    pg.attempts.multi_agent.evidence.op_status_counts.LOG = {ok: 3};  // malformed, so this attempt counts nowhere
+    const page = mount(data, [], {suite: {suite: 'macro-1'}, excluded: [], campaigns: [pg, dolt]}, '#agent-workflows'), box = page.el('macro-breakdowns');  // newest first, shown in name order
+    const verbs = classNodes(box, 'heatmap')[0], chart = classNodes(box, 'dotplot-panel')[0], dots = classNodes(chart, 'dotplot-dot');
+    assert.equal(classNodes(box, 'breakdown-title').length, 0, 'One group needs no heading');
+    assert.deepEqual(headRow(verbs).slice(1).map(th => classNodes(th, 'system-name')[0].textContent), ['Dolt', 'Doltgres']);
+    assert.deepEqual(bodyRows(verbs).map(r => r.children.map(c => c.textContent)), [['Branch', '50.0 ms', '100.0 ms'], ['Rebase', '200.0 ms4 failed of 13 calls', 'Failed12 failed of 12 calls']],
+        'Only operations some system called, each a mean per successful call, with its failures under it');
+    assert.deepEqual(bodyRows(verbs).map(r => r.children.slice(1).map(td => [td.className.split(' ').filter(c => c !== 'heat').join(' '), td.style['--strength'], classNodes(td, 'best-mark').length])),
+        [[['cell-best', '0.130', 1], ['', '0.080', 0]], [['', undefined, 0], ['cell-missing', undefined, 0]]], 'A row with two times shades and marks its fastest; one time compares nothing');
+    assert.equal(bodyRows(verbs)[0].children[2].title, '40 of 40 calls succeeded, 4.000s in all', 'The malformed attempt adds no calls');
+    assert.deepEqual(classNodes(chart, 'dotplot-row').map(r => r.children[0].textContent), NAMES_6);
+    assert.deepEqual(classNodes(chart, 'dotplot-tick').map(t => [t.textContent, t.style.left]), [['0%', '0.00%'], ['25%', '25.00%'], ['50%', '50.00%'], ['75%', '75.00%'], ['100%', '100.00%']]);
+    assert.deepEqual(dots.map(d => [d.title.split(' · ')[0], d.style.left]).sort(), [...Array(5).fill(['Dolt', '11.11%']), ['Dolt', '40.74%'], ...Array(3).fill(['Doltgres', '20.00%'])].sort(),
+        'Only completed workflows: branch time over branch and agent-step time');
+    assert.equal(dots.find(d => d.title.includes('Develop against live data')).title, 'Dolt · Develop against live data: 41% in branch operations, 2.200s of 5.400s');
+    assert.deepEqual([...new Set(dots.map(d => d.style.backgroundColor))], ['var(--sys-dolt)', 'var(--sys-doltgres)']);
+    assert.deepEqual(classNodes(chart, 'chart-key').map(k => k.textContent), ['Dolt', 'Doltgres']);
+    assert.match(classNodes(chart, 'panel-note').at(-1).textContent, /A workflow that did not complete has no dot\.$/);
+    for (const a of Object.values(dolt.attempts)) a.evidence = null;
+    const bare = mount(data, [], {suite: {suite: 'macro-1'}, excluded: [], campaigns: [dolt]}, '#agent-workflows').el('macro-breakdowns');
+    assert.equal(classNodes(bare, 'empty-cell')[0].textContent, 'No branch operations recorded.');
+    assert.equal(classNodes(bare, 'chart-empty')[0].textContent, 'No completed workflow recorded its operation time.');
+}
 
 // Design tokens: every color is written once, as a :root token in styles.css; rules, markup and scripts name the token.
 // A literal anywhere else fails with its place and the nearest token. Browser chrome cannot read CSS, so the favicon and

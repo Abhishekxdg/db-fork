@@ -135,9 +135,10 @@ function ranksOf(sorted, key, value) {
 // by data-system; a chart mark of any other system takes a series color by its position in the data.
 const systemSlug = e => e.system.toLowerCase().replace(/\s+/g, '-');
 const slug = (...words) => words.map(w => encodeURIComponent(w)).join(':');  // a stable id from a row's identity; distinct identities never share one
+// A system's own token, else a series color by its place in the microbench data; a row from elsewhere takes the neutral one.
 function seriesColor(e) {
     const named = `--sys-${systemSlug(e)}`;
-    return token(named) ? `var(${named})` : `var(--series-${data.indexOf(e) % 4 + 1})`;
+    return token(named) ? `var(${named})` : data.includes(e) ? `var(--series-${data.indexOf(e) % 4 + 1})` : 'var(--sys-other)';
 }
 function systemIcon(e) {
     const mark = node('span', 'system-icon', e.system.slice(0, 1));
@@ -194,7 +195,7 @@ function dotPlot(label, rows, systems, ticks, at) {
         line.style.left = tick.style.left = at(t.value); grid.append(line); axis.append(tick);
     }
     plot.append(grid);
-    const n = systems.length, step = n > 1 ? Math.min(5, 12 / (n - 1)) : 0;
+    const n = systems.length, step = n > 1 ? Math.min(8, 12 / (n - 1)) : 0;
     for (const row of rows) {
         const line = node('div', 'dotplot-row'), track = node('span', 'dotplot-track');
         for (const d of row.dots) {

@@ -452,7 +452,17 @@ that did not is listed under **Runs not on the board** with its reasons. A
 board wider than its card scrolls sideways past a pinned system column. The page
 is built for desktop browsers; it has no phone layout, high-contrast or dark mode.
 
-**The workflows**, directly below the board, defines each workflow
+Below the card, each comparison group's evidence sits in two columns that end on
+one line. **Branch operations** is a heatmap with a row per branch operation some
+system called and a column per system. A cell is the mean time per successful
+call over every workflow that system ran, shaded within its row, with failed or
+unsupported calls counted under it, so an operation that ended a workflow early
+still shows. **Time in branch operations** puts one dot per system and completed
+workflow at the share of that workflow's operation time spent in branch
+operations rather than agent steps. Operation time adds up concurrent workers'
+calls, so only the share compares across systems.
+
+**The workflows**, below that evidence, defines each workflow
 (`#workflows?workflow=ops_agent`): what it simulates, an animated branch history
 drawn on a Canvas (played once when seen, then held; illustrative, not a trace;
 each label is placed clear of every line, commit, mark and ref chip, and a label
