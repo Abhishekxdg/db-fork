@@ -446,8 +446,9 @@ nothing compares. A workflow that did not complete is unranked in that column
 only. The last column holds how many workflows completed and the row's
 **Details** button. There is no overall score or weighted average. Rows carry no
 badges: every campaign on the board passed validation (below), and a campaign
-that did not is listed under **Runs not on the board** with its reasons. Narrow
-screens scroll the workflow columns past a pinned system column.
+that did not is listed under **Runs not on the board** with its reasons. A
+board wider than its card scrolls sideways past a pinned system column. The page
+is built for desktop browsers; it has no phone layout, high-contrast or dark mode.
 
 **The workflows**, directly below the board, defines each workflow
 (`#workflows?workflow=ops_agent`): what it simulates, an animated branch history

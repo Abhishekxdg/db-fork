@@ -77,19 +77,18 @@ function placeLabels(ctx, spec, boxes, X, Y, w, h, gutter) {
     }
     return placed;
 }
-function drawScene(ctx, spec, w, h, t, compact) {
+function drawScene(ctx, spec, w, h, t) {
     const ink = token('--ink'), muted = token('--muted'), paper = token('--surface'), font = token('--sans');
     const index = Object.fromEntries(spec.lanes.map((l, i) => [l.id, i])), laneOf = id => spec.lanes[index[id]];
-    const px = compact ? 12 : 13;
     ctx.clearRect(0, 0, w, h);
-    ctx.font = `600 ${px}px ${font}`;
-    const gutter = Math.ceil(Math.max(...spec.lanes.flatMap(l => [ctx.measureText(l.name).width, l.sub ? ctx.measureText(l.sub).width * 11 / px : 0]))) + 16;
-    const pad = compact ? 8 : 16, gap = (h - 68) / Math.max(1, spec.lanes.length - 1);
+    ctx.font = `600 13px ${font}`;
+    const gutter = Math.ceil(Math.max(...spec.lanes.flatMap(l => [ctx.measureText(l.name).width, l.sub ? ctx.measureText(l.sub).width * 11 / 13 : 0]))) + 16;
+    const pad = 16, gap = (h - 68) / Math.max(1, spec.lanes.length - 1);
     const X = f => gutter + pad + f * (w - gutter - 2 * pad), Y = id => spec.lanes.length === 1 ? h / 2 : 34 + index[id] * gap;
-    const r = compact ? 3.5 : 4.5, stroke = compact ? 1.5 : 2, labels = !compact, key = `${w}x${h}`;  // a compact scene keeps lane names and refs only; a wider one adds every label that has room
+    const r = 4.5, stroke = 2, key = `${w}x${h}`;
     if (spec.layoutKey !== key) {  // computed once per size from the finished scene, so a chip or label never jumps while the scene plays
         const marks = sceneBoxes(spec, X, Y, r, stroke), chips = placeChips(ctx, spec, marks, X, Y, w, h, `600 11.5px ${font}`), lanes = spec.lanes.map(l => [0, Y(l.id) - 16, gutter, Y(l.id) + 16]);
-        spec.offsets = chips.offsets; spec.layout = labels ? placeLabels(ctx, spec, [...marks, ...chips.boxes, ...lanes], X, Y, w, h, gutter) : new Map(); spec.layoutKey = key;
+        spec.offsets = chips.offsets; spec.layout = placeLabels(ctx, spec, [...marks, ...chips.boxes, ...lanes], X, Y, w, h, gutter); spec.layoutKey = key;
     }
     ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.textBaseline = 'middle';
     for (const item of spec.items) {
@@ -140,7 +139,7 @@ function drawScene(ctx, spec, w, h, t, compact) {
     }
     for (const lane of spec.lanes) {
         const a = portion(t, lane.start - .2, lane.start + .1); if (!a) continue;
-        ctx.globalAlpha = a; ctx.textAlign = 'right'; ctx.fillStyle = ink; ctx.font = `600 ${px}px ${font}`;
+        ctx.globalAlpha = a; ctx.textAlign = 'right'; ctx.fillStyle = ink; ctx.font = `600 13px ${font}`;
         ctx.fillText(lane.name, gutter - 8, Y(lane.id) - (lane.sub ? 7 : 0));
         if (lane.sub) { ctx.fillStyle = muted; ctx.font = `11px ${font}`; ctx.fillText(lane.sub, gutter - 8, Y(lane.id) + 8); }
     }
@@ -165,15 +164,15 @@ function mountScene(key, raw, alt, host, fallback) {
     if (!ctx) { host.replaceChildren(fallback()); return; }  // no 2D context: a stand-in with the full text, nothing is scheduled
     host.replaceChildren(canvas);
     const compiled = compileScene(raw);
-    let w = 0, h = 0, d = 0, compact = false;
+    let w = 0, h = 0, d = 0;
     const size = () => {
         const width = host.clientWidth || 640, dpr = window.devicePixelRatio || 1;
-        compact = width < 520; const height = 68 + Math.max(1, compiled.lanes.length - 1) * (compact ? 58 : 76);
+        const height = 68 + Math.max(1, compiled.lanes.length - 1) * 76;
         if (width === w && height === h && dpr === d) return;
         w = width; h = height; d = dpr; canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr); canvas.style.width = `${w}px`; canvas.style.height = `${h}px`;
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     };
-    const draw = () => { size(); drawScene(ctx, compiled, w, h, scene.done ? SCENE_SECONDS : scene.elapsed, compact); };
+    const draw = () => { size(); drawScene(ctx, compiled, w, h, scene.done ? SCENE_SECONDS : scene.elapsed); };
     const motion = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
     scene.done = Boolean(motion && motion.matches) || played.has(key);  // the complete history at once: no frame loop, no viewport watching
     draw();

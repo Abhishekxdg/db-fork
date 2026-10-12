@@ -522,65 +522,6 @@ body:has(.dialog[open]) { overflow: hidden; }
 @media (max-width: 800px) {
     .wizard-layout { grid-template-columns: 1fr; }
 }
-@media (max-width: 600px) {
-    body { padding: 8px; }
-    .dashboard { border-radius: var(--radius); }
-    .shell { width: calc(100% - 32px); }
-    .brand-name { font-size: 19px; }
-    .brand-mark { width: 29px; height: 29px; }
-    .source-link { padding: 8px 12px; font-size: 13px; }
-    .header-nav { gap: 0; justify-content: space-between; }
-    .nav-link { padding: 9px 10px; font-size: 13px; }
-    .page-title { padding-top: 22px; font-size: 28px; letter-spacing: -.9px; }
-    .suite-tabs { padding-inline: 4px; }
-    .suite-tab { flex: 1; padding: 12px 10px 10px; }
-    .suite-desc { font-size: 12px; }
-    .filter-bar { padding: 10px 12px; gap: 6px; }
-    .chip-menu { min-width: 190px; }
-    .segmented .selector { padding-inline: 11px; font-size: 13px; }
-    .board th, .board td { padding: 10px; }
-    .board .system-col, .board .system-cell { min-width: 150px; max-width: 168px; }
-    .board .system-cell .system-icon { display: none; }
-    .rank-number { flex-basis: 22px; height: 22px; font-size: 12px; }
-    .system-name { font-size: 14px; }
-    .panel { padding: 16px; }
-    .heatmap th:first-child { min-width: 140px; }
-    .explorer-stage { padding: 16px 14px 12px; }
-    .stage-head h3 { font-size: 19px; }
-    .result-bars li { grid-template-columns: minmax(80px, 7rem) minmax(0, 1fr) auto 14px; gap: 8px; }
-    .rule-list > div, .status-rules > div { grid-template-columns: minmax(0, 1fr); }
-    .dialog { width: 100vw; height: 100dvh; max-height: 100dvh; border-radius: 0; }
-    .dialog-head { padding: 14px 14px 14px 18px; }
-    .dialog-title h2 { font-size: 21px; }
-    .dialog-body { padding: 4px 16px 28px; }
-    .dialog-foot { padding: 12px 16px; }
-    .why-body { padding-inline: 12px; }
-    .meta-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .outcome, .stacks { grid-template-columns: minmax(0, 1fr); }
-    .outcome > div + div { border-left: 0; border-top: 1px solid var(--line-soft); }
-    .why-row { grid-template-columns: minmax(0, 1fr) auto 14px; gap: 10px; padding-inline: 12px; }
-    .site-footer { margin-top: 36px; padding-block: 20px; }
-    .page-intro { gap: 17px; padding-top: 23px; }
-    .page-intro h1 { font-size: 30px; letter-spacing: -1px; }
-    .section-description { font-size: 12px; }
-    .wizard-shell .page-intro { padding-top: 26px; }
-    .wizard-shell .page-intro > .text-link { font-size: 13px; }
-    .wizard-layout { margin-top: 23px; }
-    .wizard-section { padding: 24px 17px; }
-    .database-options { gap: 10px; }
-    .database-choice { padding: 16px 12px; }
-    .database-choice input { right: 10px; }
-    .database-choice strong { font-size: 12px; }
-    .wizard-actions { gap: 10px; padding: 18px 15px; flex-wrap: wrap; }
-    .wizard-actions .button { padding-inline: 15px; font-size: 13px; }
-    .wizard-actions > a { font-size: 12px; }
-    .wizard-requirements { padding: 16px; }
-    .database-requirements li { grid-template-columns: 1fr; gap: 3px; }
-    .command-card pre { font-size: 12px; }
-    .wizard-workflow { padding: 23px; }
-    .workflow-header { align-items: flex-start; flex-direction: column; }
-    .run-outline { grid-template-columns: 1fr; }
-}
 
 /* ---------------------------------------------------------------- Reduced motion */
 @media (prefers-reduced-motion: reduce) {

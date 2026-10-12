@@ -782,7 +782,7 @@ assert.equal(scenePage.observers.intersection[2].disconnected, true); assert.equ
 assert.equal(scenePage.pendingFrames().length, 0); assert.equal(canvasOf(scenePage).getContext('2d').ops.filter(([op]) => op === 'arc').length, scenePage.run('SCENES.rl_env.items.filter(i => i.kind === "dot").length'), 'Every commit bead of the final state is drawn');
 assert.equal(scenePage.observers.resize.length, 4); assert.equal(ro().targets[0], sceneEl('workflow-scene'), 'A finished scene still follows its host');
 sceneEl('workflow-scene').clientWidth = 480; ro().callback();
-assert.equal(canvasOf(scenePage).style.width, '480px'); assert.equal(canvasOf(scenePage).width, 960); assert.equal(canvasOf(scenePage).height, (68 + 3 * 58) * 2, 'A narrower host redraws the held scene in compact geometry');
+assert.equal(canvasOf(scenePage).style.width, '480px'); assert.equal(canvasOf(scenePage).width, 960); assert.equal(canvasOf(scenePage).height, (68 + 3 * 76) * 2, 'A narrower host redraws the held scene at its width');
 assert.equal(canvasOf(scenePage).getContext('2d').ops.filter(([op]) => op === 'clearRect').length, 2);
 scenePage.run('window.devicePixelRatio = 3'); ro().callback();
 assert.equal(canvasOf(scenePage).width, 1440); assert.deepEqual(canvasOf(scenePage).getContext('2d').ops.filter(([op]) => op === 'setTransform').at(-1)[1], [3, 0, 0, 3, 0, 0], 'A device pixel ratio change resizes the backing store');
@@ -807,21 +807,15 @@ assert.ok(canvasOf(still).getContext('2d').ops.filter(([op]) => op === 'roundRec
 assert.equal(still.observers.resize.length, 1, 'A static scene still observes its host');
 still.el('workflow-scene').clientWidth = 600; still.observers.resize[0].callback();
 assert.equal(canvasOf(still).style.width, '600px'); assert.equal(canvasOf(still).getContext('2d').ops.filter(([op]) => op === 'clearRect').length, 2, 'A static scene redraws at the new width without any frame');
-// Narrow screens: the geometry is recomputed for the width, labels are dropped before text shrinks below readable size.
-const narrow = mount(data, [], macroData, '#workflows?workflow=data_agent', 'local', {reduced: true, width: 328});
-assert.equal(canvasOf(narrow).style.width, '328px'); assert.equal(canvasOf(narrow).height, (68 + 3 * 58) * 2);
 assert.equal(canvasOf(mount(data, [], macroData, '#workflows', 'local', {reduced: true, width: 300})).style.width, '300px', 'The canvas takes the host width as it is, never a wider minimum');
-const fonts = canvasOf(narrow).getContext('2d').font;
-assert.match(String(fonts), /^(600 )?1[1-9](\.\d+)?px /, 'Text never shrinks below 11px');
-assert.deepEqual(canvasOf(narrow).getContext('2d').ops.filter(([op]) => op === 'fillText').map(([, args]) => args[0]), [...narrow.run('SCENES.data_agent.items.filter(i => i.kind === "ref" && !(i.end !== undefined && i.end + .35 <= SCENE_SECONDS)).map(i => i.name)'), ...narrow.run('SCENES.data_agent.lanes.flatMap(l => [l[1], l[2]])')], 'Ref chips and lane names stay; the explanatory labels are left to the caption');
 const labelsIn = ops => ops.filter(([op, , st]) => op === 'fillText' && /^12px/.test(st.font)).map(([, args]) => args[0]);
 const stillOps = canvasOf(still).getContext('2d').ops, redraw = stillOps.map(([op]) => op).lastIndexOf('clearRect');
 assert.equal(labelsIn(stillOps.slice(0, redraw)).length, still.run('SCENES.ops_agent.items.filter(i => i.kind === "text").length'), 'The 900px frame draws every label');
-assert.deepEqual(labelsIn(stillOps.slice(redraw + 1)), labelsIn(stillOps.slice(0, redraw)).filter(text => !/^reset/.test(text)), 'The 600px redraw, not compact, keeps every label that has room and leaves out the one that has none');
+assert.deepEqual(labelsIn(stillOps.slice(redraw + 1)), labelsIn(stillOps.slice(0, redraw)).filter(text => !/^reset/.test(text)), 'The 600px redraw keeps every label that has room and leaves out the one that has none');
 const chips = canvasOf(mount(data, [], macroData, '#workflows?workflow=data_agent', 'local', {reduced: true, width: 240})).getContext('2d').ops.filter(([op]) => op === 'roundRect').map(([, [x, , width]]) => [x, x + width]);
 assert.ok(chips.length >= 1 && chips.every(([left, right]) => left >= 1.25 && right <= 240 - 1.25), `Every ref chip, border included, lies inside a 240px canvas: ${JSON.stringify(chips)}`);
 // Legibility: in every scene's finished frame, no text touches a line, curve, commit, read or write mark, another ref
-// chip or another text, from phone widths, where only lane names and ref chips are drawn, to the widest. The fake canvas measures 6.5px per character.
+// chip or another text, at every width from 520px. The fake canvas measures 6.5px per character.
 const overlapsIn = ops => {
     const frame = ops.slice(ops.map(([op]) => op).lastIndexOf('clearRect') + 1), segs = [], dots = [], rects = [], texts = [];
     let path = [], cur = null;
@@ -852,7 +846,7 @@ const overlapsIn = ops => {
     }
     return found;
 };
-for (const width of [328, 400, 520, 600, 760, 900, 1000, 1300]) {
+for (const width of [520, 600, 760, 900, 1000, 1300]) {
     for (const key of page.run('Object.keys(SCENES)')) {
         const shown = mount(data, [], macroData, `#workflows?workflow=${key}`, 'local', {reduced: true, width});
         assert.deepEqual(overlapsIn(canvasOf(shown).getContext('2d').ops), [], `${key} at ${width}px: every label sits clear of the drawing`);
