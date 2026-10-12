@@ -259,9 +259,10 @@ class DevAgentScenario(Scenario):
                 intact = is_intact(schema_after)
                 if born_after_conflict:
                     # Forked from a spine that already has c_tier INT: the
-                    # feature DDL failed on creation, nothing to compare.
-                    inv.not_applicable(f"S4.3 schema-conflict rebase of {branch} (rebase {rebases_done})",
-                                       "branch created after the conflicting migration")
+                    # feature DDL failed on creation, nothing to compare. S4.3
+                    # concerns the branches alive at the conflicting migration,
+                    # so no check is recorded (none the backend could not run).
+                    pass
                 elif conflict_due and col == "c_tier":
                     # First integration after the conflicting migration; a
                     # branch that already moved its column is checked as usual.
