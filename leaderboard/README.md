@@ -603,11 +603,11 @@ first; older campaigns of a system can be chosen from its details.
 
 ### Current local status
 
-After merging main (`e9ae186`), two quick campaigns on 2026-10-12 from commit
-`358d742` on an Apple M5 (10 CPUs, 32 GiB, machine label `fable-mini`) passed
-validation and share one comparison group: Dolt 1.81.2 (campaign `094049ed`)
+After merging main (`e9ae186`) and fixing what two reviews found, two quick
+campaigns on 2026-10-12 from commit `1bc5ed3` on an Apple M5 (10 CPUs, 32 GiB, machine label `fable-mini`) passed
+validation and share one comparison group: Dolt 1.81.2 (campaign `0503ca8e`)
 verified all six workflows, including S4's new schema conflict, which both live
-branches resolved by merge, and Doltgres 0.54.10 (campaign `2e602353`) verified
+branches resolved by merge, and Doltgres 0.54.10 (campaign `12f832f0`) verified
 S3 and S5. Doltgres failed S1, S2, S4 and S6 as it did before the merge: S1 and
 S6's ingest because Doltgres rejects TPC-C consistency queries (`GMSCast expected
 type float64, got decimal.Decimal`), and S2, S4 and S6 because `dolt_rebase`
@@ -615,9 +615,9 @@ aborted with `rebase aborted due to changes in branch ...` even though the
 adapter commits first; main's S6.2 to S6.4 checks now name the S6 failures too.
 These are backend or adapter limitations surfaced by the evidence and are shown
 as **Failed** with their reasons. Every database was cleaned up and both servers
-stopped. Two earlier Dolt campaigns of the same day (`ec942e50`, `1ffb607b`) ran
-from intermediate commits of the merge and remain selectable as other runs on
-this machine. The campaigns of 2026-10-10 and 2026-10-11 are listed under **Runs
+stopped. Earlier campaigns of the same day ran from intermediate commits while the
+merge and the review fixes landed; they remain selectable as other runs on this
+machine. The campaigns of 2026-10-10 and 2026-10-11 are listed under **Runs
 not on the board**: main changed the S4 preset, so their S4 attempts no longer
 match the frozen preset's digest. No Full campaign has been run yet, and
 `publish.json` is empty, so the production site shows no agent-workflow results.
