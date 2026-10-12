@@ -243,6 +243,8 @@ def classify(evidence: dict | None, child: dict) -> tuple[str, list[str]]:
     failed, incomplete = [], []
     if status.startswith(("setup_failed", "crashed", "invariant_failed")):
         failed.append(status[:300])
+    elif status == "incomplete":  # the runner's stall watchdog cancelled an operation that never finished
+        incomplete.append("an operation stalled and was cancelled before it finished")
     elif status not in ("completed", "interrupted"):
         return "unverified", [f"unknown status {status[:60]!r}"]
     if problem := setup_outcome(evidence["setup"]):

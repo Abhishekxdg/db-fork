@@ -88,6 +88,7 @@ class Classifier(unittest.TestCase):
             "checks disabled": (good_evidence(invariants=invariants(enabled=False)), "incomplete"),
             "timed out": (good_evidence(timed_out=True, work={"expected": 8, "succeeded": 3, "failed": 0, "skipped": 0}), "timed_out"),
             "interrupted": (good_evidence(status="interrupted"), "timed_out"),
+            "stalled operation": (good_evidence(status="incomplete"), "incomplete"),
             "no status": ({k: v for k, v in good_evidence().items() if k != "status"}, "unverified"),
             "no work": ({k: v for k, v in good_evidence().items() if k != "work"}, "unverified"),
             "too much work": (good_evidence(work={"expected": 8, "succeeded": 9, "failed": 0, "skipped": 0}), "unverified"),
