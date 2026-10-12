@@ -172,9 +172,9 @@ def test_history_ref_fallback_is_counted():
     assert ctx.metrics["history_ref_fallbacks"] >= 1
 
 
-def test_s6_integrity_mismatch_is_a_failed_unit_and_never_a_passed_check():
+def test_s6_integrity_mismatch_is_a_failed_unit():
     """A load step whose derived revenue disagrees with the inserted order lines
-    is corrupt output: never a succeeded unit, and never a passed S6.3."""
+    is corrupt output: never a succeeded unit, and counted for the verdict."""
     ctx, scenario, suite = _run("data_agent", reset_prob=0.0)
     original = scenario._load_step
 
@@ -190,8 +190,18 @@ def test_s6_integrity_mismatch_is_a_failed_unit_and_never_a_passed_check():
     scenario.run()
     assert ctx.work["failed"] >= 1, ctx.work
     assert ctx.metrics["integrity_mismatches"] >= 1
-    summary = ctx.invariants.summary()
-    assert not [r for r in summary["results"] if r["name"].startswith("S6.3") and r["passed"]], summary["results"]
+
+
+def test_s6_3_oracle_flags_derived_tables_that_disagree_with_the_orders():
+    """S6.3 recomputes daily_revenue and customer_summary from the batch orders. It runs
+    only where merge works, which the fake lacks, so its oracle is checked directly:
+    zero after a consistent load, and the disagreeing rows once a derived table is corrupted."""
+    ctx, scenario, suite = _run("data_agent", reset_prob=0.0)
+    load = suite.exec(scenario._load_step(1, 0, 6, random.Random(1)), refs=["main"], label="ingest")[0]
+    assert load.ok and load.value["mismatches"] == 0, load
+    assert scenario._derived_mismatches(suite, "main") == 0
+    suite.exec(["UPDATE daily_revenue SET revenue = revenue + 100"], refs=["main"], label="tamper")
+    assert scenario._derived_mismatches(suite, "main") > 0
 
 
 def test_s5_spine_traffic_that_always_fails_leaves_evidence(monkeypatch):
