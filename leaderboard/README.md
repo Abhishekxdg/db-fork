@@ -131,6 +131,9 @@ with only one time has neither. Tick
 read/write workloads there to choose what the reads & writes score counts; at
 least one stays ticked, so the score never silently counts all of them. A
 trade-off plot beside it compares the first-query and reads & writes scores.
+Under that, a warm-up plot puts one dot per system and workload at its first
+try over its best repeat, so it shows where **First try** and **Best repeat**
+disagree. The two columns end on one line.
 **The operations** defines every operation the way the workflows are defined: a
 picker, a branch-history diagram in the same drawing language (beads are
 commits, open circles are new branch heads, diamonds are reads, squares are writes),
