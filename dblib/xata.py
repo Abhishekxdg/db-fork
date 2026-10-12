@@ -22,7 +22,7 @@ around them are built from child branches and a bookkeeping table:
 A commit ref ("branch@commit") is the commit's frozen branch: branch forks
 from it, exec and diff reactivate it and connect to it.
 
-reset, merge, rebase and revert are not provided. Xata's restore
+reset, merge, rebase and revert are not provided (IMPLEMENTATION_NOTES says why). Xata's restore
 endpoint is no in-place rollback (see IMPLEMENTATION_NOTES["reset"]).
 """
 
@@ -119,8 +119,11 @@ class XataToolSuite(DBToolSuite):
                 "Client-side because postgres_fdw cannot reach across branches: the branch host "
                 "names (nip.io) do not resolve inside a branch pod and the per-branch "
                 "NetworkPolicy blocks egress to other branches. Both sides are read in read-only "
-                "transactions; tables whose columns differ between the sides are not compared "
-                "and are listed under skipped_tables. Whether a row is modified is decided by "
+                "transactions. A table whose columns differ between the sides is not compared "
+                "and is listed under skipped_tables: a deliberate divergence from Neon, which "
+                "diffs the columns the two sides share, so where a diff crosses a schema change "
+                "on a table both sides have, a Xata/Neon difference in the counts is "
+                "definitional, not a discrepancy. Whether a row is modified is decided by "
                 "Python equality of the fetched values, so a NaN value reads as modified where "
                 "Neon's IS DISTINCT FROM would not",
         "commit_refs": "the commit's frozen branch: branch forks from it, exec and diff "
@@ -130,6 +133,13 @@ class XataToolSuite(DBToolSuite):
                  "archive to the latest archived segment; the source is unchanged, the request "
                  "takes no time or LSN (such fields are ignored), and writes are missing until "
                  "their WAL segment is archived. Scenarios branch from the commit ref instead",
+        "merge": "not provided: Xata has no merge of branches. The Neon backend simulates one "
+                 "as a SQL three-way merge over postgres_fdw, which cannot reach across Xata "
+                 "branches (see diff); a client-side one is not built",
+        "rebase": "not provided: no Xata equivalent; it would be the same three-way merge as "
+                  "merge, replayed onto the new base",
+        "revert": "not provided: no Xata equivalent; it would need the inverse of a commit's "
+                  "delta against its predecessor applied to the head, which is not built",
     }
 
     # ------------------------------------------------------------------
