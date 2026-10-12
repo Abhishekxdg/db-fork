@@ -12,8 +12,9 @@ prod  carries the micro results and the Full campaigns that publish.json names, 
       raw JSON of those records, index.html, styles.css, the page scripts and the six
       workflow diagram PNGs. No mock, quick, unvalidated or unselected record, no wizard, no README.
 local carries what build() and build_macro.build() find: the newest micro result per
-      system and machine (an invalid or failed newest file is listed as excluded), the
-      mocks, every campaign that passes validation, the wizard and the README.
+      system and machine (an invalid or failed newest file is listed as excluded), every
+      campaign that passes validation, the wizard and the README, plus the rows of
+      leaderboard.mock, the one module that knows about mock data.
 
 Both phases use the same page and the same ingestion; this module only selects and
 copies. Output goes only to <board>/.site/<phase>: it is prepared in a staging
@@ -32,7 +33,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from leaderboard import build, build_macro
+from leaderboard import build, build_macro, mock
 from leaderboard.validate import BOARD, MACHINE_RE, validate
 from leaderboard.validate_macro import MACRO_SUITE, OUTCOMES, SCENARIOS, VERBS
 
@@ -192,7 +193,8 @@ def assemble(phase: str, board: Path = BOARD) -> Path:
     try:
         macro_suite = {"suite": MACRO_SUITE, "scenarios": SCENARIOS, "outcomes": list(OUTCOMES), "verbs": list(VERBS)}
         js = lambda pairs: "".join(f"const {name} = {json.dumps(value, indent=1)};\n" for name, value in pairs)
-        (staging / "data.js").write_text(js((("site", {"phase": phase}), ("suite", suite), ("data", entries), ("excluded", excluded))))
+        rows = entries + (mock.entries(board) if phase == "local" else [])
+        (staging / "data.js").write_text(js((("site", {"phase": phase}), ("suite", suite), ("data", rows), ("excluded", excluded))))
         (staging / "macro-data.js").write_text(js((("macroSuite", macro_suite), ("macroCampaigns", campaigns), ("macroExcluded", macro_excluded))))
         for rel in [*PAGES[phase], *WORKFLOW_DIAGRAMS, *sorted(raw_files(entries, excluded, campaigns, macro_excluded, phase))]:
             (staging / rel).parent.mkdir(parents=True, exist_ok=True)

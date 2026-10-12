@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 from leaderboard.build import build
+from leaderboard.mock import entries as mock_rows
 from leaderboard.connector import Connector, connector_names, load_connector
 from leaderboard.run import RunError, clean_up, exclusive, scrub
 from leaderboard.validate import BOARD, SCHEMA_VERSION, sha256, validate
@@ -116,22 +117,20 @@ class ResultFiles(unittest.TestCase):
         self.assertIn("suite differs", excluded[0]["reason"])
 
     def test_a_mock_stands_in_only_until_a_real_file_exists(self) -> None:
-        mock = {"basis": "Mock, not a measurement.", "date": "2026-09-30", "machine": "box", "region": "r",
+        mock = {"date": "2026-09-30", "machine": "box", "region": "r",
                 "rtt_ms": 20.0, "client_location": "US East", "provision_time": 5.0, "load_time": 9.0,
                 "result": self.payload()["result"]}
         (self.board / "mock").mkdir()
         (self.board / "mock" / "neon.json").write_text(json.dumps(mock))
-        entries, _ = build(self.board)
-        self.assertEqual([(e["system"], e["mock"], e["source"]) for e in entries], [("Neon", True, "mock/neon.json")])
+        self.assertEqual(build(self.board), ([], []), "the build carries real results only")
+        self.assertEqual([(e["system"], e["date"], "source" in e) for e in mock_rows(self.board)], [("Neon", "2026-09-30", False)])
         self.write({"error": "RunError: neon failed"}, system="neon")
-        entries, excluded = build(self.board)
-        self.assertEqual((entries, [x["system"] for x in excluded]), ([], ["neon"]))
+        self.assertEqual(mock_rows(self.board), [], "a first result file, even an error record, retires the mock")
 
     def test_committed_mocks_match_the_suite(self) -> None:
         for path in sorted((BOARD / "mock").glob("*.json")):
             with self.subTest(path.name):
                 mock = json.loads(path.read_text())
-                self.assertTrue(mock["basis"].startswith("Mock, not a measurement."))
                 self.assertEqual(json.loads((BOARD / path.stem / "system.json").read_text())["hosted"], "yes")
                 self.assertEqual([len(r) for r in mock["result"]], [self.suite["tries"]] * len(self.suite["rows"]))
                 self.assertTrue(all(c > 0 for r in mock["result"] for c in r))

@@ -77,10 +77,9 @@ assert.match(html.match(/<main\b[^>]*>\s*<section\b([^>]*)>/)?.[1] ?? '', /\bid=
     'The leaderboard is the first main section, not a marketing hero');
 assert.match(html, /<h1\b[^>]*\bid="leaderboard-title"[^>]*>Leaderboard<\/h1>/);
 assert.doesNotMatch(html, /branch-visual|<section\b[^>]*class="hero\b|class="eyebrow">Database branching/);
-const entry = (system, value, tags, mock = false) => ({
-    system, machine: 'test', hosted: 'no', date: mock ? '2035-01-01' : '2026-09-30', source: 'test.json', tags, mock,
-    basis: 'Illustrative only', result: suite.rows.map(() => [value, value, value]),
-    load_time: value, provision_time: value,
+const entry = (system, value, tags) => ({
+    system, machine: 'test', hosted: 'no', date: '2026-09-30', source: 'test.json', commit: '0'.repeat(40), tags,
+    result: suite.rows.map(() => [value, value, value]), load_time: value, provision_time: value,
 });
 // Observers and frames never fire on their own: a test triggers them, so the scene's lifecycle is checked step by step.
 class FakeObserver {
@@ -331,16 +330,12 @@ assert.equal(document.activeElement, classNodes(secondRow, 'details-button')[0],
 classNodes(firstRow, 'details-button')[0].click();
 assert.match(classNodes(elements.get('run-body'), 'verdict')[0].textContent, /^1st of 2 by First query, score ×1\.00\. /, 'The leader is not compared with itself');
 click('close-run');
-// Production framing: a mock record is an ordinary row, ranked and charted like any other, with a flag that names it.
-const mocked = mount([entry('Measured', 0.06, ['sql']), entry('Preview', 0.001, ['sql'], true)]);
-const mockRows = bodyRows(mocked.byClass('summary')[0]);
-assert.deepEqual(mockRows.map(r => nameOf(r).textContent), ['Preview', 'Measured']);
-assert.deepEqual(mockRows.map(r => classNodes(r, 'flag').map(f => [f.textContent, f.title])), [[['Mock data', 'Illustrative only']], []]);
-assert.equal(classNodes(mocked.el('breakdowns'), 'chart-point').length, 2, 'and charted');
-assert.equal(mocked.el('updated').textContent, 'Last run 2026-09-30', 'A mock date never claims a fresh run');
-classNodes(mockRows[0], 'details-button')[0].click();
-assert.match(mocked.el('run-subtitle').textContent, / · mock data$/);
-assert.equal(classNodes(mocked.el('run-body'), 'notice')[0].textContent, 'Illustrative only');
+// The page has no notion of mock data: the local site's mock rows are ordinary rows. A row without a source or
+// reproducibility fields simply has no raw-record link and no empty reproducibility section.
+assert.doesNotMatch(scripts.join('\n'), /mock/i, 'No page script knows about mock data');
+const bare = mount([entry('Measured', 0.06, ['sql']), {...entry('Sample', 0.001, ['sql']), source: undefined, commit: undefined}]);
+classNodes(bodyRows(bare.byClass('summary')[0])[0], 'details-button')[0].click();
+assert.deepEqual([bare.el('run-title').textContent, bare.el('run-source').hidden, classNodes(bare.el('run-body'), 'inline-more').length, classNodes(bare.el('run-body'), 'notice').length], ['Sample', true, 0, 0]);
 
 // Agent workflows: a separate lane with explicit states, never a score. Every campaign the page receives passed
 // validation in the build, so a row is a result and nothing else: no flag, no caveat, no comparability state.

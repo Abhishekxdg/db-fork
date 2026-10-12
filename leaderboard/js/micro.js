@@ -106,7 +106,7 @@ function summaryTable(title, ctx) {
         ...Object.keys(SORTS).map(key => sortHeader(sortName(key), key === state.sort, state.sortDesc, descending => { state.sort = key; state.sortDesc = descending; writeHash(boardHash()); }, `sort-${key}-${measured[0].hosted}`)), colHead(node('span', 'sr-only', 'Details'), 'action-col')]);
     for (const e of order) {
         const tr = body.insertRow();
-        const th = systemHeader(rank.get(e), e, nameOf(e), [e.machine, e.date], e.mock ? [flag('Mock data', e.basis || 'Illustrative numbers, not a measurement')] : []); tr.append(th);
+        const th = systemHeader(rank.get(e), e, nameOf(e), [e.machine, e.date]); tr.append(th);
         if (!rank.has(e)) th.title = `Not ranked by ${SORTS[state.sort]}: ${missingText(by, e)}`;
         for (const key of Object.keys(SORTS)) {
             const td = tr.insertCell(); td.className = 'score-cell';
@@ -217,8 +217,7 @@ function breakdown(title, ctx, named) {
 
 // A system's details: why it sits where it does, every try, the environment, then provenance behind a disclosure.
 function showRun(e, opener, ctx) {
-    const body = openDetails(e.system, `${HOSTING[e.hosted]} · ${e.machine} · ${e.date} · ${e.version ? `v${e.version}` : 'version not recorded'}${e.mock ? ' · mock data' : ''}`, e.source, opener);
-    if (e.mock) body.append(node('p', 'notice', e.basis || 'Illustrative data, not a measured run.'));
+    const body = openDetails(e.system, `${HOSTING[e.hosted]} · ${e.machine} · ${e.date} · ${e.version ? `v${e.version}` : 'version not recorded'}`, e.source, opener);
     whyMicro(body, e, ctx);
     detailsSection(body, 'Every try', `Batch totals in seconds. Best repeat is the faster of tries 2 and 3; both must succeed. The column marked used is the leaderboard's current selection.`);
     const selected = state.mode === 'first' ? 0 : suite.tries;
@@ -234,7 +233,8 @@ function showRun(e, opener, ctx) {
     body.append(metaGrid([['Machine', e.machine], ['Database version', e.version], ['Suite', e.suite], ['Run ID', e.run_id], ['Configuration', e.tuned === 'yes' ? 'Tuned' : e.tuned === 'no' ? 'Default' : null],
         ['Load', seconds(e.load_time)], ['Provisioning', seconds(e.provision_time)], ['Region', e.region], ['Client location', e.client_location], ['Round-trip baseline', e.rtt_ms === undefined ? null : `${e.rtt_ms} ms`]]));
     if (e.tags.length) body.append(tagList(e.tags));
-    if (!e.mock) body.append(disclosure('Reproducibility details', metaGrid([['Git commit', e.commit], ['Seed', e.seed], ['Python', e.python], ['Suite SHA-256', e.suite_sha256], ['Dataset SHA-256', e.dataset_sha256], ['Dependency lock SHA-256', e.lock_sha256], ...Object.entries(e.service || {})])));
+    const reproducibility = metaGrid([['Git commit', e.commit], ['Seed', e.seed], ['Python', e.python], ['Suite SHA-256', e.suite_sha256], ['Dataset SHA-256', e.dataset_sha256], ['Dependency lock SHA-256', e.lock_sha256], ...Object.entries(e.service || {})]);
+    if (reproducibility.children.length) body.append(disclosure('Reproducibility details', reproducibility));
     showDetails();
 }
 // Why a measured system sits where it does: each category score, then every workload ratio that feeds it.
@@ -337,7 +337,7 @@ function renderDataset() {
     el('dataset-version').textContent = `${suite.suite} / ${suite.seed}`;
     el('suite-badge').textContent = suite.suite;
     el('method').textContent = `seed ${suite.seed} · ${suite.chain_length}-branch chain · isolated writes`;
-    const latest = data.filter(e => !e.mock).map(e => e.date).sort().at(-1);  // a mock's date never claims a fresh run
+    const latest = data.map(e => e.date).sort().at(-1);
     el('updated').textContent = latest ? `Last run ${latest}` : 'No published runs yet';
 }
 function renderMicro() {

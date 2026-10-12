@@ -2,9 +2,6 @@
 
 leaderboard.site writes the result as data.js into the phase's generated directory;
 `python -m leaderboard.build` delegates to it and builds the development site.
-
-A system with no result file yet is shown from leaderboard/mock/<system>.json, if
-one exists. Mock entries carry "mock": true, and the page labels them as mock.
 """
 
 from __future__ import annotations
@@ -26,20 +23,12 @@ def newest(board: Path, sources: set[str] | None = None) -> list[Path]:
     return list(found.values())
 
 
-def mocks(board: Path, measured: set[str]) -> list[dict]:
-    """Mock entries for the systems that have no result file, with their identity from system.json."""
-    return [{**json.loads((board / path.stem / "system.json").read_text()), **json.loads(path.read_text()),
-             "mock": True, "source": path.relative_to(board).as_posix()}
-            for path in sorted((board / "mock").glob("*.json")) if path.stem not in measured]
-
-
 def build(board: Path = BOARD, sources: set[str] | None = None) -> tuple[list[dict], list[dict]]:
     """Entries to rank, and excluded entries with their reasons. A newest file that
     is an error or invalid excludes its system and machine; no older file stands in.
-    With sources, only those files compete and no mock stands in for anything."""
-    entries, excluded, measured = [], [], set()
+    With sources, only those files compete."""
+    entries, excluded = [], []
     for path in newest(board, sources):
-        measured.add(path.parts[-4])
         source = path.relative_to(board).as_posix()
         if problems := validate(path, board):
             reason = "invalid: " + "; ".join(problems)
@@ -49,7 +38,7 @@ def build(board: Path = BOARD, sources: set[str] | None = None) -> tuple[list[di
             entries.append({**data, "source": source})
             continue
         excluded.append({"system": path.parts[-4], "machine": path.stem, "source": source, "reason": reason})
-    return entries + ([] if sources is not None else mocks(board, measured)), excluded
+    return entries, excluded
 
 
 def main() -> int:

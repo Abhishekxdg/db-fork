@@ -15,7 +15,7 @@ change it, and it is never part of a measurement's provenance.
 | Phase | Contents | Generated into |
 | --- | --- | --- |
 | `prod` (default) | Only the official records named in `leaderboard/publish.json`, their raw JSON, `index.html`, `styles.css` and the page scripts in `js/`. No mock, quick, unvalidated or unselected record, no wizard, no launcher routes, no README. | `leaderboard/.site/prod/` |
-| `local` | What the builders find on this machine: the newest microbench result per system and machine (an invalid or failed newest file is listed as excluded with its reason), the mocks, every campaign that passes validation (quick ones included), the run wizard (linked from the header as **Run a benchmark**), the Terminal launcher and this README. The page itself is the production page: it renders the validated records as ordinary rows; only a mock carries a **Mock data** flag. | `leaderboard/.site/local/` |
+| `local` | What the builders find on this machine: the newest microbench result per system and machine (an invalid or failed newest file is listed as excluded with its reason), the mock rows (see **Mock data**), every campaign that passes validation (quick ones included), the run wizard (linked from the header as **Run a benchmark**), the Terminal launcher and this README. The page itself is the production page: it renders the validated records as ordinary rows; only a mock carries a **Mock data** flag. | `leaderboard/.site/local/` |
 
 Three distinct commands, one per job:
 
@@ -92,8 +92,8 @@ Local laptop runs are not published by relabeling; the manifest names real recor
 The leaderboard's `local-4` suite uses the new shared API, but remains the
 eight-row **microbenchmark** below. The six macrobench scenarios run in a separate,
 unranked **Agent workflows** lane (see the last section). Only **Doltgres (`dolt`)
-and Dolt (`dolt_mysql`)** currently have leaderboard connectors. Neon, Xata and Tiger Cloud are mock previews, not
-runnable leaderboard systems. Main also has SeekDB and MatrixOne adapters, but
+and Dolt (`dolt_mysql`)** currently have leaderboard connectors. Neon, Xata and Tiger Cloud appear only as mock rows on the local site, not
+as runnable leaderboard systems. Main also has SeekDB and MatrixOne adapters, but
 neither has a leaderboard connector yet; main removed its Tiger adapter.
 
 `local-4` records branch creation from `BRANCH`, branch switches from `CONNECT`,
@@ -123,8 +123,7 @@ is part of the URL, so a link reopens the same table:
 `#microbench?try=best&sort=data&order=desc&workloads=insert,update&systems=Neon`
 holds the try, the sorted score, its order, the counted workloads and every
 narrowed filter (`hosting`, `systems`, `machines`, `capabilities`); unknown
-values fall back to the defaults. A row from a mock file is ranked like any other and
-carries a **Mock data** flag; production never contains one.
+values fall back to the defaults.
 
 Below the card, the workload heatmap shows every batch time: darker mint means
 closer to the fastest time within that row, and a check marks the fastest; a row
@@ -223,7 +222,7 @@ rejects such results, so they never reach the page.
 
 ## Hosted connectors (not implemented)
 
-The current hosted entries are mock previews only. Adding a hosted system
+The current hosted entries are mock rows only. Adding a hosted system
 requires a connector with credential preflight, provisioning, loading and scoped
 cleanup; a shared adapter alone does not make it runnable here. Tiger also needs
 an upstream adapter port to the new API before a leaderboard connector can use it.
@@ -271,18 +270,18 @@ because browser chrome cannot read CSS, and `theme-color` must equal `--canvas`.
 
 ## Mock data
 
-Until Neon, Tiger Cloud, and Xata have real runs, the page shows mock entries for
-them, from `leaderboard/mock/<system>.json`. These are illustrative numbers, not
-measurements. Branch create and connect follow earlier hosted measurements in
-`run_stats_final`, and data operations assume about 20 ms per statement from a
-client in US East. Each file's `basis` says so.
+Until Neon, Tiger Cloud, and Xata have real runs, `leaderboard/mock/<system>.json`
+holds sample numbers for them. `leaderboard/mock.py` is the only code that reads
+these files, and only the local site build calls it, appending one row per mock
+after the real results. The page shows these rows like any other: it has no
+notion of mock data. Production never carries one.
 
-- The build adds a mock only for a system with no result file. So a system's first
-  real result, or even its first error record, replaces its mock.
-- The local page ranks and charts a mock like any other row and flags it **Mock data**;
-  production never carries one, so it never meets a published result there.
-- Mock files sit outside `results/`, and the validator rejects a result file that
-  carries a `mock` key, so a mock cannot be published as a measurement.
+- A mock row exists only for a system with no result file. So a system's first
+  real result, or even its first error record, retires its mock.
+- A mock is not a record, so its row links to no source file, and the site
+  neither copies nor serves the mock files.
+- Mock files sit outside `results/`, and the validator rejects a result file with
+  keys it does not know, so a mock cannot be published as a measurement.
 - To remove them all, delete `leaderboard/mock/` and run the build again.
 
 ## What is measured

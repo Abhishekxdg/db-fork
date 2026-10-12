@@ -61,8 +61,6 @@ function parts(items, className = '') {
     items.filter(Boolean).forEach((text, i) => { if (i) line.append(' '); line.append(node('span', 'nowrap', i ? `· ${text}` : text)); });
     return line;
 }
-// A small flag beside a system's name. The full reason is its title.
-function flag(text, title) { const tag = node('span', 'flag', text); tag.title = title; return tag; }
 // Heat: how close a time is to the fastest in its row or column, painted with the --heat token at that strength. Only a
 // row or column with at least two times is a comparison, so only there does a cell get a background or a fastest mark.
 const compared = times => times.filter(t => t !== null).length >= 2;
@@ -148,13 +146,13 @@ function systemIcon(e) {
 }
 // The row header of every board: rank, mark, name and one line of context. A board that never ranks passes rank false.
 // The rank badge is drawn for the eye; a screen reader hears "Rank 2" or "Not ranked" before the name instead.
-function systemHeader(rank, e, name, meta, extra = []) {
+function systemHeader(rank, e, name, meta) {
     const text = node('span', 'system-text'), identity = node('span', 'system-identity');
     if (rank !== false) {
         const badge = node('span', 'rank-number' + (rank === 1 ? ' rank-leader' : ''), rank ? String(rank) : '—'); badge.setAttribute('aria-hidden', 'true');
         identity.append(badge); text.append(node('span', 'sr-only', rank ? `Rank ${rank}, ` : 'Not ranked, '));
     }
-    text.append(node('span', 'system-name', name), parts(meta, 'system-meta'), ...extra);
+    text.append(node('span', 'system-name', name), parts(meta, 'system-meta'));
     identity.append(systemIcon(e), text);
     return rowHead(identity, 'system-cell');
 }

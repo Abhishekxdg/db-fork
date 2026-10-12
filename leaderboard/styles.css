@@ -168,7 +168,6 @@ code { font: .92em/1.5 var(--mono); }
 .time-bar { height: 8px; margin: 0; border-radius: 4px; }
 .time-bar .bar-fill { background: var(--mint); }
 .heat { background-color: color-mix(in srgb, var(--heat) calc(var(--strength) * 100%), transparent); }
-.flag { display: inline-flex; align-items: center; gap: 5px; margin-top: 6px; padding: 2px 8px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--sheet); color: var(--muted); font-size: 11.5px; font-weight: 600; line-height: 1.5; }  /* a pill on one line, rounded corners when it wraps */
 .notice { margin: 14px 0 0; padding: 10px 14px; border-radius: 10px; background: var(--warn-tint); color: var(--warn-text); font-size: 13px; line-height: 1.6; }
 .pill-list { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0 0; padding: 0; list-style: none; }
 .pill-list li { padding: 3px 10px; border: 1px solid var(--line); border-radius: var(--pill); color: var(--muted); font-size: 12px; }

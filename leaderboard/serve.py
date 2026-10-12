@@ -7,7 +7,7 @@ From the repository root:
 Both assemble the phase's site first (leaderboard.site), then serve only that
 directory. Production serves index.html, styles.css, the two data files, the six
 workflow diagram PNGs and the published raw records; it has no wizard, no launcher
-routes, no mocks and no README.
+routes and no README.
 """
 
 import argparse
@@ -130,8 +130,7 @@ class Handler(SimpleHTTPRequestHandler):
                   and ((parts[1] == "results" and parts[3].endswith(".json"))
                        or (parts[1] == "macro" and parts[3].endswith(".json")
                            and any(r.fullmatch(parts[3].removesuffix(".json")) for r in (ATTEMPT_RE, CAMPAIGN_FILE_RE)))))
-        preview = self.phase == "local" and len(parts) == 2 and parts[0] == "mock" and parts[1] in {f"{s}.json" for s in SYSTEMS}
-        if ((path not in STATIC[self.phase] and not result and not preview)
+        if ((path not in STATIC[self.phase] and not result)
                 or not Path(self.translate_path(path)).resolve().is_relative_to((site.SITE / self.phase).resolve())):
             self.send_error(404)
             return None

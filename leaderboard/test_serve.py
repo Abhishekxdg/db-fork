@@ -197,7 +197,7 @@ class Launcher(unittest.TestCase):
                 local = phase == "local"
                 self.assertEqual(request("/run.html")[0], 200 if local else 404, "the wizard exists only in development")
                 self.assertEqual(request("/README.md")[0], 200 if local else 404)
-                self.assertEqual(request("/mock/tiger.json")[0], 200 if local else 404, "mock previews exist only in development")
+                self.assertEqual(request("/mock/tiger.json")[0], 404, "a mock file is not a record and is never served")
                 self.assertEqual(request(f"/{board.smoke}")[0], 200 if local else 404, "a smoke campaign is never served by production")
                 self.assertEqual(request(f"/{board.smoke_attempt}")[0], 200 if local else 404)
                 self.assertEqual(request(f"/{board.unpublished}")[0], 200 if local else 404, "a valid result the manifest does not name is not downloadable")
