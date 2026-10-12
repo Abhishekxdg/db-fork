@@ -178,9 +178,11 @@ class FakeSuite(DBToolSuite):
             try:
                 cur.execute("SELECT count(*) FROM t")
             except sqlite3.OperationalError:  # schemas without the probe table
-                return 0
+                return None
             return cur.fetchone()[0]
-        return {"rows_a": count(a), "rows_b": count(b)}
+        rows_a, rows_b = count(a), count(b)
+        # Without the probe table the fake has no row counts to report, rather than invented zeros.
+        return None if rows_a is None or rows_b is None else {"rows_a": rows_a, "rows_b": rows_b}
 
     def _reset_impl(self, ref: Ref, to: str) -> None:
         self.branches[ref.branch] = self.commits[to][1].copy()

@@ -11,6 +11,12 @@ collateral change, and the task's branches are deleted.
 Sentinels (item rows at reserved ids): 100000+t is written in the task
 state and never touched; 200000+t gets a rollout-specific price on every
 path; task B must not see task A's rows.
+
+Invariants: S1.1 the kept sentinel is readable from every leaf; S1.2 the
+path sentinel differs per leaf; S1.3 a task cannot see another task's
+sentinel; S1.4 the diff of a leaf against the task commit reports exactly
+the repair_audit rows the path inserted, at least the stock rows and the
+path sentinel it updated, and no deletion.
 """
 
 from macrobench import faults
@@ -58,6 +64,8 @@ class RlEnvScenario(Scenario):
         ctx, p = self.ctx, self.params
         suite, rng = w.suite, w.rng
         task_branch = f"task_{task_id}"
+        self._touched_steps = getattr(self, "_touched_steps", {})   # (branch, step) -> stock keys so far
+        self._touched = getattr(self, "_touched", {})               # leaf branch -> distinct stock rows updated
         fault, fw, fd = faults.pick_fault(rng, ctx.scale.warehouses)
 
         # 1. Task-specific state: fault + sentinels + registry row, committed.
@@ -114,21 +122,29 @@ class RlEnvScenario(Scenario):
                 ok = True
                 price = round(rollout * 1.25, 2)
                 budget = p.step_budget - fork_step
+                # Stock rows this path has updated, inherited from the fork
+                # point (the parent's rows up to that step).
+                touched = set(self._touched_steps.get((fork_ref.split("@")[0], fork_step), set()))
                 repair_at = rng.randint(1, max(1, budget)) if rng.random() < 0.5 else None
                 for i in range(budget):
                     ctx.check_stop()
                     step = fork_step + i + 1
-                    script = self._step_script(task_id, rollout, step, i == 0, price,
-                                               fault, fw, fd, fault_state,
-                                               repair=(repair_at == i + 1), rng=rng,
-                                               create_audit=(fork_step == 0))
-                    ok &= w.exec(script, branch, label="rollout_step").ok
+                    script, keys = self._step_script(task_id, rollout, step, i == 0, price,
+                                                     fault, fw, fd, fault_state,
+                                                     repair=(repair_at == i + 1), rng=rng,
+                                                     create_audit=(fork_step == 0))
+                    res = w.exec(script, branch, label="rollout_step")
+                    ok &= res.ok
+                    if res.ok:
+                        touched |= keys
                     steps_total += 1
                     if ctx.should_commit(i, last_step=(i == budget - 1)):
                         c = w.commit(branch, f"rollout {rollout} step {step}", label="step_commit")
                         ok &= c.ok
                         if c.ok and c.value:
                             recorded.append((f"{branch}@{c.value}", step))
+                            self._touched_steps[(branch, step)] = set(touched)
+                self._touched[branch] = len(touched)
                 leaves.append((branch, price))
                 ctx.tick(outcome="succeeded" if ok else "failed")
         if shortfall := p.group_size - len(leaves):
@@ -169,6 +185,7 @@ class RlEnvScenario(Scenario):
         do_ddl = first or rng.random() < ctx.data_ops.ddl_fraction
         start_item = rng.randint(1, max(1, ctx.scale.items - rows))
         conditions = [rng.choice(faults.CONDITIONS) for _ in range(reads)]
+        keys = {(fw, start_item + k * rows + j) for k in range(writes) for j in range(rows)}
 
         def script(db):
             if first:
@@ -200,7 +217,7 @@ class RlEnvScenario(Scenario):
             for cond in conditions:
                 db.sql(qs[cond])
             db.sql("SELECT COUNT(*) FROM repair_audit WHERE task_id = %s", (task_id,))
-        return script
+        return script, keys
 
     def _score(self, w: Worker, task_id: int, leaf_refs: list, task_ref: str) -> list:
         """Group-relative reward: -violations per leaf (cross-branch read),
@@ -231,10 +248,24 @@ class RlEnvScenario(Scenario):
             for res in results:
                 v = res.value if (res.ok and isinstance(res.value, dict)) else {}
                 rewards.append(-sum(x for x in v.values() if x > 0))
+        inv = ctx.invariants
         for ref in leaf_refs:
-            d = w.suite.diff(task_ref, ref, label="score_diff")
+            d = ctx.retry(lambda: w.suite.diff(task_ref, ref, label="score_diff"))
             if d.ok and isinstance(d.value, dict):
                 ctx.bump_metric("diff_rows_modified", int(d.value.get("rows_modified") or 0))
+                # S1.4: the diff of a leaf against the task commit must show
+                # exactly the repair_audit rows the path inserted (the table
+                # did not exist at the task commit), at least the stock rows
+                # and the path sentinel it updated, and no deletion.
+                audit = w.suite.exec(["SELECT COUNT(*) FROM repair_audit"], refs=[ref], label="invariant")[0]
+                n_audit = int(audit.rows[0][0]) if audit.ok and audit.rows else -1
+                v = d.value
+                added, deleted, modified = (int(v.get("rows_added") or 0), int(v.get("rows_deleted") or 0),
+                                            int(v.get("rows_modified") or 0))
+                min_mod = self._touched.get(ref, 0) + 1
+                inv.check(f"S1.4 diff of {ref} against the task commit reports the path's changes",
+                          n_audit >= 0 and added == n_audit and deleted == 0 and modified >= min_mod,
+                          f"added={added} (audit rows {n_audit}) deleted={deleted} modified={modified} (>= {min_mod} expected)")
         return rewards
 
     def _check_invariants(self, w: Worker, task_id: int, leaves: list):

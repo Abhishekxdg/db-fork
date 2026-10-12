@@ -109,7 +109,7 @@ both under `capabilities` and `implementation`.
 | Backend | branch | commit/diff/log | merge | rebase/revert | reset | delete | commit refs | multi-branch exec | exec_async |
 |---------|--------|-----------------|-------|---------------|-------|--------|-------------|-------------------|------------|
 | `dolt`, `dolt_mysql` | yes | yes | yes | yes | yes | yes | yes | yes | yes |
-| `neon` | yes | | | | restore (LSN/timestamp) | yes | | | yes |
+| `neon` | yes | yes (LSN + log table) | yes (SQL three-way over postgres_fdw) | yes | yes (restore to LSN) | yes | yes | per-ref fallback | yes |
 | `xata` | yes | | | | | yes | | | yes |
 | `seekdb` | yes | yes (SCN snapshots) | yes (SQL three-way) | yes | yes | yes | yes | yes | yes |
 | `matrixone` | yes | yes (snapshots) | yes (DATA BRANCH MERGE) | yes | yes (diff-driven) | yes | yes | yes | yes |
@@ -167,7 +167,7 @@ whether the sentinel-based invariance checks held.
 | S1 Agentic RL environment | `rl_env` | T task branches, G rollout leaves each, forks from recorded steps | branch (from commit), commit, diff, delete |
 | S2 Agent context management | `context_mgmt` | long spine, candidate branches per compaction | branch, commit, merge (ff), revert, rebase, delete |
 | S3 Multi-agent collaboration | `multi_agent` | N agents merging into a spine that keeps changing | branch, commit, log, merge (with conflicts), delete |
-| S4 Development agent | `dev_agent` | dev branches off a busy production spine, never merged | branch, commit, rebase (with conflicts), delete |
+| S4 Development agent | `dev_agent` | dev branches off a busy production spine, never merged; one spine migration adds a column the branches already added with another type (a schema conflict at their next rebase, which the branch resolves by moving its column and retrying; a backend that replays history merges the spine in instead) | branch, commit, rebase (with data and schema conflicts), merge (conflict recovery), delete |
 | S5 Operations agent | `ops_agent` | dense commits, bad deploy, investigation branches, PITR | branch (from commit), commit, diff, reset, delete |
 | S6 Data agent | `data_agent` | ingestion batches rebased and merged into a warehouse | branch, commit, reset, rebase, merge, delete |
 
@@ -222,8 +222,9 @@ workload {
 ### Running
 
 ```bash
-./scripts/run_macrobench.sh [--mini] [--outdir DIR] [--max-runtime-sec N] [--measure-storage] \
-    [--branch-intensity X] [--data-intensity Y] <scenario> <backend> [scale_factor]
+./scripts/run_macrobench.sh [--mini] [--outdir DIR] [--max-runtime-sec N] [--op-stall-sec N] \
+    [--measure-storage] [--storage-sample-interval SEC] [--branch-intensity X] [--data-intensity Y] \
+    <scenario> <backend> [scale_factor]
 ```
 
 | Argument | Description |
@@ -231,6 +232,10 @@ workload {
 | `scenario` | `rl_env`, `context_mgmt`, `multi_agent`, `dev_agent`, `ops_agent`, `data_agent` |
 | `backend` | `dolt`, `dolt_mysql`, `seekdb`, `matrixone`, `neon`, `xata`, `file_copy` |
 | `scale_factor` | W warehouses for the generated data (default: the config's) |
+| `--max-runtime-sec N` | runtime cap; default one hour times the largest of the scale factor and the intensity multipliers (3600 s at scale 1, intensity 1), 0 = no cap. A run that reaches it (or gets Ctrl-C / SIGTERM) is recorded as `interrupted` with its rows and stats written |
+| `--op-stall-sec N` | stall limit for one operation: a verb or an exec that has been running longer than this (default 600 s, 0 = off) is cancelled and recorded `FAILED` with a `stalled: cancelled after Ns` note; the run goes on, so later failures and invariant results are recorded too; the e2e stats list the cancelled operations under `stalls` with their outcome (`failed`, or `completed` when it finished before the cancel landed), and a run with a cancelled operation that failed ends with status `incomplete` instead of `completed` |
+| `--storage-sample-interval SEC` | seconds between background storage samples (default 5, 0 = off) |
+| `--measure-storage` | also measure storage around every operation |
 
 ```bash
 ./scripts/run_macrobench.sh --mini rl_env dolt
@@ -246,6 +251,29 @@ A backend that lacks a verb still runs the whole scenario: the verb is
 recorded as UNSUPPORTED, `workflow_supported` is false in the e2e stats, and
 invariance checks that depend on it are reported as not applicable.
 
+#### Storage
+
+Every run records the backend's storage size (`DBToolSuite._storage_bytes()`:
+the database's own directory on Dolt, the whole server data directory on
+SeekDB and MatrixOne, which declare `STORAGE_SCOPE = "server"`) at four
+workflow-level points, written to the e2e stats under `storage.points`:
+
+| Point | When |
+|---|---|
+| `after_setup` | schema and seed data loaded, before the scenario |
+| `after_workflow` | the scenario is done (its branches deleted) |
+| `after_gc` | after the backend's GC/flush hook (`gc()`: `dolt_gc`, MatrixOne checkpoint; UNSUPPORTED on SeekDB) |
+| `after_cleanup` | the run's database dropped (and, on Dolt, the dropped databases purged) |
+
+A background sampler also records the size every 5 s during the scenario
+(`storage.samples`, wall-clock seconds and bytes); `--storage-sample-interval
+SEC` changes the interval (`0` turns it off), as does
+`storage_sample_interval_sec` in the config. `--measure-storage` additionally
+measures before and after every verb and every exec() call (two directory
+walks per operation; off by default, and not attributable under concurrent
+workers). The report's `storage.png` draws the sampled series with the four
+points as markers; `summary.md` carries them as `storage_after_*_mb`.
+
 ### Output
 
 ```
@@ -255,10 +283,13 @@ run_stats/
 ```
 
 The e2e stats carry the workload parameters, the seed statistics,
-`capabilities`, `workflow_supported` with `unsupported_ops` and
-`op_status_counts`, the `invariants` results, the scenario's own `metrics`
-(e.g. S3 merge order and conflicts, S5 time to recovery, S6 fast-forward vs
-three-way merges) and the spine load's transaction counts.
+`capabilities` and `implementation` (how the backend realises each verb:
+native, composed or simulated), `workflow_supported` with `unsupported_ops`
+and `op_status_counts`, the `invariants` results, the scenario's own
+`metrics` (e.g. S3 merge order and conflicts, S5 time to recovery, S6
+fast-forward vs three-way merges), the spine load's transaction counts and
+the `storage` block (the four workflow-level points, the GC status, the
+sampled series; see [Storage](#storage)).
 
 ---
 
@@ -449,12 +480,13 @@ uv run python scripts/plotting/plot_macrobench.py \
 | `data/summary.md`, `data/summary.csv` | per run: status, elapsed/setup time, support, invariants, agent op counts and median latency per verb (spine load excluded), spine throughput and statement latency, scenario metrics |
 | `time_breakdown.png` | summed latency split into branch ops (verbs plus the connection switch `exec()` does to reach a ref) and data ops (statements); spine load excluded |
 | `latency_by_op_branch.png`, `latency_by_op_data.png`, `data/latency_by_op.md/.csv` | one panel per operation (branch verbs + CONNECT in one figure; statements inside `exec()` + EXEC in the other, with READ/UPDATE/DELETE split into point vs range by rows touched, READ:scan for aggregate/join reads, INSERT:bulk for multi-row inserts): median latency with a 95% CI, grouped by scenario (shaded bands), colour = backend; ops some backends lack are grouped last; the .md adds a backend x op support matrix |
+| `latency_cross_branch.png`, `data/cross_branch.md/.csv` | one scenario-level read over several branches (rl_env's `score` over a task's 16 leaves, context_mgmt's `policy_check` over the candidates) as a single logical step: median wall-clock latency per backend, whisker to p90, annotated `multi` (one multi-ref `exec()`) or `per_ref x N` (the same read once per branch on a backend without multi-branch queries, N connection switches included); the table adds the summed exec latency and the per-branch cost |
 | `latency_exec_by_label.png`, `data/exec_by_label.md/.csv` | `exec()` latency per script label (rollout_step, ingest, spine, ...) with statements per exec, and the mean exec time split into READ/INSERT/UPDATE/DELETE_ROWS/DDL/CONNECT/other |
 | `progress.png` | completed agent steps (branch verbs and `exec()` runs, background load excluded) against elapsed seconds, one curve per backend |
 | `exec_time_by_op.png` | per scenario, one horizontal 100% bar per script label and backend (adjacent rows) showing where `exec()` time goes: statement types, CONNECT, and `other` (untimed BEGIN/COMMIT/ROLLBACK round trips plus the Python between statements); mean ms and count at the bar end |
 | `data/data_ops.md/.csv` | data statements (READ/INSERT/UPDATE/DELETE_ROWS/DDL) split by workload role: spine traffic vs. the agent's own statements (ingest, backfill, rollout_step, ...) |
 | `cdf/latency_cdf_<scenario>.png` | latency CDF of each branch verb and data statement type (agent rows only), one line per backend |
-| `storage.png` | database size over the run (runs made with `--measure-storage`) |
+| `storage.png` | storage over the run: the 5 s sampled series (or the per-operation sizes of runs made with `--measure-storage`) with the four workflow-level points as markers; log axis when database-scope and server-scope backends share a panel |
 
 Only the newest run per (scenario, backend) is used unless `--all-runs` is
 given; `--run-glob` narrows by run id (e.g. `'macro_*_mini_*'`).
@@ -736,6 +768,81 @@ A commit ref used with `exec()` is materialised as a temporary branch
 (`<db>__tmp_*`) created from the snapshot and dropped when the connection
 closes. `drop_database()` drops every branch database and every snapshot of
 the run (`bb_<db>_*`). Async mode uses an aiomysql pool, like `dolt_mysql`.
+
+---
+
+## Neon backend — `neon` (Lakebase Postgres on Neon)
+
+Runs against Neon's API (`console.neon.tech/api/v2`) with `NEON_API_KEY_ORG`
+from `.env`. Each run creates a project of its own (`project_<db_name>`,
+region `NEON_REGION`, default `aws-us-east-1`, Postgres `NEON_PG_VERSION`
+17, a 2-day history window `NEON_HISTORY_RETENTION_SEC`) and deletes it
+afterwards; stale benchmark projects left by interrupted runs are deleted
+before a run starts. Every compute is a fixed `NEON_COMPUTE_CU` (2 CU) and never
+auto-suspends (`NEON_BRANCH_SUSPEND_TIMEOUT_SEC=-1`): Neon's scale-to-zero
+counts only running statements as activity, so with the plan default (5
+min on Launch) a compute that a worker holds but has not queried for 5
+minutes, or one a merge reads over `postgres_fdw` while busy elsewhere, is
+suspended under its connections ("SSL connection has been closed
+unexpectedly"). Computes are suspended explicitly instead, by the
+active-compute budget below and on delete.
+
+Branches are Neon branches with one read-write compute each. Neon versions
+storage but has no commits, diff or merge, so the adapter builds them from
+point-in-time branching (`parent_lsn`), branch restore and `postgres_fdw`:
+
+- `branch()` (native): `POST /branches` with `parent_id`, `parent_lsn` for a
+  commit ref, and a compute; the verb waits for the operations to finish
+  and writes a fork row on the new branch (its own LSN and the parent point
+  it was cloned from, the base of later merges).
+- `commit()` (composed): a row in the branch's `_bb_commits` table plus
+  `pg_current_wal_flush_lsn()` as the commit's point in time; `log()` reads
+  the table. A commit ref is read through a temporary branch at that LSN,
+  cached between uses, deleted when the connection closes.
+- `diff()`: per table a row hash on each compute; the differing tables are
+  pulled over `postgres_fdw` into temp tables and compared locally.
+- `merge()`: SQL three-way merge on the target's compute. The base is a
+  temporary branch at the source's fork LSN (its creation is inside the
+  verb's latency), theirs is the source's compute, both pulled over
+  `postgres_fdw`; rows are matched by primary key, conflicts resolved per
+  `on_conflict` with the same callable row shape as the other backends;
+  deletes go in reverse foreign-key order and upserts in forward order
+  (the role is not a superuser, so constraints stay on).
+- `rebase()`: the same three-way merge of the upstream into the branch,
+  then a rebase row moves the branch's base to the upstream's LSN so the
+  merge back only sees newer changes.
+- `revert()`: temporary branches at the commit's LSN and its predecessor,
+  inverse delta applied locally.
+- `reset()` (native): `POST /branches/{id}/restore` to the commit's LSN.
+  Neon requires `preserve_under_name` and keeps the pre-restore state in a
+  backup branch (`<branch>_bk_*`) that cannot be deleted before the project.
+- `delete()` (native): `DELETE /branches/{id}`; a branch that still has
+  children is deferred and retried after later deletes and at close.
+- Multi-branch queries (`exec(mode="multi")`) are not provided: Neon has no
+  multi-branch query semantics, and the scenarios' cross-branch reads run
+  once per branch instead (recorded as the `multi_ref_exec: unsupported`
+  implementation entry).
+
+Quotas are capacity, not errors. Neon limits *active computes* per
+project (20 on the Launch plan, the default branch exempt), not branches,
+so the process keeps at most `NEON_ACTIVE_BUDGET` (18) computes active:
+when a compute is needed above that, the least recently used one that no
+connection holds is suspended first (`NEON_SUSPEND_ON_SWITCH=1` instead
+suspends a branch's compute whenever the connection moves off it); a
+suspended compute resumes on the next connect, and both land in `CONNECT`.
+A connect refused for the compute limit rebuilds the registry from
+Neon's own list of active computes, suspends the least recently used
+ones no connection holds, and retries (`active_compute_limit_hits`,
+`limit_suspends` and `active_compute_unregistered` in the e2e stats'
+`backend_observations` count how often that happened). All API calls share one process-wide token bucket under the
+documented 700 requests/minute (`NEON_API_RATE_PER_MIN`, `NEON_API_BURST`);
+bucket waits are part of the verb's cost and are summed in the e2e stats'
+`backend_observations`, while reactive waits (429/423/503 backoff, compute
+limit) are recorded as `API_RETRY_WAIT` rows. Connections use the unpooled
+endpoint: the pooler runs PgBouncer in transaction mode, where session
+state (temp tables, the `search_path` postgres_fdw sets on its remote
+sessions) leaks between clients. Storage is the sum of the branches'
+`logical_size` from the API; there is no GC hook.
 
 ---
 
