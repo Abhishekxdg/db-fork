@@ -295,3 +295,25 @@ def test_runner_threads_leave_thread_internals_alone():
         thread.stop()
     watchdog.join(timeout=5)
     assert not sampler.is_alive() and not watchdog.is_alive()
+
+
+def test_a_failed_spill_keeps_its_rows(tmp_path):
+    """A spill write that fails keeps its batch for the next spill or the final write, so the
+    parquet file holds every row the summary counts."""
+    import pyarrow.parquet as pq
+    from dblib import result_pb2 as rslt
+    collector = rc.ResultCollector(run_id="spill", output_dir=str(tmp_path), spill_rows=2)
+    write, calls = collector._write_batch, []
+
+    def flaky(batch):
+        calls.append(len(batch))
+        if len(calls) == 1:
+            raise OSError("disk hiccup")
+        write(batch)
+    collector._write_batch = flaky
+    for _ in range(4):
+        collector.emit(rslt.OpType.BRANCH, latency=0.01)
+    collector.write_to_parquet(append=False)
+    assert calls[0] == 2 and len(calls) >= 2, calls
+    assert pq.read_table(tmp_path / "spill.parquet").num_rows == 4
+    assert collector.support_summary()["op_status_counts"]["BRANCH"]["ok"] == 4

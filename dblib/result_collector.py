@@ -496,7 +496,12 @@ class ResultCollector:
                 if self.spill_rows and len(self.results) >= self.spill_rows:
                     batch, self.results = self.results, []
             if batch:
-                self._write_batch(batch)
+                try:
+                    self._write_batch(batch)
+                except Exception:
+                    with self._lock:  # kept, ahead of the rows emitted since, for the next spill or the final write
+                        self.results[:0] = batch
+                    raise
         except Exception as e:
             import sys
             import traceback
