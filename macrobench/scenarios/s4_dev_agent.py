@@ -328,6 +328,8 @@ class DevAgentScenario(Scenario):
                         else:
                             inv.check(f"S4.3b {branch} incorporates the spine after moving its column", False,
                                       f"column move failed: {rn.error[:120]}")
+                    elif rb.unsupported:  # the backend cannot rebase, so the branch never meets the conflict
+                        inv.not_applicable(f"S4.3 schema-conflict rebase of {branch} (rebase {rebases_done})", "rebase unsupported")
                     else:
                         inv.check(f"S4.3a schema-conflict rebase of {branch} keeps both sides",
                                   intact and schema_after["migrations"] == spine_migrations,

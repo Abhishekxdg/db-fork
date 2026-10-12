@@ -4,6 +4,8 @@ UNSUPPORTED, so these runs check the "never stop the workload" contract:
 the lifecycle completes, unsupported verbs are recorded, and the
 invariants that depend on them are marked not applicable."""
 
+import random
+
 import pytest
 from google.protobuf import text_format
 
@@ -216,6 +218,25 @@ class _ProbeLostSuite(FakeSuite):
         if kwargs.get("timed") is False and ("information_schema" in text or "loyalty_tier" in text):
             return [ExecResult(op="exec", status=OpStatus.FAILED, ref="main", refs=["main"], error="connection lost")]
         return super().exec(script, refs, **kwargs)
+
+
+def test_s4_conflict_on_a_backend_without_rebase_is_not_applicable():
+    """A branch alive at the conflicting migration meets it at its next rebase. A backend
+    that cannot rebase never meets it: S4.3 is not applicable, never a failed check."""
+    ctx, scenario, suite = _run("dev_agent", schema_conflict_migration=1, spine_migration_interval=0)
+    tick, migrated = ctx.tick, []
+
+    def tick_then_migrate(*args, **kwargs):  # the conflicting migration lands right after the first step
+        tick(*args, **kwargs)
+        if not migrated:
+            migrated.append(True)
+            scenario._migrate(suite, random.Random(0))
+    ctx.tick = tick_then_migrate
+    scenario.run()
+    results = ctx.invariants.summary()["results"]
+    assert migrated and scenario._schema_conflict_applied
+    assert not [r for r in results if r["passed"] is False], results
+    assert [r for r in results if r["name"].startswith("S4.3") and r["passed"] is None], results
 
 
 def test_s4_isolation_check_fails_when_the_spine_cannot_be_probed():
