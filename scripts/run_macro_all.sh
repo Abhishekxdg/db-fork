@@ -6,8 +6,8 @@
 #   ./scripts/run_macro_all.sh [--mini] [--max-runtime-sec N] [--outroot DIR] \
 #       [--no-manage-servers] [--storage-sample-interval SEC] [--measure-storage] [backend ...]
 #
-#   backend ...   subset of: dolt dolt_mysql seekdb matrixone neon
-#                 (default: all five)
+#   backend ...   subset of: dolt dolt_mysql seekdb matrixone neon file_copy chronos
+#                 (default: all seven; bauplan and xata are not run by default)
 #
 # Results land in <outroot>/<backend>/ with one log per run under
 # <outroot>/logs/ and a driver log with start/end stamps. The default
@@ -18,7 +18,11 @@
 # is not listening, and a server this script started is stopped after that
 # backend's runs (and on Ctrl-C / exit). A server that was already running
 # is used as is and left running. --no-manage-servers skips all of that and
-# only checks reachability. Neon is remote and needs NEON_API_KEY_ORG.
+# only checks reachability. Neon is remote and needs NEON_API_KEY_ORG (from
+# the environment or .env).
+# file_copy and chronos share the PostgreSQL 18 server (PGSQL_* in .env,
+# cluster at $PGSQL_DATA_DIR/pgdata, run as the postgres user via sudo); it
+# is started once for both and stopped with pg_ctl after the last of them.
 #
 # Storage: every run records the backend's storage size at four workflow
 # points (after setup, after the workflow, after GC, after cleanup) and
@@ -54,7 +58,7 @@ done
 
 BACKENDS=("$@")
 if [[ ${#BACKENDS[@]} -eq 0 ]]; then
-    BACKENDS=(dolt dolt_mysql seekdb matrixone neon)
+    BACKENDS=(dolt dolt_mysql seekdb matrixone neon file_copy chronos)
 fi
 SCENARIOS=(rl_env context_mgmt multi_agent dev_agent ops_agent data_agent)
 
@@ -74,14 +78,34 @@ log()   { echo "=== $* $(stamp)" | tee -a "$DRIVER"; }
 # Local servers
 # --------------------------------------------------------------------------
 
+# PostgreSQL 18 server shared by file_copy and chronos (settings from .env).
+envval() { local v; v=$(grep -E "^$1=" .env 2>/dev/null | tail -1 | cut -d= -f2-); echo "${v:-$2}"; }
+PGSQL_HOST=$(envval PGSQL_HOST 127.0.0.1)
+PGSQL_PORT=$(envval PGSQL_PORT 5434)
+PGSQL_USER=$(envval PGSQL_USER postgres)
+PGSQL_PASSWORD=$(envval PGSQL_PASSWORD password)
+PGSQL_DATA_DIR=$(envval PGSQL_DATA_DIR /mnt/pgbench)
+PG_BIN=/usr/lib/postgresql/18/bin
+PG_DATA="$PGSQL_DATA_DIR/pgdata"
+
+# The server a backend runs on: itself, or pg18 for the two Postgres-based
+# backends; neon is remote.
+server_of() {
+    case "$1" in
+        file_copy|chronos) echo pg18 ;;
+        *)                 echo "$1" ;;
+    esac
+}
+
 # Port each local backend listens on; neon is remote.
 port_of() {
     case "$1" in
-        dolt)       echo 5432 ;;
-        dolt_mysql) echo 3306 ;;
-        seekdb)     echo 2881 ;;
-        matrixone)  echo 6001 ;;
-        *)          echo "" ;;
+        dolt)              echo 5432 ;;
+        dolt_mysql)        echo 3306 ;;
+        seekdb)            echo 2881 ;;
+        matrixone)         echo 6001 ;;
+        file_copy|chronos) echo "$PGSQL_PORT" ;;
+        *)                 echo "" ;;
     esac
 }
 
@@ -99,16 +123,21 @@ probe() {
             uv run python -c "import pymysql; pymysql.connect(host='127.0.0.1', port=2881, user='root', password='').cursor().execute('SELECT 1')" ;;
         matrixone)
             uv run python -c "import pymysql; pymysql.connect(host='127.0.0.1', port=6001, user='root', password='111').cursor().execute('SELECT 1')" ;;
+        file_copy|chronos)
+            PGHOST="$PGSQL_HOST" PGPORT="$PGSQL_PORT" PGUSER="$PGSQL_USER" PGPASSWORD="$PGSQL_PASSWORD" \
+                uv run python -c "import psycopg2; psycopg2.connect(dbname='postgres').cursor().execute('SELECT 1')" ;;
         *) return 1 ;;
     esac
 } 2>/dev/null
 
-# Backends whose server this script started: "<backend>=<pid>" entries.
+# Servers this script started: "<server>=<pid>" entries (see server_of).
 STARTED=()
 
 start_server() {
-    local b="$1" slog="$OUTROOT/logs/${b}_server.log" pid
-    case "$b" in
+    local b="$1" srv slog pid
+    srv=$(server_of "$b")
+    slog="$OUTROOT/logs/${srv}_server.log"
+    case "$srv" in
         dolt)
             # DoltgreSQL source build; data dir is doltgres's default.
             (cd ~/doltgresql && exec ./doltgres -data-dir ~/doltgres/databases) >> "$slog" 2>&1 &
@@ -127,44 +156,68 @@ start_server() {
             # earlier runs' server-side history.
             (cd ~/mo/matrixone && exec ./mo-service -launch ./etc/launch/launch.toml) >> ~/mo/mo-service.log 2>&1 &
             pid=$! ;;
+        pg18)
+            # The cluster lives on a loop-mounted XFS image (reflink clones);
+            # re-mount it after a reboot. pg_ctl daemonizes; its own log is
+            # $PGSQL_DATA_DIR/pg.log and the pid is in postmaster.pid.
+            if ! mountpoint -q "$PGSQL_DATA_DIR" && [[ -f "$HOME/pgbench.img" ]]; then
+                log "MOUNTING $HOME/pgbench.img on $PGSQL_DATA_DIR"
+                sudo -n mount -o loop "$HOME/pgbench.img" "$PGSQL_DATA_DIR" >> "$slog" 2>&1
+            fi
+            sudo -n -u postgres "$PG_BIN/pg_ctl" -D "$PG_DATA" -l "$PGSQL_DATA_DIR/pg.log" -w start >> "$slog" 2>&1
+            pid=$(sudo -n head -1 "$PG_DATA/postmaster.pid" 2>/dev/null || echo "") ;;
         *) return 1 ;;
     esac
     if [[ -z "$pid" ]]; then
-        log "FAILED to start $b (no pid)"
+        log "FAILED to start $srv (no pid)"
         return 1
     fi
-    STARTED+=("$b=$pid")
-    log "STARTED $b server pid=$pid (log: $slog)"
+    STARTED+=("$srv=$pid")
+    log "STARTED $srv server pid=$pid (log: $slog)"
     local i
     for i in $(seq 1 120); do
         if listening "$(port_of "$b")" && probe "$b"; then
-            log "READY $b after ~$((i * 2))s"
+            log "READY $srv after ~$((i * 2))s"
             return 0
         fi
         if ! kill -0 "$pid" 2>/dev/null; then
-            log "FAILED $b server exited during startup (see $slog)"
+            log "FAILED $srv server exited during startup (see $slog)"
             return 1
         fi
         sleep 2
     done
-    log "FAILED $b server not ready after 240s"
+    log "FAILED $srv server not ready after 240s"
     return 1
 }
 
+# Takes a server name (see server_of) and the pid recorded at start.
 stop_server() {
-    local b="$1" pid="$2" port
-    port=$(port_of "$b")
-    log "STOPPING $b server pid=$pid"
+    local srv="$1" pid="$2" port
+    case "$srv" in
+        dolt)       port=5432 ;;
+        dolt_mysql) port=3306 ;;
+        seekdb)     port=2881 ;;
+        matrixone)  port=6001 ;;
+        pg18)       port=$PGSQL_PORT ;;
+    esac
+    log "STOPPING $srv server pid=$pid"
+    if [[ "$srv" == pg18 ]]; then
+        # A fast shutdown (TERM alone is a smart shutdown that waits for
+        # every session, and KILL would force crash recovery next time).
+        sudo -n -u postgres "$PG_BIN/pg_ctl" -D "$PG_DATA" -m fast -t 60 -w stop >> "$OUTROOT/logs/pg18_server.log" 2>&1 \
+            && log "STOPPED $srv" || log "FAILED to stop $srv (see logs/pg18_server.log)"
+        return 0
+    fi
     kill -TERM "$pid" 2>/dev/null
     local i
     for i in $(seq 1 60); do
         if ! kill -0 "$pid" 2>/dev/null && ! listening "$port"; then
-            log "STOPPED $b"
+            log "STOPPED $srv"
             return 0
         fi
         sleep 1
     done
-    log "KILLING $b (did not stop in 60s)"
+    log "KILLING $srv (did not stop in 60s)"
     kill -KILL "$pid" 2>/dev/null
 }
 
@@ -181,13 +234,13 @@ trap stop_started EXIT
 ensure_backend() {
     local b="$1"
     if [[ "$b" == neon ]]; then
-        [[ -n "${NEON_API_KEY_ORG:-}" ]] && return 0
+        [[ -n "${NEON_API_KEY_ORG:-$(envval NEON_API_KEY_ORG)}" ]] && return 0
         log "SKIP neon: NEON_API_KEY_ORG is not set"
         return 1
     fi
     if listening "$(port_of "$b")"; then
         if probe "$b"; then
-            log "USING running $b server on :$(port_of "$b") (left running at the end)"
+            log "USING running $(server_of "$b") server on :$(port_of "$b") (left running at the end)"
             return 0
         fi
         log "SKIP $b: port $(port_of "$b") is open but a query failed"
@@ -205,7 +258,8 @@ ensure_backend() {
 # --------------------------------------------------------------------------
 
 log "RUN SET outroot=$OUTROOT backends=${BACKENDS[*]} mini=${MINI:-no} cap=${MAX_RUNTIME_SEC}s manage_servers=$MANAGE_SERVERS"
-for b in "${BACKENDS[@]}"; do
+for idx in "${!BACKENDS[@]}"; do
+    b="${BACKENDS[$idx]}"
     ensure_backend "$b" || continue
     for s in "${SCENARIOS[@]}"; do
         log "START $s $b"
@@ -214,13 +268,21 @@ for b in "${BACKENDS[@]}"; do
         rc=$?
         log "END $s $b rc=$rc"
     done
-    # Stop only the server this script started for this backend.
-    for i in "${!STARTED[@]}"; do
-        if [[ "${STARTED[$i]%%=*}" == "$b" ]]; then
-            stop_server "$b" "${STARTED[$i]##*=}"
-            unset 'STARTED[i]'
-        fi
+    # Stop the server this script started for this backend, unless a later
+    # backend in the list runs on the same server (file_copy and chronos).
+    srv=$(server_of "$b")
+    still_needed=false
+    for later in "${BACKENDS[@]:idx+1}"; do
+        [[ "$(server_of "$later")" == "$srv" ]] && still_needed=true
     done
-    STARTED=("${STARTED[@]+"${STARTED[@]}"}")
+    if ! $still_needed; then
+        for i in "${!STARTED[@]}"; do
+            if [[ "${STARTED[$i]%%=*}" == "$srv" ]]; then
+                stop_server "$srv" "${STARTED[$i]##*=}"
+                unset 'STARTED[i]'
+            fi
+        done
+        STARTED=("${STARTED[@]+"${STARTED[@]}"}")
+    fi
 done
 log "ALL DONE"

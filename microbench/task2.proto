@@ -12,6 +12,7 @@ enum Backend {
   SEEKDB = 8;
   MATRIXONE = 9;
   CHRONOS = 10;
+  BAUPLAN = 11;
 }
 
 // Operation types for benchmarking
