@@ -4,11 +4,12 @@
 # Usage:
 #   ./scripts/run_macrobench.sh [--mini] [--outdir DIR] [--max-runtime-sec N] [--op-stall-sec N] \
 #       [--measure-storage] [--storage-sample-interval SEC] [--branch-intensity X] [--data-intensity Y] \
+#       [--native-only] \
 #       <scenario> <backend> [scale_factor]
 #
 # Arguments:
 #   scenario      rl_env | context_mgmt | multi_agent | dev_agent | ops_agent | data_agent
-#   backend       dolt | dolt_mysql | seekdb | matrixone | neon | xata | file_copy | chronos
+#   backend       dolt | dolt_mysql | seekdb | matrixone | bauplan | neon | xata | file_copy | chronos
 #   scale_factor  W warehouses for the generated CH-benCHmark data (default: the config's)
 #
 # The base config is macrobench/configs/<scenario>[_mini].textproto; run_id,
@@ -26,10 +27,26 @@
 # --op-stall-sec (default 600) is cancelled: it is recorded FAILED with a
 # stall note and the run goes on (the e2e stats list the stalls).
 
+# The whole script is one { ... } block: bash parses it completely before
+# running it, so editing this file during a sweep cannot break the run in
+# progress (bash otherwise reads scripts incrementally by byte offset).
+{
 set -euo pipefail
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+# Export .env so backend host/ssh settings (DBFORK_SERVER_HOST, DOLT_HOST,
+# SEEKDB_SSH, ...) reach every adapter, not only the two that load it
+# themselves. Variables already set in the environment win.
+if [[ -f "$REPO/.env" ]]; then
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || continue
+        k=${line%%=*}; v=${line#*=}; v=${v%\"}; v=${v#\"}
+        [[ -n "${!k:-}" ]] || export "$k=$v"
+    done < "$REPO/.env"
+fi
 
 MINI=false
 MEASURE_STORAGE=false
+NATIVE_ONLY=false
 OUTDIR="run_stats/"
 BRANCH_INTENSITY=""
 DATA_INTENSITY=""
@@ -42,6 +59,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --mini)            MINI=true; shift ;;
         --measure-storage) MEASURE_STORAGE=true; shift ;;
+        --native-only)     NATIVE_ONLY=true; shift ;;
         --outdir)          OUTDIR="$2"; shift 2 ;;
         --branch-intensity) BRANCH_INTENSITY="$2"; shift 2 ;;
         --data-intensity)   DATA_INTENSITY="$2"; shift 2 ;;
@@ -53,9 +71,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ $# -lt 2 || $# -gt 3 ]]; then
-    echo "Usage: $0 [--mini] [--outdir DIR] [--max-runtime-sec N] [--op-stall-sec N] [--measure-storage] [--storage-sample-interval SEC] [--branch-intensity X] [--data-intensity Y] <scenario> <backend> [scale_factor]"
+    echo "Usage: $0 [--mini] [--outdir DIR] [--max-runtime-sec N] [--op-stall-sec N] [--measure-storage] [--native-only] [--storage-sample-interval SEC] [--branch-intensity X] [--data-intensity Y] <scenario> <backend> [scale_factor]"
     echo "  scenario:  rl_env | context_mgmt | multi_agent | dev_agent | ops_agent | data_agent"
-    echo "  backend:   dolt | dolt_mysql | seekdb | matrixone | neon | xata | file_copy | chronos"
+    echo "  backend:   dolt | dolt_mysql | seekdb | matrixone | bauplan | neon | xata | file_copy | chronos"
     exit 1
 fi
 
@@ -68,7 +86,7 @@ if ! echo "$VALID_SCENARIOS" | grep -qw "$SCENARIO"; then
     echo "Error: invalid scenario '$SCENARIO' (one of: $VALID_SCENARIOS)"
     exit 1
 fi
-VALID_BACKENDS="dolt dolt_mysql seekdb matrixone neon xata file_copy chronos"
+VALID_BACKENDS="dolt dolt_mysql seekdb matrixone bauplan neon xata file_copy chronos"
 if ! echo "$VALID_BACKENDS" | grep -qw "$BACKEND"; then
     echo "Error: invalid backend '$BACKEND' (one of: $VALID_BACKENDS)"
     exit 1
@@ -134,8 +152,15 @@ if [[ -n "$OP_STALL_SEC" ]]; then
     EXTRA_FLAGS+=(--op-stall-sec "$OP_STALL_SEC")
 fi
 
+if $NATIVE_ONLY; then
+    export DBFORK_NATIVE_ONLY=1
+    echo "Native-only mode: simulated operations run as unsupported"
+fi
 PYTHONUNBUFFERED=1 uv run python -m macrobench.runner \
     --config "$TMP_CONFIG" \
     --outdir "$OUTDIR" \
     --max-runtime-sec "$MAX_RUNTIME_SEC" \
     ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"}
+
+exit
+}

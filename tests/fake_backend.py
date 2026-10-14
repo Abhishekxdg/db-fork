@@ -151,6 +151,18 @@ class FakeSuite(DBToolSuite):
             raise ValueError(f"unknown branch {ref.branch}")
         self.conn = self.branches[ref.branch]
 
+    def _schema_at(self, ref: Ref) -> dict:
+        """sqlite's catalog: table list plus PRAGMA table_info per table."""
+        self._connect_impl(ref)
+        out = {}
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '_bb_%'")
+            tables = [r[0] for r in cur.fetchall()]
+            for t in tables:
+                cur.execute(f"PRAGMA table_info({t})")
+                out[t] = {r[1]: str(r[2]).lower() for r in cur.fetchall()}
+        return out
+
     def _branch_impl(self, name: str, from_ref: Ref) -> None:
         if name in self.branches:
             raise ValueError(f"branch {name} exists")

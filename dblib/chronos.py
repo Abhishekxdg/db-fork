@@ -33,6 +33,7 @@ import datetime
 import decimal
 import os
 import random
+import json
 import re
 import threading
 import time
@@ -79,8 +80,10 @@ load_dotenv()
 
 PGSQL_USER = os.getenv("PGSQL_USER", "elaineang")
 PGSQL_PASSWORD = os.getenv("PGSQL_PASSWORD", "")
-PGSQL_HOST = os.getenv("PGSQL_HOST", "localhost")
-PGSQL_PORT = os.getenv("PGSQL_PORT", "5433")
+# CHRONOS_HOST/CHRONOS_PORT when Chronos's Postgres is not the one file_copy uses.
+PGSQL_HOST = (os.getenv("CHRONOS_HOST") or os.getenv("PGSQL_HOST")
+              or os.getenv("DBFORK_SERVER_HOST", "localhost"))
+PGSQL_PORT = os.getenv("CHRONOS_PORT") or os.getenv("PGSQL_PORT", "5433")
 
 MAIN_BRANCH = "main"
 LOG_TABLE = "_bb_log"
@@ -97,13 +100,13 @@ _LOG_DDL = f"""
 CREATE TABLE IF NOT EXISTS {LOG_TABLE} (
     log_branch TEXT NOT NULL, seq BIGINT NOT NULL, id TEXT NOT NULL, kind TEXT NOT NULL,
     message TEXT, snap TEXT, prev_snap TEXT, prev_branch TEXT,
-    ts TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (log_branch, seq));
+    ts TIMESTAMPTZ NOT NULL DEFAULT now(), schema_json TEXT, PRIMARY KEY (log_branch, seq));
 CREATE TABLE IF NOT EXISTS {VIEWS_TABLE} (branch TEXT NOT NULL, name TEXT NOT NULL, sql TEXT NOT NULL,
     PRIMARY KEY (branch, name));
 CREATE TABLE IF NOT EXISTS {ROWID_TABLES} (name TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS {TOMBSTONES} (branch TEXT PRIMARY KEY);
 """
-_LOG_COLS = ("seq", "id", "kind", "message", "snap", "prev_snap", "prev_branch", "ts")
+_LOG_COLS = ("seq", "id", "kind", "message", "snap", "prev_snap", "prev_branch", "ts", "schema_json")
 
 
 def _uri(db: str, app: str = "") -> str:
@@ -438,9 +441,9 @@ class ChronosToolSuite(DBToolSuite):
     SUPPORTS_MULTI_REF_EXEC = True
 
     IMPLEMENTATION = {
-        "branch": "composed",
-        "commit": "composed",
-        "diff": "composed",
+        "branch": "native",
+        "commit": "native",
+        "diff": "native",
         "log": "simulated",
         "merge": "simulated",
         "rebase": "simulated",
@@ -448,6 +451,7 @@ class ChronosToolSuite(DBToolSuite):
         "reset": "simulated",
         "delete": "native",
         "commit_refs": "native",
+        "schema_diff": "simulated",
         "multi_ref_exec": "simulated",
     }
     IMPLEMENTATION_NOTES = {
@@ -473,6 +477,7 @@ class ChronosToolSuite(DBToolSuite):
                   "GC); deleting a branch deletes its subtree in Chronos, so a branch with live "
                   "children is tombstoned and deleted once they are gone",
         "commit_refs": "checkpoints: read-only sessions on the checkpoint's interval",
+        "schema_diff": "catalog columns of each ref compared by the adapter",
         "multi_ref_exec": "temporary views over the interval tables at each ref's branch point "
                           "(the visibility predicate Chronos itself uses), the SELECT rewritten by "
                           "the session for its own branch and run on a plain connection",
@@ -1268,6 +1273,64 @@ class ChronosToolSuite(DBToolSuite):
         else:
             yield ref.branch
 
+    def _schema_of_branch(self, branch: str) -> dict:
+        """{table: {"cols": {column: type}, "pk": [columns]}} from Chronos's
+        per-branch table metadata (the hidden row id left out)."""
+        out = {}
+        for t, meta in self._branch_tables(branch).items():
+            out[t] = {"cols": {c: _type_of(d).lower() for c, d in zip(meta.columns, meta.column_defs)
+                               if c != ROWID_COL},
+                      "pk": [c for c in meta.pk_columns if c != ROWID_COL]}
+        return out
+
+    @staticmethod
+    def _fp_columns(fp: dict) -> dict:
+        """{table: {column: type}} view of a fingerprint (either shape)."""
+        return {t: (spec["cols"] if isinstance(spec, dict) and "cols" in spec else spec)
+                for t, spec in fp.items()}
+
+    def _reconcile_to_fingerprint(self, sess, branch: str, fp: dict) -> None:
+        """Give the branch exactly the fingerprint's tables and columns:
+        extra tables and columns dropped, missing tables created (empty),
+        missing or retyped columns (re)added with the recorded type."""
+        now = self._branch_tables(branch)
+        for t in sorted(set(now) - set(fp)):
+            sess.execute(f"DROP TABLE {_q(t)}")
+        for t in sorted(set(fp) - set(now)):
+            spec = fp[t]
+            cols = spec["cols"] if "cols" in spec else spec
+            pk = set(spec.get("pk", ())) if "cols" in spec else set()
+            defs = [f"{_q(c)} {ty}" + (" PRIMARY KEY" if c in pk else "") for c, ty in cols.items()]
+            sess.execute(f"CREATE TABLE {_q(t)} ({', '.join(defs)})")
+        for t in sorted(set(now) & set(fp)):
+            spec = fp[t]
+            cols = spec["cols"] if "cols" in spec else spec
+            meta = now[t]
+            pk = set(meta.pk_columns)
+            have = {c: _type_of(d).lower() for c, d in zip(meta.columns, meta.column_defs) if c != ROWID_COL}
+            for c in list(have):
+                if c not in cols and c not in pk:
+                    sess.execute(f"ALTER TABLE {_q(t)} DROP COLUMN {_q(c)}")
+                    have.pop(c)
+            for c, ty in cols.items():
+                if c in have and have[c] != ty and c not in pk:
+                    sess.execute(f"ALTER TABLE {_q(t)} DROP COLUMN {_q(c)}")
+                    have.pop(c)
+                if c not in have:
+                    sess.execute(f"ALTER TABLE {_q(t)} ADD COLUMN {_q(c)} {ty}")
+
+    def _schema_at(self, ref: Ref) -> dict:
+        """Chronos keeps a table's definition per branch, not per
+        checkpoint; a commit's schema is the fingerprint the adapter stored
+        with its log row (any branch's copy of the row carries it)."""
+        if not ref.commit:
+            return self._fp_columns(self._schema_of_branch(ref.branch))
+        rows = self._pgx(f"SELECT schema_json FROM {LOG_TABLE} WHERE id = %s AND schema_json IS NOT NULL "
+                         "ORDER BY (log_branch = %s) DESC LIMIT 1", (str(ref.commit), ref.branch))
+        if not rows:
+            raise self._unsupported("schema_diff", f"no schema recorded at commit {ref.commit}")
+        return self._fp_columns(json.loads(rows[0][0]))
+
     def _branch_tables(self, branch: str) -> dict:
         out = {}
         for t in self.ctx._backend.diff_tables():
@@ -1600,6 +1663,10 @@ class ChronosToolSuite(DBToolSuite):
         with _GATES.hold([ref.branch], self._check_cancel):
             self._retry("checkpoint", lambda: self.ctx.create_checkpoint(cp, ref.branch, {"message": message or "", "id": cid}))
         self._add_row(ref.branch, "commit", message, snap=cp, commit_id=cid, seq=seq)
+        # Chronos keeps no schema history, so the commit records the
+        # branch's schema for schema_diff at this commit.
+        self._pgx(f"UPDATE {LOG_TABLE} SET schema_json = %s WHERE log_branch = %s AND id = %s",
+                  (json.dumps(self._schema_of_branch(ref.branch)), ref.branch, cid))
         return cid
 
     def _log_impl(self, ref: Ref, limit: int) -> list:
@@ -1719,13 +1786,23 @@ class ChronosToolSuite(DBToolSuite):
             raise ValueError(f"commit {to} has no checkpoint to reset to ({row['kind']} row)")
         by_table = {}
         with self._temp_branch(cp) as target:
-            self._reconcile_schema(sess, ref.branch, target, drop_extra=True)
+            # The schema the commit recorded is what the reset returns to
+            # (a retyped column is dropped and re-added, then refilled);
+            # without a fingerprint, reconcile against the temporary
+            # branch, which fails on a type difference.
+            if row.get("schema_json"):
+                self._reconcile_to_fingerprint(sess, ref.branch, json.loads(row["schema_json"]))
+            else:
+                self._reconcile_schema(sess, ref.branch, target, drop_extra=True)
+            cols_now = {t: set(m.columns) for t, m in self._branch_tables(ref.branch).items()}
             for (table, _), d in self._diff_map(ref.branch, target).items():
+                if table not in cols_now:
+                    continue
                 ops = by_table.setdefault(table, {"upsert": [], "delete": []})
                 if d.change == "deleted":
                     ops["delete"].append(dict(d.key))
                 else:
-                    ops["upsert"].append(dict(d.after))
+                    ops["upsert"].append({c: v for c, v in dict(d.after).items() if c in cols_now[table]})
             self._apply(sess, ref.branch, by_table)
         self._pgx(f"DELETE FROM {LOG_TABLE} WHERE log_branch = %s AND seq > %s", (ref.branch, int(row["seq"])))
 

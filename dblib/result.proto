@@ -106,6 +106,9 @@ enum OpType {
   // Driver-side waits (e.g. backoff on API rate limits)
   API_RETRY_WAIT = 16;
 
+  // Schema-level diff between two refs (tables and columns)
+  SCHEMA_DIFF = 18;
+
   // exec(): DELETE statements (recorded as UPDATE before this was added)
   DELETE_ROWS = 17;
 }

@@ -40,19 +40,21 @@ report uses):
     rebase     re-fork: the branch's next generation is cloned from the
                upstream's head snapshot and snapshotted at once (the new
                base), then receives the branch's delta since its previous
-               base through DATA BRANCH PICK ... BETWEEN SNAPSHOT (always,
-               for every table: the native diff does not see a change that
-               is confined to a column added since the base, so it cannot
-               decide what to skip); conflicts with the upstream's delta are
-               resolved per on_conflict; the registry is repointed and the
-               old generation dropped (the lineage now starts at the
-               upstream head, so a later merge back sees only newer changes)
+               base: the keys a native diff of the branch's own two
+               snapshots lists (plus rows with a value in a column the
+               branch added, which that diff does not see) are copied in
+               with SQL from the head snapshot's time-travel view, or, in
+               native-only mode, replayed with DATA BRANCH PICK ... BETWEEN
+               SNAPSHOT; conflicts with the upstream's delta are resolved
+               per on_conflict; the registry is repointed and the old
+               generation dropped (the lineage now starts at the upstream
+               head, so a later merge back sees only newer changes)
     revert     DATA BRANCH DIFF between the commit's snapshot and its
                predecessor; the inverse is applied with SQL
     reset      DATA BRANCH DIFF between the head and the commit's snapshot,
                the differences undone with SQL (RESTORE DATABASE does it in
-               one statement, MO_NATIVE_RESET=1, but later diffs across the
-               restore misreport updated rows); a commit inherited from the
+               one statement, used in native-only mode, but later diffs
+               across the restore misreport updated rows); a commit inherited from the
                parent is restored row by row from its time-travel view
     delete     DATA BRANCH DELETE DATABASE (DROP DATABASE as fallback)
 
@@ -66,14 +68,14 @@ in a rebase "ours" is the upstream (the branch being rebased onto) and
 
 Known limitations (MatrixOne v4.2.5):
 
-- Rebase is not fully reliable. In a long S4 run, from roughly 500 s in,
-  about every other rebase's PICK carries none of the branch's rows even
-  though a time-travel read of the same snapshots shows them all; the
-  branch then silently loses that backfill. Not reproduced standalone
-  (spine load, delays, flushes, checkpoints, intermediate commits,
-  composite keys, migrations in the window, prior ALTERs and sibling
-  branch churn were all ruled out). A rebase that compares the two
-  snapshots with a server-side join instead of PICK would avoid it.
+- The native-only rebase (DATA BRANCH PICK) is not fully reliable. In a
+  long S4 run, from roughly 500 s in, about every other rebase's PICK
+  carries none of the branch's rows even though a time-travel read of
+  the same snapshots shows them all; the branch then silently loses that
+  backfill. Not reproduced standalone (spine load, delays, flushes,
+  checkpoints, intermediate commits, composite keys, migrations in the
+  window, prior ALTERs and sibling branch churn were all ruled out). The
+  default rebase copies the rows from the snapshot with SQL instead.
 - PICK and MERGE resolve conflicts per row, so "theirs" replaces the
   upstream's whole row, including columns only the upstream changed.
 - DATA BRANCH DIFF does not report a change confined to a column added
@@ -82,6 +84,7 @@ Known limitations (MatrixOne v4.2.5):
   tarLCASnapshot/baseLCASnapshot in pkg/frontend/data_branch_types.go).
 """
 
+import json
 import os
 import re
 import time
@@ -91,14 +94,14 @@ import aiomysql
 import pymysql
 from pymysql.constants import CLIENT
 
-from dblib.db_api import DBToolSuite, Ref
+from dblib.db_api import DBToolSuite, Ref, native_only
 from dblib import mysql_common
 import dblib.result_collector as rc
 import dblib.util as dbutil
 
 MO_USER = os.environ.get("MO_USER", "root")
 MO_PASSWORD = os.environ.get("MO_PASSWORD", "111")
-MO_HOST = os.environ.get("MO_HOST", "127.0.0.1")
+MO_HOST = os.environ.get("MO_HOST") or os.environ.get("DBFORK_SERVER_HOST", "127.0.0.1")
 MO_PORT = int(os.environ.get("MO_PORT", "6001"))
 MO_DATA_DIR = os.path.expanduser(os.environ.get("MO_DATA_DIR", "~/mo/matrixone/mo-data"))
 
@@ -106,12 +109,14 @@ MO_DATA_DIR = os.path.expanduser(os.environ.get("MO_DATA_DIR", "~/mo/matrixone/m
 # even when on_conflict is "ours"/"theirs" and the count is only reported.
 MO_COUNT_CONFLICTS = os.environ.get("MO_COUNT_CONFLICTS", "1").lower() not in ("0", "false", "no")
 
-# Use RESTORE DATABASE for reset(). It is the native primitive, but it
-# gives the restored tables new identities and MatrixOne's later diffs
-# across that edge report updated rows as inserted on both sides (checked
-# on v4.2.5 with a 300k-row table), which breaks rebase/merge afterwards.
-# Off by default: reset() then restores the rows a native diff lists.
-MO_NATIVE_RESET = os.environ.get("MO_NATIVE_RESET", "").lower() in ("1", "true", "yes")
+# Native-only mode (DBFORK_NATIVE_ONLY=1) uses the engine's own primitives
+# as they are: RESTORE DATABASE for reset() (it gives the restored tables
+# new identities and later lineage diffs across that edge misreport
+# updated rows) and DATA BRANCH PICK to replay the branch's delta in
+# rebase() (sporadically carries nothing late in long runs). Otherwise
+# both are done from a native diff of the branch's own two snapshots,
+# applied with SQL.
+MO_NATIVE_RESET = native_only()
 
 MAIN_BRANCH = "main"
 _BRANCH_SEP = "__"
@@ -137,6 +142,7 @@ CREATE TABLE IF NOT EXISTS {table} (
     prev_snap VARCHAR(64),
     prev_db VARCHAR(64),
     ts DATETIME(6),
+    schema_json TEXT,
     PRIMARY KEY (seq)
 )
 """
@@ -283,18 +289,20 @@ class MatrixOneToolSuite(DBToolSuite):
     BACKEND_NAME = "matrixone"
     STORAGE_SCOPE = "server"
     SUPPORTS_COMMIT_REFS = True
+    SCHEMA_DIALECT = "mysql"
     SUPPORTS_MULTI_REF_EXEC = True
     IMPLEMENTATION = {
         "branch": "native",
-        "commit": "composed",
+        "commit": "native",
         "diff": "native",
         "log": "simulated",
-        "merge": "composed",
-        "rebase": "composed",
+        "merge": "native",
+        "rebase": "native" if MO_NATIVE_RESET else "simulated",
         "revert": "simulated",
-        "reset": "native" if MO_NATIVE_RESET else "composed",
+        "reset": "native" if MO_NATIVE_RESET else "simulated",
         "delete": "native",
         "commit_refs": "native",
+        "schema_diff": "simulated",
         "multi_ref_exec": "native",
     }
     IMPLEMENTATION_NOTES = {
@@ -305,11 +313,13 @@ class MatrixOneToolSuite(DBToolSuite):
         "merge": "DATA BRANCH MERGE per table WHEN CONFLICT SKIP|ACCEPT; conflict rows/count "
                  "from two native diffs against the fork snapshot; a resolve callable writes "
                  "over the SKIP result",
-        "rebase": "re-fork: the branch's next generation is cloned from the upstream's head "
-                  "snapshot and snapshotted (the new base), DATA BRANCH PICK ... BETWEEN SNAPSHOT "
-                  "replays the branch's delta into it (every table: the native diff misses "
-                  "changes confined to a column added since the base), conflicts from two "
-                  "native diffs, the registry is repointed and the old generation dropped",
+        "rebase": ("re-fork: the branch's next generation is cloned from the upstream's head "
+                   "snapshot and snapshotted (the new base); the branch's delta since its previous "
+                   "base (a native diff of its own two snapshots) is "
+                   + ("replayed with DATA BRANCH PICK ... BETWEEN SNAPSHOT" if MO_NATIVE_RESET else
+                      "copied in with SQL from its head snapshot's time-travel view")
+                   + "; conflicts from two native diffs; the registry is repointed and the old "
+                   "generation dropped"),
         "revert": "DATA BRANCH DIFF commit vs predecessor; inverse applied with SQL",
         "reset": ("RESTORE DATABASE {snapshot}" if MO_NATIVE_RESET else
                   "DATA BRANCH DIFF head vs the commit's snapshot, rows put back with SQL "
@@ -317,6 +327,7 @@ class MatrixOneToolSuite(DBToolSuite):
                  + "; SQL row restore for commits inherited from a parent",
         "delete": "DATA BRANCH DELETE DATABASE (DROP DATABASE fallback)",
         "commit_refs": "time-travel reads t{snapshot = ...}",
+        "schema_diff": "catalog columns of each ref compared by the adapter",
         "multi_ref_exec": "cross-database queries",
     }
 
@@ -442,21 +453,59 @@ class MatrixOneToolSuite(DBToolSuite):
             self._add_commit(db, "root", "initial state", None, db, None, None,
                              take_snapshot=True)
 
+    def _schema_at(self, ref: Ref) -> dict:
+        """A commit's schema is the fingerprint recorded with its log row;
+        a branch head is read from the catalog."""
+        if ref.commit:
+            row = self._find_commit(self._db_for(ref.branch), ref.commit)
+            if row.get("schema_json"):
+                fp = json.loads(row["schema_json"])
+                return {t: dict(spec["cols"]) for t, spec in fp.items()}
+        return super()._schema_at(ref)
+
+    def _fingerprint(self, db: str) -> dict:
+        """{table: {"cols": {column: type}, "pk": [columns]}} of db's data
+        tables, one catalog query; recorded with every log row so that a
+        reset can put the schema back (types, dropped tables included)."""
+        rows = self._execute(
+            "SELECT c.table_name, c.column_name, c.column_type, c.column_key "
+            "FROM information_schema.columns c JOIN information_schema.tables t "
+            "ON t.table_schema = c.table_schema AND t.table_name = c.table_name "
+            "WHERE c.table_schema = %s AND t.table_type = 'BASE TABLE' AND c.table_name NOT LIKE %s "
+            "ORDER BY c.table_name, c.ordinal_position",
+            (db, META_PREFIX.replace("_", r"\_") + "%")) or []
+        out: dict = {}
+        for table, col, ctype, key in rows:
+            if str(col).startswith("__mo_"):
+                continue
+            t = out.setdefault(str(table), {"cols": {}, "pk": []})
+            t["cols"][str(col)] = str(ctype).lower()
+            if str(key or "").upper() == "PRI":
+                t["pk"].append(str(col))
+        return out
+
     def _add_commit(self, db: str, kind: str, message: str, snap, snap_db: str,
                     prev_snap, prev_db, commit_id: str = None, take_snapshot: bool = False,
-                    seq: int = None) -> str:
+                    seq: int = None, schema_json: str = None) -> str:
         """Append a log row. With ``take_snapshot`` the snapshot named in
-        the row is created after the row, so it contains its own entry."""
+        the row is created after the row, so it contains its own entry.
+        ``schema_json`` is the schema fingerprint of the state the row
+        records (captured from snap_db when not given)."""
         seq = seq or time.time_ns()
         commit_id = commit_id or f"{seq:x}"
         snap = snap or self._new_snapshot_name()
+        if schema_json is None:
+            try:
+                schema_json = json.dumps(self._fingerprint(snap_db))
+            except pymysql.MySQLError as e:
+                self._warn(("fingerprint", snap_db), f"schema fingerprint of {snap_db} failed: {e}")
         for _ in range(8):
             try:
                 self._execute(
                     f"INSERT INTO {_qt(db, COMMITS_TABLE)} "
-                    "(seq, id, kind, message, snap, db, prev_snap, prev_db, ts) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(6))",
-                    (seq, commit_id, kind, message or "", snap, snap_db, prev_snap, prev_db))
+                    "(seq, id, kind, message, snap, db, prev_snap, prev_db, ts, schema_json) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(6), %s)",
+                    (seq, commit_id, kind, message or "", snap, snap_db, prev_snap, prev_db, schema_json))
                 break
             except pymysql.err.IntegrityError:
                 seq += 1
@@ -466,7 +515,7 @@ class MatrixOneToolSuite(DBToolSuite):
             self._snapshot(snap_db, snap)
         return commit_id
 
-    _LOG_COLS = ("seq", "id", "kind", "message", "snap", "db", "prev_snap", "prev_db", "ts")
+    _LOG_COLS = ("seq", "id", "kind", "message", "snap", "db", "prev_snap", "prev_db", "ts", "schema_json")
 
     def _log_rows(self, db: str, limit: int = None, max_seq: int = None) -> list:
         sql = f"SELECT {', '.join(self._LOG_COLS)} FROM {_qt(db, COMMITS_TABLE)}"
@@ -631,7 +680,7 @@ class MatrixOneToolSuite(DBToolSuite):
     def _storage_bytes(self) -> int:
         """Size of the server's data directory (object store plus log
         service): MatrixOne has no per-database directory."""
-        return dbutil.get_directory_size_bytes(MO_DATA_DIR)
+        return dbutil.get_directory_size_bytes(MO_DATA_DIR, ssh=dbutil.ssh_target("MO_SSH"))
 
     def _gc_impl(self) -> None:
         # No GC command; a forced checkpoint flushes memtables to objects.
@@ -949,8 +998,10 @@ class MatrixOneToolSuite(DBToolSuite):
         upstream's head snapshot and snapshotted at once (that snapshot is
         the new base, so a later rebase's delta window starts before the
         work replayed now), the branch's delta since its previous base
-        (DATA BRANCH PICK ... BETWEEN SNAPSHOT, the branch's own snapshots)
-        is replayed into it table by table, conflicts with the upstream's
+        (a native diff of the branch's own two snapshots) is replayed into
+        it table by table, by SQL from the head snapshot's time-travel
+        view, or by DATA BRANCH PICK ... BETWEEN SNAPSHOT in native-only
+        mode, conflicts with the upstream's
         delta over the same period are resolved per on_conflict ("ours" =
         upstream, "theirs" = the branch, as in git), the registry is
         repointed and the old generation dropped. The lineage now starts
@@ -1046,19 +1097,33 @@ class MatrixOneToolSuite(DBToolSuite):
                     info["ours_changes"] += len(d_u)
                     if d_u:
                         upstream_moved = True
-                    self._execute(f"DATA BRANCH PICK {_qt(branch_db, table)} INTO {_qt(new_db, table)} "
-                                  f"BETWEEN SNAPSHOT '{s_b0}' AND '{s_now}' WHEN CONFLICT ACCEPT")
-                    # On a table with a foreign key, rows PICK writes are
-                    # invisible to a later PICK from this generation once
-                    # the source generation is dropped (v4.2.5, whether or
-                    # not foreign_key_checks is on), so they are rewritten
-                    # as ordinary writes of this generation after the drop.
                     new_cols = [c.split(".", 1)[1] for c in schema["added_columns"]
                                 if c.startswith(table + ".")]
                     keys = self._replayed_keys(d_b, branch_now, table, pk, new_cols)
-                    if keys:
+                    if MO_NATIVE_RESET:
+                        self._execute(f"DATA BRANCH PICK {_qt(branch_db, table)} INTO {_qt(new_db, table)} "
+                                      f"BETWEEN SNAPSHOT '{s_b0}' AND '{s_now}' WHEN CONFLICT ACCEPT")
+                        # On a table with a foreign key, rows PICK writes are
+                        # invisible to a later PICK from this generation once
+                        # the source generation is dropped (v4.2.5, whether or
+                        # not foreign_key_checks is on), so they are rewritten
+                        # as ordinary writes of this generation after the drop.
+                        if keys:
+                            touches.append((table, pk, rest, keys))
+                    else:
+                        # Simulated replay: the branch's deletes, then its
+                        # inserted/updated rows copied from the head snapshot's
+                        # time-travel view (server-side; only keys travel).
+                        deleted = [k for k, (flag, _) in d_b.items() if flag == "DELETE"]
+                        for chunk in self._chunks(deleted):
+                            self._execute(f"DELETE FROM {_qt(new_db, table)} WHERE {self._in_keys(pk, chunk)}")
+                        for chunk in self._chunks(keys):
+                            self._execute(self._upsert(
+                                _qt(new_db, table), cols, pk,
+                                f"SELECT {self._cols('s', cols)} FROM {branch_now.expr(table)} s "
+                                f"WHERE {self._in_keys(pk, chunk)}"))
+                    if keys or any(flag == "DELETE" for flag, _ in d_b.values()):
                         info["merged_tables"].append(table)
-                        touches.append((table, pk, rest, keys))
                     if not d_u:
                         continue
                     keys = self._conflict_keys(d_u, d_b, rest)
@@ -1095,7 +1160,8 @@ class MatrixOneToolSuite(DBToolSuite):
                    if r["kind"] in ("commit", "merge") and int(r["seq"]) > base_seq]
             for i, r in enumerate(own):
                 self._add_commit(new_db, r["kind"], r["message"], r["snap"], r["db"],
-                                 r["prev_snap"], r["prev_db"], commit_id=r["id"], seq=now + 1 + i)
+                                 r["prev_snap"], r["prev_db"], commit_id=r["id"], seq=now + 1 + i,
+                                 schema_json=r.get("schema_json"))
         except BaseException:
             self._execute_ddl(f"DROP DATABASE IF EXISTS {_quote(new_db)};")
             self._drop_snapshot(base_snap)
@@ -1166,12 +1232,13 @@ class MatrixOneToolSuite(DBToolSuite):
             # already cut at the commit; make sure of it anyway.
             self._execute(f"DELETE FROM {_qt(db, COMMITS_TABLE)} WHERE seq > %s", (int(row["seq"]),))
             return
+        fp = json.loads(row["schema_json"]) if row.get("schema_json") else None
         if row["db"] == db:
-            self._undo_since(db, _State(db, row["snap"]))
+            self._undo_since(db, _State(db, row["snap"]), fp)
             self._execute(f"DELETE FROM {_qt(db, COMMITS_TABLE)} WHERE seq > %s", (int(row["seq"]),))
             return
         self._warn(("reset_sql", db), f"reset of {db} to a commit made on {row['db']}: rows restored with SQL")
-        self._restore_sql(db, _State(row["db"], row["snap"]))
+        self._restore_sql(db, _State(row["db"], row["snap"]), fp)
         self._execute(
             f"DELETE FROM {_qt(db, COMMITS_TABLE)} WHERE seq > %s "
             "AND kind NOT IN ('fork', 'rebase', 'root')", (int(row["seq"]),))
@@ -1181,27 +1248,85 @@ class MatrixOneToolSuite(DBToolSuite):
             cur.execute(f"SELECT * FROM {state.expr(table)} LIMIT 0")
             return [d[0] for d in cur.description if not str(d[0]).startswith("__mo_")]
 
-    def _undo_since(self, db: str, target: _State) -> None:
+    def _reconcile_to_fingerprint(self, db: str, fp: dict) -> list:
+        """Give db exactly the tables and columns of the fingerprint:
+        tables not in it dropped, missing ones created (empty), extra
+        columns dropped, missing or retyped columns (re)added with the
+        recorded type (the row restore that follows refills them).
+        Returns (tables (re)created, tables whose columns changed, retyped
+        columns as (table, column, type) to MODIFY once rows are back: a
+        MODIFY keeps the column's identity, so the lineage diff still
+        works and the snapshot's values are restored before the type is
+        narrowed back)."""
+        now = set(self._tables(db))
+        created, altered, retyped = [], [], []
+        for table in sorted(now - set(fp)):
+            self._execute_ddl(f"DROP TABLE {_qt(db, table)}")
+        for table in sorted(set(fp) - now):
+            spec = fp[table]
+            defs = [f"{_quote(c)} {t}" for c, t in spec["cols"].items()]
+            if spec.get("pk"):
+                defs.append(f"PRIMARY KEY ({', '.join(map(_quote, spec['pk']))})")
+            self._execute_ddl(f"CREATE TABLE {_qt(db, table)} ({', '.join(defs)})")
+            created.append(table)
+        for table in sorted(now & set(fp)):
+            spec = fp[table]
+            cols_now = {c: str(t).lower() for c, t, _, _ in self._columns(db, table)}
+            pk = set(spec.get("pk") or self._pk(db, table))
+            changed = False
+            for col in list(cols_now):
+                if col not in spec["cols"]:
+                    self._execute_ddl(f"ALTER TABLE {_qt(db, table)} DROP COLUMN {_quote(col)}")
+                    cols_now.pop(col)
+                    changed = True
+            for col, ctype in spec["cols"].items():
+                if col in cols_now and cols_now[col] != ctype and col not in pk:
+                    # MODIFY changed the column's identity, which the lineage
+                    # diff refuses: the table's rows are restored by SQL.
+                    retyped.append((table, col, ctype))
+                    changed = True
+                elif col not in cols_now:
+                    self._execute_ddl(f"ALTER TABLE {_qt(db, table)} ADD COLUMN {_quote(col)} {ctype}")
+                    changed = True
+            if changed:
+                altered.append(table)
+        return created, altered, retyped
+
+    def _undo_since(self, db: str, target: _State, fp: dict = None) -> None:
         """Make db's tables equal to its own earlier snapshot ``target``
-        by undoing what a native diff of head vs snapshot lists; tables
-        and columns created since are dropped, dropped tables recreated."""
-        here = set(self._tables(db))
-        there = {t for t in self._tables(db) if self._readable(target, t)}
-        # Tables dropped since the snapshot are not listed by _tables(db);
-        # find them through the snapshot's catalog of the commits table's
-        # siblings is not possible, so probe the known table names of the
-        # log's schema: every table readable at the snapshot but absent now.
+        by undoing what a native diff of head vs snapshot lists. The
+        schema comes first: from the commit's fingerprint when the log
+        row has one (tables and columns dropped, created, retyped), else
+        tables and columns created since are dropped."""
         self._fk_checks(False)
         try:
+            recreated, altered, retyped = [], [], []
+            if fp is not None:
+                recreated, altered, retyped = self._reconcile_to_fingerprint(db, fp)
+            here = set(self._tables(db))
+            there = {t for t in here if self._readable(target, t)}
             for table in sorted(here - there):
+                if table in recreated:
+                    continue  # its snapshot cannot be read; left empty
                 self._execute(f"DROP TABLE {_qt(db, table)}")
             for table in sorted(there):
                 cols_now = [c[0] for c in self._columns(db, table)]
                 cols_then = self._snapshot_columns(target, table)
-                for col in cols_now:
-                    if col not in cols_then:
-                        self._execute(f"ALTER TABLE {_qt(db, table)} DROP COLUMN {_quote(col)}")
+                if fp is None:
+                    for col in cols_now:
+                        if col not in cols_then:
+                            self._execute(f"ALTER TABLE {_qt(db, table)} DROP COLUMN {_quote(col)}")
                 cols = [c for c in cols_now if c in cols_then]
+                if table in recreated:
+                    # A table dropped since the commit: fill it from the snapshot.
+                    self._execute(f"INSERT INTO {_qt(db, table)} ({', '.join(map(_quote, cols))}) "
+                                  f"SELECT {self._cols('s', cols)} FROM {target.expr(table)} s")
+                    continue
+                if table in altered:
+                    # A re-added column has a new identity, which the lineage
+                    # diff refuses: restore the table's rows by SQL instead.
+                    self._restore_table_sql(db, table, target.expr(table), cols)
+                    continue
                 pk = [c for c in self._pk(db, table) if c in cols]
                 dst = _qt(db, table)
                 diff = self._diff_rows(dst, target.expr(table))
@@ -1222,12 +1347,41 @@ class MatrixOneToolSuite(DBToolSuite):
                         dst, cols, pk,
                         f"SELECT {self._cols('s', cols)} FROM {target.expr(table)} s "
                         f"WHERE {self._in_keys(pk, chunk)}"))
+            for table, col, ctype in retyped:
+                self._execute_ddl(f"ALTER TABLE {_qt(db, table)} MODIFY {_quote(col)} {ctype}")
         finally:
             self._fk_checks(True)
 
-    def _restore_sql(self, db: str, target: _State) -> None:
+    def _restore_table_sql(self, db: str, table: str, src: str, cols: list) -> None:
+        """Make one table equal to ``src`` (a time-travel expression) on
+        ``cols``: rows absent from src deleted, the rest upserted."""
+        pk = [c for c in self._pk(db, table) if c in cols]
+        dst = _qt(db, table)
+        if not pk:
+            self._execute(f"DELETE FROM {dst}")
+            self._execute(f"INSERT INTO {dst} ({', '.join(map(_quote, cols))}) "
+                          f"SELECT {self._cols('s', cols)} FROM {src} s")
+            return
+        # The source is the same table's time-travel view, which MatrixOne
+        # does not allow in a DELETE's subquery (error 1093): the keys to
+        # delete are computed here instead.
+        keys_now = {tuple(r) for r in self._execute(f"SELECT {', '.join(map(_quote, pk))} FROM {dst}") or []}
+        keys_then = {tuple(r) for r in self._execute(f"SELECT {', '.join(map(_quote, pk))} FROM {src}") or []}
+        for chunk in self._chunks(sorted(keys_now - keys_then)):
+            self._execute(f"DELETE FROM {dst} WHERE {self._in_keys(pk, chunk)}")
+        self._execute(self._upsert(dst, cols, pk, f"SELECT {self._cols('s', cols)} FROM {src} s"))
+
+    def _restore_sql(self, db: str, target: _State, fp: dict = None) -> None:
         """Make db's tables equal to target's (common columns; tables
-        missing on either side are created from / dropped)."""
+        missing on either side are created from / dropped); with a
+        fingerprint the schema is reconciled to it first."""
+        retyped = []
+        if fp is not None:
+            self._fk_checks(False)
+            try:
+                retyped = self._reconcile_to_fingerprint(db, fp)[2]
+            finally:
+                self._fk_checks(True)
         here = set(self._tables(db))
         there = {t for t in self._tables(target.db) if self._readable(target, t)}
         try:
@@ -1254,6 +1408,8 @@ class MatrixOneToolSuite(DBToolSuite):
                     f"DELETE FROM {dst} WHERE NOT EXISTS (SELECT 1 FROM {src} s "
                     f"WHERE {self._join('s', dst, pk)})")
                 self._execute(self._upsert(dst, cols, pk, f"SELECT {self._cols('s', cols)} FROM {src} s"))
+            for table, col, ctype in retyped:
+                self._execute_ddl(f"ALTER TABLE {_qt(db, table)} MODIFY {_quote(col)} {ctype}")
         finally:
             try:
                 self._execute("SET SESSION foreign_key_checks = 1")

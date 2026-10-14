@@ -36,6 +36,7 @@ from macrobench.scenarios import (  # noqa: F401 (registers the scenarios)
     create_scenario,
 )
 from macrobench.tpcc import SpineLoad
+from dblib.db_api import native_only
 from microbench.runner2 import (
     BackendManager,
     BackendSetup,
@@ -147,6 +148,7 @@ def _capabilities_for(backend) -> dict:
     from dblib.dolt_mysql import DoltMySQLToolSuite
     from dblib.seekdb import SeekDBToolSuite
     from dblib.matrixone import MatrixOneToolSuite
+    from dblib.bauplan import BauplanToolSuite
     from dblib.xata import XataToolSuite
     from dblib.file_copy import FileCopyToolSuite
     from dblib.chronos import ChronosToolSuite
@@ -156,6 +158,7 @@ def _capabilities_for(backend) -> dict:
         tp.Backend.DOLT_MYSQL: DoltMySQLToolSuite,
         tp.Backend.SEEKDB: SeekDBToolSuite,
         tp.Backend.MATRIXONE: MatrixOneToolSuite,
+        tp.Backend.BAUPLAN: BauplanToolSuite,
         tp.Backend.NEON: NeonToolSuite,
         tp.Backend.XATA: XataToolSuite,
         tp.Backend.FILE_COPY: FileCopyToolSuite,
@@ -166,11 +169,12 @@ def _capabilities_for(backend) -> dict:
 
 
 def _implementation_for(backend) -> dict:
-    """How the backend realises each verb (native/composed/simulated)."""
+    """How the backend realises each verb (native/simulated; unsupported in native-only mode)."""
     from dblib.dolt import DoltToolSuite
     from dblib.dolt_mysql import DoltMySQLToolSuite
     from dblib.seekdb import SeekDBToolSuite
     from dblib.matrixone import MatrixOneToolSuite
+    from dblib.bauplan import BauplanToolSuite
     from dblib.xata import XataToolSuite
     from dblib.file_copy import FileCopyToolSuite
     from dblib.chronos import ChronosToolSuite
@@ -180,6 +184,7 @@ def _implementation_for(backend) -> dict:
         tp.Backend.DOLT_MYSQL: DoltMySQLToolSuite,
         tp.Backend.SEEKDB: SeekDBToolSuite,
         tp.Backend.MATRIXONE: MatrixOneToolSuite,
+        tp.Backend.BAUPLAN: BauplanToolSuite,
         tp.Backend.NEON: NeonToolSuite,
         tp.Backend.XATA: XataToolSuite,
         tp.Backend.FILE_COPY: FileCopyToolSuite,
@@ -300,8 +305,10 @@ def main(argv=None):
     # the parquet file as they come so the run's memory stays bounded.
     collector = rc.ResultCollector(run_id=config.run_id, output_dir=args.outdir,
                                    spill_rows=int(os.environ.get("MACRO_SPILL_ROWS", "200000")))
-    # Per-op storage is too expensive on Neon (pg_database_size per branch).
-    measure_storage = config.measure_storage and config.backend != tp.Backend.NEON
+    # Per-op storage is too expensive on Neon (pg_database_size per branch)
+    # and Bauplan (table metadata calls per branch).
+    measure_storage = config.measure_storage and config.backend not in (
+        tp.Backend.NEON, tp.Backend.BAUPLAN)
     db_name = config.database_setup.db_name
 
     def suite_factory():
@@ -472,6 +479,7 @@ def main(argv=None):
             "setup": seed_stats,
             "capabilities": _capabilities_for(config.backend),
             "implementation": _implementation_for(config.backend),
+            "native_only": native_only(),
             "invariants": inv,
             "metrics": ctx.metrics,
         }

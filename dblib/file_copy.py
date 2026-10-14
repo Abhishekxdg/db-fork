@@ -71,8 +71,10 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 PGSQL_USER = os.environ.get("PGSQL_USER", "elaineang")
 PGSQL_PASSWORD = os.environ.get("PGSQL_PASSWORD", "")
-PGSQL_HOST = os.environ.get("PGSQL_HOST", "localhost")
-PGSQL_PORT = int(os.environ.get("PGSQL_PORT", "5433"))
+# FILE_COPY_HOST/FILE_COPY_PORT when this Postgres is not the one Chronos uses.
+PGSQL_HOST = (os.environ.get("FILE_COPY_HOST") or os.environ.get("PGSQL_HOST")
+              or os.environ.get("DBFORK_SERVER_HOST", "localhost"))
+PGSQL_PORT = int(os.environ.get("FILE_COPY_PORT") or os.environ.get("PGSQL_PORT", "5433"))
 PGSQL_DATA_DIR = os.environ.get("PGSQL_DATA_DIR", "")
 # CREATE DATABASE strategy and the server's file_copy_method for it.
 FILE_COPY_STRATEGY = os.environ.get("FILE_COPY_STRATEGY", "FILE_COPY").upper()
@@ -326,18 +328,20 @@ class FileCopyToolSuite(PgMergeMixin, DBToolSuite):
     BACKEND_NAME = "file_copy"
     STORAGE_SCOPE = "server" if PGSQL_DATA_DIR else "database"
     SUPPORTS_COMMIT_REFS = True
+    SCHEMA_DIALECT = "postgres"
     SUPPORTS_MULTI_REF_EXEC = True
     IMPLEMENTATION = {
-        "branch": "composed",
-        "commit": "composed",
+        "branch": "simulated",
+        "commit": "simulated",
         "diff": "simulated",
         "log": "simulated",
         "merge": "simulated",
         "rebase": "simulated",
         "revert": "simulated",
-        "reset": "composed",
-        "delete": "native",
-        "commit_refs": "composed",
+        "reset": "simulated",
+        "delete": "simulated",
+        "commit_refs": "simulated",
+        "schema_diff": "simulated",
         "multi_ref_exec": "simulated",
     }
     IMPLEMENTATION_NOTES = {
@@ -364,6 +368,7 @@ class FileCopyToolSuite(PgMergeMixin, DBToolSuite):
         "delete": "DROP DATABASE of the branch, its base clones and its snapshots (snapshots other "
                   "branches' logs reference are kept until the run's cleanup)",
         "commit_refs": "a commit ref connects to the commit's snapshot database (read-only)",
+        "schema_diff": "catalog columns of each ref compared by the adapter",
         "multi_ref_exec": "postgres_fdw: db.table(ref, t) imports the other database's table into "
                           "the session's database (re-imported per exec; the foreign server "
                           "connection is dropped when the exec ends)",
@@ -857,7 +862,7 @@ class FileCopyToolSuite(PgMergeMixin, DBToolSuite):
 
     def _storage_bytes(self) -> int:
         if PGSQL_DATA_DIR:
-            used = dbutil.get_volume_usage_bytes(PGSQL_DATA_DIR)
+            used = dbutil.get_volume_usage_bytes(PGSQL_DATA_DIR, ssh=dbutil.ssh_target("FILE_COPY_SSH"))
             try:
                 wal = int(self._admin("SELECT COALESCE(SUM(size), 0) FROM pg_ls_waldir()")[0][0])
             except Exception:

@@ -19,7 +19,10 @@ the rows the path inserted (its repair_audit rows, plus what the fault's
 repair re-inserts on a repaired path), at least the existing stock rows
 and the path sentinel it updated, and no deletion other than the
 delete-plus-add some backends report for a repair's update of a row in a
-table without a primary key.
+table without a primary key; S1.5 the schema diff of a leaf against the
+commit it forked from reports exactly the DDL the rollout ran (the
+repair_audit table when the rollout started from the task commit, else
+the note_<step> columns it added; indexes are not part of a schema diff).
 """
 
 from macrobench import faults
@@ -69,6 +72,7 @@ class RlEnvScenario(Scenario):
         task_branch = f"task_{task_id}"
         self._touched_steps = getattr(self, "_touched_steps", {})   # (branch, step) -> stock keys so far
         self._touched = getattr(self, "_touched", {})               # leaf branch -> distinct stock rows updated
+        self._ddl = getattr(self, "_ddl", {})                       # leaf branch -> (fork ref, leaf ref, table added?, columns added)
         fault, fw, fd = faults.pick_fault(rng, ctx.scale.warehouses)
 
         # 1. Task-specific state: fault + sentinels + registry row, committed.
@@ -124,23 +128,30 @@ class RlEnvScenario(Scenario):
                 # point (the parent's rows up to that step).
                 touched = set(self._touched_steps.get((fork_ref.split("@")[0], fork_step), set()))
                 repair_at = rng.randint(1, max(1, budget)) if rng.random() < 0.5 else None
+                table_added, cols_added, leaf_ref = False, [], branch
                 for i in range(budget):
                     ctx.check_stop()
                     step = fork_step + i + 1
-                    script, keys = self._step_script(task_id, rollout, step, i == 0, price,
-                                                     fault, fw, fd, fault_state,
-                                                     repair=(repair_at == i + 1), rng=rng,
-                                                     create_audit=(fork_step == 0))
+                    script, keys, ddl = self._step_script(task_id, rollout, step, i == 0, price,
+                                                          fault, fw, fd, fault_state,
+                                                          repair=(repair_at == i + 1), rng=rng,
+                                                          create_audit=(fork_step == 0))
                     res = w.exec(script, branch, label="rollout_step")
                     if res.ok:
                         touched |= keys
+                        if ddl and ddl[0] == "table":
+                            table_added = True
+                        elif ddl and ddl[0] == "column":
+                            cols_added.append(ddl[1])
                     steps_total += 1
                     if ctx.should_commit(i, last_step=(i == budget - 1)):
                         c = w.commit(branch, f"rollout {rollout} step {step}", label="step_commit")
                         if c.ok and c.value:
                             recorded.append((f"{branch}@{c.value}", step))
                             self._touched_steps[(branch, step)] = set(touched)
+                            leaf_ref = f"{branch}@{c.value}"
                 self._touched[branch] = len(touched)
+                self._ddl[branch] = (fork_ref, leaf_ref, table_added, cols_added)
                 leaves.append((branch, price))
                 ctx.tick()
 
@@ -163,6 +174,35 @@ class RlEnvScenario(Scenario):
 
     # ------------------------------------------------------------------
 
+    def _check_schema_diff(self, w: Worker, fork_ref: str, leaf_ref: str, branch: str,
+                           table_added: bool, cols_added: list) -> None:
+        """S1.5: the schema diff from the fork point to the leaf lists
+        exactly the rollout's DDL: the repair_audit table if this rollout
+        created it (its columns are then not listed separately), otherwise
+        the note_<step> columns it added; nothing dropped or retyped."""
+        ctx, inv = self.ctx, self.ctx.invariants
+        name = f"S1.5 schema diff of {branch} against its fork point reports the rollout's DDL"
+        sd = ctx.retry(lambda: w.suite.schema_diff(fork_ref, leaf_ref, label="schema_diff"))
+        if sd.unsupported:
+            inv.not_applicable(name, f"schema diff unsupported: {sd.error[:80]}")
+            return
+        if not sd.ok or not isinstance(sd.value, dict):
+            inv.check(name, False, f"schema diff failed: {sd.error[:100]}")
+            return
+        v = sd.value
+        want_tables = ["repair_audit"] if table_added else []
+        want_cols = [] if table_added else sorted(cols_added)
+        got_cols = sorted(v.get("columns_added", {}).get("repair_audit", []))
+        other_cols = {t: c for t, c in v.get("columns_added", {}).items() if t != "repair_audit"}
+        inv.check(name,
+                  v.get("tables_added") == want_tables and not v.get("tables_dropped")
+                  and got_cols == want_cols and not other_cols
+                  and not v.get("columns_dropped") and not v.get("columns_changed"),
+                  f"tables_added={v.get('tables_added')} (want {want_tables}) "
+                  f"columns_added[repair_audit]={got_cols} (want {want_cols}) "
+                  f"other={other_cols} dropped={v.get('tables_dropped')}/{v.get('columns_dropped')} "
+                  f"changed={v.get('columns_changed')}")
+
     def _step_script(self, task_id, rollout, step, first, price, fault, fw, fd,
                      fault_state, repair, rng, create_audit=True):
         """One rollout step: a mix of reads and writes sized by DataOps.
@@ -175,6 +215,12 @@ class RlEnvScenario(Scenario):
         reads = max(0, n - writes)
         rows = ctx.rows_per_write
         do_ddl = first or rng.random() < ctx.data_ops.ddl_fraction
+        if first and create_audit:
+            ddl = ("table", "repair_audit")
+        elif do_ddl:
+            ddl = ("column", f"note_{step}") if step % 2 == 0 else ("index", f"idx_audit_r{rollout}_s{step}")
+        else:
+            ddl = None
         start_item = rng.randint(1, max(1, ctx.scale.items - rows))
         conditions = [rng.choice(faults.CONDITIONS) for _ in range(reads)]
         # The ranges after the first can run past the last item; only rows
@@ -212,12 +258,13 @@ class RlEnvScenario(Scenario):
             for cond in conditions:
                 db.sql(qs[cond])
             db.sql("SELECT COUNT(*) FROM repair_audit WHERE task_id = %s", (task_id,))
-        return script, keys
+        return script, keys, ddl
 
     def _score(self, w: Worker, task_id: int, leaf_refs: list, task_ref: str,
                fault, fw: int, fd: int) -> list:
         """Group-relative reward: -violations per leaf (cross-branch read),
-        plus a diff of each leaf against the task commit."""
+        plus a data diff of each leaf against the task commit and a schema
+        diff against the commit it forked from."""
         ctx = self.ctx
         if not leaf_refs:
             return []
@@ -246,6 +293,12 @@ class RlEnvScenario(Scenario):
                 rewards.append(-sum(x for x in v.values() if x > 0))
         inv = ctx.invariants
         for ref in leaf_refs:
+            # Schema diff of the leaf against the commit it forked from
+            # (against the task commit the audit table is always new, so
+            # no column change would be visible); S1.5.
+            if ref in self._ddl:
+                fork_ref, leaf_ref, table_added, cols_added = self._ddl[ref]
+                self._check_schema_diff(w, fork_ref, leaf_ref, ref, table_added, cols_added)
             d = ctx.retry(lambda: w.suite.diff(task_ref, ref, label="score_diff"))
             if d.ok and isinstance(d.value, dict):
                 ctx.bump_metric("diff_rows_modified", int(d.value.get("rows_modified") or 0))

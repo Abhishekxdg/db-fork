@@ -63,7 +63,7 @@ SCENARIO_TITLES = {
     "ops_agent": "S5 Ops agent",
     "data_agent": "S6 Data agent",
 }
-BRANCH_VERBS = ["BRANCH", "COMMIT", "DIFF", "LOG", "MERGE", "REBASE", "REVERT", "RESET", "DELETE"]
+BRANCH_VERBS = ["BRANCH", "COMMIT", "DIFF", "SCHEMA_DIFF", "LOG", "MERGE", "REBASE", "REVERT", "RESET", "DELETE"]
 DATA_OPS = ["READ", "INSERT", "UPDATE", "DELETE_ROWS", "DDL"]
 # EXEC rows summarise the statements they contain, so they are excluded from
 # time sums to avoid double counting.

@@ -14,7 +14,7 @@ from macrobench import faults, schema, task_pb2 as tp
 from macrobench.datagen.ch import CHScale, CHGenerator, seed_ch
 from macrobench.intensity import apply_intensity
 from macrobench.scenarios.base import InvariantFailed, InvariantRecorder
-from macrobench.tpcc import Quiescer
+from macrobench.tpcc import Quiescer, SpineLoad
 from tests.fake_backend import FakeSuite
 
 
@@ -150,6 +150,29 @@ def test_on_conflict_is_validated_and_passed_through():
     assert DBToolSuite.supports("merge") is False
 
 
+def test_spine_load_wait_for_total_counts_transactions_and_stops():
+    load = SpineLoad(lambda: None, "main", scale=None, clients=0)
+    stop = threading.Event()
+
+    def produce():
+        for _ in range(7):
+            time.sleep(0.002)
+            with load._lock:
+                load.total += 1
+                load._total_cond.notify_all()
+
+    load._threads = [threading.Thread(target=produce, daemon=True)]
+    load._threads[0].start()
+    assert load.wait_for_total(5, stop=stop, poll=0.01)
+    assert load.total >= 5
+    load._threads[0].join(1)
+    # Target beyond what the (now finished) load produced: returns False
+    # once no client is running, instead of blocking.
+    assert not load.wait_for_total(100, stop=stop, poll=0.01)
+    stop.set()
+    assert not load.wait_for_total(100, stop=stop, poll=0.01)
+
+
 def test_intensity_scales_branch_and_data_knobs():
     w = tp.Workload()
     w.branch_ops.commit_interval = 4
@@ -161,6 +184,7 @@ def test_intensity_scales_branch_and_data_knobs():
     w.dev_agent.concurrent_branches = 3
     w.dev_agent.dev_phase_steps = 5
     w.dev_agent.rebases_per_branch = 1
+    w.dev_agent.spine_commit_every_txns = 20
     w.branch_intensity = 2.0
     w.data_intensity = 0.5
     changed = apply_intensity(w)
@@ -173,6 +197,7 @@ def test_intensity_scales_branch_and_data_knobs():
     assert w.data_ops.spine_clients == 1
     assert w.data_ops.worker_threads == 8               # threads untouched
     assert w.dev_agent.dev_phase_steps == 2             # round(2.5) -> 2
+    assert w.dev_agent.spine_commit_every_txns == 10    # data knob
     assert changed["dev_agent.dev_branches"] == (10, 20)
     assert "data_ops.worker_threads" not in changed
 
@@ -182,10 +207,13 @@ def test_intensity_keeps_ops_agent_offset_inside_spine_and_caps_fanout():
     w.ops_agent.spine_commits = 6
     w.ops_agent.fault_commit_offset = 5
     w.ops_agent.investigation_branches = 2
+    w.ops_agent.commit_every_txns = 20
     w.branch_intensity = 0.5
+    w.data_intensity = 2.0
     apply_intensity(w)
     assert w.ops_agent.spine_commits == 3
     assert 0 < w.ops_agent.fault_commit_offset < w.ops_agent.spine_commits
+    assert w.ops_agent.commit_every_txns == 40          # data knob, not branch
 
     w = tp.Workload()
     w.context_mgmt.fanout = 6

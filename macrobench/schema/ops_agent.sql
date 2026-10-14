@@ -6,5 +6,6 @@ CREATE TABLE deploy_log (
     version     VARCHAR(32) NOT NULL,
     deployed_at TIMESTAMP,
     note        VARCHAR(200),
+    approved_by VARCHAR(40),
     PRIMARY KEY (deploy_id)
 );

@@ -41,7 +41,7 @@ def ok(res):
 
 def test_implementation_summary():
     impl = chronos.ChronosToolSuite.implementation()
-    assert impl["branch"] == "composed" and impl["merge"] == "simulated"
+    assert impl["branch"] == "native" and impl["merge"] == "simulated"
     assert impl["delete"] == "native" and impl["commit_refs"] == "native"
     assert impl["multi_ref_exec"] == "simulated"
     assert set(impl) >= {"branch", "commit", "diff", "log", "merge", "rebase", "revert",
@@ -247,3 +247,23 @@ def test_storage_and_gc(suite):
     ok(suite.commit(MAIN, "base"))
     assert suite._storage_bytes() > 0
     assert suite.gc().ok
+
+
+def test_schema_diff_reports_tables_and_columns(suite):
+    main = "main"
+    c = suite.commit(main, "base")
+    base = f"{main}@{c.value}"
+    assert suite.branch("sd", main).ok
+    r = suite.exec(["ALTER TABLE t ADD COLUMN w INT", "CREATE TABLE extra (id INT PRIMARY KEY, z VARCHAR(4))"],
+                   refs=["sd"])[0]
+    assert r.ok, r.error
+    d = suite.schema_diff(base, "sd")
+    assert d.ok, d.error
+    assert d.value["tables_added"] == ["extra"] and d.value["tables_dropped"] == []
+    assert d.value["columns_added"] == {"t": ["w"]} and d.value["changed"]
+    assert not d.value["columns_dropped"] and not d.value["columns_changed"]
+    back = suite.schema_diff("sd", base)
+    assert back.ok and back.value["tables_dropped"] == ["extra"] and back.value["columns_dropped"] == {"t": ["w"]}
+    same = suite.schema_diff("sd", "sd")
+    assert same.ok and not same.value["changed"]
+    assert suite.delete("sd").ok

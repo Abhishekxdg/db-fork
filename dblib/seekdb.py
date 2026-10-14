@@ -44,7 +44,7 @@ decides ("ours" | "theirs" | callable, see dblib.db_api). A table whose
 columns were added on one side gets those columns on the other; a differing
 primary key is a schema conflict and the verb fails without touching data.
 
-``SEEKDB_NATIVE_MERGE=1`` switches merge() to SeekDB's own
+Native-only mode (``DBFORK_NATIVE_ONLY=1``) switches merge() to SeekDB's own
 ``MERGE TABLE ... STRATEGY OURS|THEIRS`` per table, which has no common
 ancestor (every differing row is a conflict and the source's deletes are
 never applied) but measures the native primitive.
@@ -62,14 +62,14 @@ import aiomysql
 import pymysql
 from pymysql.constants import CLIENT
 
-from dblib.db_api import DBToolSuite, Ref
+from dblib.db_api import DBToolSuite, Ref, native_only
 from dblib import mysql_common
 import dblib.result_collector as rc
 import dblib.util as dbutil
 
 SEEKDB_USER = os.environ.get("SEEKDB_USER", "root")
 SEEKDB_PASSWORD = os.environ.get("SEEKDB_PASSWORD", "")
-SEEKDB_HOST = os.environ.get("SEEKDB_HOST", "127.0.0.1")
+SEEKDB_HOST = os.environ.get("SEEKDB_HOST") or os.environ.get("DBFORK_SERVER_HOST", "127.0.0.1")
 SEEKDB_PORT = int(os.environ.get("SEEKDB_PORT", "2881"))
 
 
@@ -90,7 +90,7 @@ def _default_data_dir() -> str:
 SEEKDB_DATA_DIR = _default_data_dir()
 
 # Use SeekDB's own MERGE TABLE instead of the SQL three-way merge.
-SEEKDB_NATIVE_MERGE = os.environ.get("SEEKDB_NATIVE_MERGE", "").lower() in ("1", "true", "yes")
+SEEKDB_NATIVE_MERGE = native_only()
 
 # OceanBase's default 10s query timeout is too short for seeding and for the
 # anti-joins behind merge/rebase/reset; one hour, in microseconds.
@@ -297,12 +297,13 @@ class SeekDBToolSuite(DBToolSuite):
     BACKEND_NAME = "seekdb"
     STORAGE_SCOPE = "server"
     SUPPORTS_COMMIT_REFS = True
+    SCHEMA_DIALECT = "mysql"
     SUPPORTS_MULTI_REF_EXEC = True
     # For the report: FORK/DROP DATABASE and cross-database queries are
     # native; everything else is built on current_scn() + flashback reads.
     IMPLEMENTATION = {
         "branch": "native",
-        "commit": "simulated",
+        "commit": "native",
         "diff": "simulated",
         "log": "simulated",
         "merge": "native" if SEEKDB_NATIVE_MERGE else "simulated",
@@ -310,7 +311,8 @@ class SeekDBToolSuite(DBToolSuite):
         "revert": "simulated",
         "reset": "simulated",
         "delete": "native",
-        "commit_refs": "simulated",
+        "commit_refs": "native",
+        "schema_diff": "simulated",
         "multi_ref_exec": "native",
     }
     IMPLEMENTATION_NOTES = {
@@ -325,6 +327,7 @@ class SeekDBToolSuite(DBToolSuite):
         "reset": "rows restored with SQL from the flashback snapshot",
         "delete": "DROP DATABASE",
         "commit_refs": "flashback reads AS OF SNAPSHOT scn",
+        "schema_diff": "catalog columns of each ref compared by the adapter",
         "multi_ref_exec": "cross-database queries",
     }
 
@@ -444,18 +447,30 @@ class SeekDBToolSuite(DBToolSuite):
                 seq += 1  # two writers recorded the same SCN
         raise RuntimeError(f"could not record commit {commit_id} on {db}")
 
+    def _schema_at(self, ref: Ref) -> dict:
+        """A commit's schema is the typed fingerprint recorded with it (a
+        fork restored to the commit would cost a full restore); a branch
+        head is read from the catalog."""
+        if ref.commit:
+            row = self._find_commit(self._db_for(ref.branch), ref.commit)
+            fp = json.loads(row["schema_json"]) if row.get("schema_json") else None
+            if fp and all(isinstance(v, dict) for v in fp.values()):
+                return {t: {c: str(ty).lower() for c, ty in cols.items()} for t, cols in fp.items()}
+        return super()._schema_at(ref)
+
     def _fingerprint(self, db: str) -> dict:
-        """{table: [columns]} of db's data tables."""
+        """{table: {column: type}} of db's data tables (older rows hold
+        {table: [columns]}; consumers only need the names from those)."""
         rows = self._execute(
-            "SELECT c.table_name, c.column_name FROM information_schema.columns c "
+            "SELECT c.table_name, c.column_name, c.column_type FROM information_schema.columns c "
             "JOIN information_schema.tables t ON t.table_schema = c.table_schema "
             "AND t.table_name = c.table_name AND t.table_type = 'BASE TABLE' "
             "WHERE c.table_schema = %s AND c.table_name NOT LIKE %s "
             "ORDER BY c.table_name, c.ordinal_position",
             (db, META_PREFIX.replace("_", r"\_") + "%"))
         out = {}
-        for table, col in rows or []:
-            out.setdefault(table, []).append(col)
+        for table, col, ctype in rows or []:
+            out.setdefault(table, {})[col] = str(ctype).lower()
         return out
 
     @staticmethod
@@ -665,7 +680,7 @@ class SeekDBToolSuite(DBToolSuite):
     def _storage_bytes(self) -> int:
         """Size of the server's data directory. SeekDB keeps all databases
         in one store, so this covers the whole server."""
-        return dbutil.get_directory_size_bytes(SEEKDB_DATA_DIR)
+        return dbutil.get_directory_size_bytes(SEEKDB_DATA_DIR, ssh=dbutil.ssh_target("SEEKDB_SSH"))
 
     def _connect_impl(self, ref: Ref) -> None:
         if ref.commit:
@@ -790,7 +805,25 @@ class SeekDBToolSuite(DBToolSuite):
         there = set(self._tables(target.db))
         if target.schema is not None:
             there &= set(target.schema)
+            # Upfront schema comparison: what the target had and the branch
+            # has since dropped cannot come back with its values (a
+            # re-added column or table is new to the engine; a flashback
+            # read returns NULL or nothing for it). Refuse before touching
+            # anything rather than restore NULLs or a half-reset branch.
+            lost = []
+            for table, fp in target.schema.items():
+                if table not in here:
+                    if target.db == db or table not in set(self._tables(target.db)):
+                        lost.append(f"table {table}")
+                    continue
+                now = {col for col, _, _, _ in self._columns(db, table)}
+                lost += [f"{table}.{c}" for c in fp if c not in now]
+            if lost:
+                raise self._unsupported("restore to a state before a dropped column or table",
+                                        "flashback versions rows under the current schema only; dropped since "
+                                        f"the target and not restorable: {', '.join(lost)}")
         dropped, restored, created, skipped = [], [], [], []
+        retyped: dict = {}
         for table in sorted(here | there):
             if table in there:
                 readable = self._snapshot_exists(target, table)
@@ -807,15 +840,26 @@ class SeekDBToolSuite(DBToolSuite):
                 self._execute(f"CREATE TABLE {_qt(db, table)} LIKE {_qt(target.db, table)}")
                 created.append(table)
             if target.schema is not None:
-                # Columns added after the commit are not part of its state.
-                keep = set(target.schema.get(table, ()))
-                for col, _, _, _ in self._columns(db, table):
+                # Columns added after the commit are not part of its state;
+                # columns dropped or retyped since are put back (re-added
+                # with the recorded type: the row restore refills them).
+                fp = target.schema.get(table, ())
+                keep = set(fp)
+                types = fp if isinstance(fp, dict) else {}
+                now = {col: str(ctype).lower() for col, ctype, _, _ in self._columns(db, table)}
+                for col in now:
                     if col not in keep:
                         self._execute(f"ALTER TABLE {_qt(db, table)} DROP COLUMN {_quote(col)}")
+                # A retyped column keeps its identity: rows are restored
+                # first (flashback still reads it), then the type is put back.
+                retyped[table] = [(c, t) for c, t in types.items() if c in now and now[c] != t]
             restored.append(table)
         with self._bulk():
             for table in restored:
                 self._restore_table(db, table, target)
+        for table, cols in retyped.items():
+            for col, ctype in cols:
+                self._execute(f"ALTER TABLE {_qt(db, table)} MODIFY {_quote(col)} {ctype}")
         return {"restored": restored, "dropped": dropped, "created": created,
                 "not_restored": skipped}
 
@@ -1174,7 +1218,7 @@ class SeekDBToolSuite(DBToolSuite):
         return info
 
     # ------------------------------------------------------------------
-    # Native MERGE TABLE (SEEKDB_NATIVE_MERGE=1)
+    # Native MERGE TABLE (native-only mode)
     # ------------------------------------------------------------------
 
     def _native_merge(self, into: Ref, source: Ref, message: str,
