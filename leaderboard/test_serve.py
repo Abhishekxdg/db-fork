@@ -125,7 +125,7 @@ class Launcher(unittest.TestCase):
             self.assertIn("leaderboard.run", serve.script_for({**base, "suite": "micro"}))
 
     def test_missing_connectors_cannot_generate_scripts(self):
-        for system in ("neon", "tiger", "xata"):
+        for system in ("tiger",):
             with self.subTest(system=system), self.assertRaisesRegex(ValueError, "no runnable"):
                 serve.script_for({"systems": [system], "machine": "bench-01", "location": "US East"})
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(serve, "BOARD", Path(directory)):

@@ -1,0 +1,34 @@
+#!/bin/bash
+# Start SeekDB (OceanBase) the way dblib/seekdb.py expects it:
+# 127.0.0.1:2881, user root with no password.
+set -euo pipefail
+
+runs="$(cd "$(dirname "$0")/.." && pwd)/.runs"
+if [ -n "${SEEKDB_DATA_DIR:-}" ]; then
+    data_dir="$SEEKDB_DATA_DIR"
+elif [ -d "$HOME/seekdb/store" ]; then
+    data_dir="$HOME/seekdb/store"
+else
+    data_dir="/opt/homebrew/var/seekdb/data"
+fi
+mkdir -p "$runs" "$data_dir"
+
+if [ -f "$runs/seekdb.pid" ] && kill -0 "$(cat "$runs/seekdb.pid")" 2>/dev/null; then
+    echo "SeekDB already running (pid $(cat "$runs/seekdb.pid"))"
+    exit 0
+fi
+
+if [ -n "${SEEKDB_BIN:-}" ]; then
+    seekdb_bin="$SEEKDB_BIN"
+elif command -v seekdb >/dev/null 2>&1; then
+    seekdb_bin="$(command -v seekdb)"
+elif [ -x "/opt/homebrew/opt/seekdb/bin/seekdb" ]; then
+    seekdb_bin="/opt/homebrew/opt/seekdb/bin/seekdb"
+else
+    seekdb_bin="$HOME/seekdb/build/debug/src/observer/seekdb"
+fi
+
+export DYLD_FALLBACK_LIBRARY_PATH="/opt/homebrew/opt/seekdb/libexec/compat:${DYLD_FALLBACK_LIBRARY_PATH:-/usr/local/lib:/lib:/usr/lib}"
+cd "$data_dir"
+"$seekdb_bin" --nodaemon --base-dir="$data_dir" > "$runs/seekdb.log" 2>&1 &
+echo $! > "$runs/seekdb.pid"

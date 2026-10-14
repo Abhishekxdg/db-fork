@@ -1,0 +1,29 @@
+#!/bin/bash
+# Start PostgreSQL 18 on port 5433 the way dblib/file_copy.py expects it.
+set -euo pipefail
+
+runs="$(cd "$(dirname "$0")/.." && pwd)/.runs"
+data_dir="${PGSQL_DATA_DIR:-$HOME/pg_file_copy/data}"
+port="${PGSQL_PORT:-5433}"
+mkdir -p "$runs" "$(dirname "$data_dir")"
+
+if [ -f "$runs/file_copy.pid" ] && kill -0 "$(cat "$runs/file_copy.pid")" 2>/dev/null; then
+    echo "PostgreSQL (file_copy) already running (pid $(cat "$runs/file_copy.pid"))"
+    exit 0
+fi
+
+if [ -x "/opt/homebrew/opt/postgresql@18/bin/postgres" ]; then
+    pg_bin_dir="/opt/homebrew/opt/postgresql@18/bin"
+elif [ -x "/usr/local/opt/postgresql@18/bin/postgres" ]; then
+    pg_bin_dir="/usr/local/opt/postgresql@18/bin"
+else
+    pg_bin_dir="$(dirname "$(command -v postgres)")"
+fi
+
+if [ ! -f "$data_dir/PG_VERSION" ]; then
+    "$pg_bin_dir/initdb" -D "$data_dir" --auth=trust --no-locale --encoding=UTF8 > "$runs/file_copy.init.log" 2>&1
+fi
+
+rm -f "$data_dir/postmaster.pid"
+"$pg_bin_dir/postgres" -D "$data_dir" -p "$port" -k /tmp -c max_connections=200 > "$runs/file_copy.log" 2>&1 &
+echo $! > "$runs/file_copy.pid"

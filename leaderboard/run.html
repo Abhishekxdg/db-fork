@@ -30,13 +30,16 @@
                 </fieldset>
             </section>
             <section class="wizard-section" aria-labelledby="databases-title">
-                <h2 id="databases-title">Databases</h2><p class="wizard-description">Dolt and Doltgres can run today. Each selected database gets the same suite in its own run.</p>
+                <h2 id="databases-title">Databases</h2><p class="wizard-description">Select one or more databases to benchmark. Each selected database gets the same suite in its own run.</p>
                 <fieldset class="option-grid" aria-describedby="database-selection"><legend class="sr-only">Databases</legend>
                     <label class="option-card"><input id="database-dolt" type="checkbox" name="database" value="dolt_mysql" checked><span class="system-icon" data-system="dolt">D</span><strong>Dolt</strong><span>MySQL protocol</span><small>Self-hosted</small></label>
                     <label class="option-card"><input id="database-doltgres" type="checkbox" name="database" value="dolt"><span class="system-icon" data-system="doltgres">D</span><strong>Doltgres</strong><span>Postgres protocol</span><small>Self-hosted</small></label>
-                    <label class="option-card"><input id="database-neon" type="checkbox" name="database" value="neon" disabled><span class="system-icon" data-system="neon">N</span><strong>Neon</strong><span>Serverless Postgres</span><small>No connector yet</small></label>
+                    <label class="option-card"><input id="database-seekdb" type="checkbox" name="database" value="seekdb"><span class="system-icon" data-system="seekdb">S</span><strong>SeekDB</strong><span>MySQL protocol</span><small>Self-hosted</small></label>
+                    <label class="option-card"><input id="database-matrixone" type="checkbox" name="database" value="matrixone"><span class="system-icon" data-system="matrixone">M</span><strong>MatrixOne</strong><span>MySQL protocol</span><small>Self-hosted</small></label>
+                    <label class="option-card"><input id="database-file-copy" type="checkbox" name="database" value="file_copy"><span class="system-icon" data-system="postgresql-file-copy">P</span><strong>PostgreSQL (FILE_COPY)</strong><span>Full database copy</span><small>Self-hosted</small></label>
+                    <label class="option-card"><input id="database-neon" type="checkbox" name="database" value="neon"><span class="system-icon" data-system="neon">N</span><strong>Neon</strong><span>Serverless Postgres</span><small>Managed service</small></label>
                     <label class="option-card"><input id="database-tiger" type="checkbox" name="database" value="tiger" disabled><span class="system-icon" data-system="tiger-cloud">T</span><strong>Tiger Cloud</strong><span>Postgres service forks</span><small>No connector yet</small></label>
-                    <label class="option-card"><input id="database-xata" type="checkbox" name="database" value="xata" disabled><span class="system-icon" data-system="xata">X</span><strong>Xata</strong><span>Branching Postgres</span><small>No connector yet</small></label>
+                    <label class="option-card"><input id="database-xata" type="checkbox" name="database" value="xata"><span class="system-icon" data-system="xata">X</span><strong>Xata</strong><span>Branching Postgres</span><small>Managed service</small></label>
                 </fieldset>
                 <p id="database-selection" class="database-selection" role="status">1 database selected</p>
             </section>
@@ -94,6 +97,11 @@ source .venv/bin/activate</code></pre><p>On macOS, libpq’s tools may need addi
 const SYSTEMS = {
     dolt_mysql: {name: 'Dolt', requirement: 'Dolt CLI on PATH.', keys: []},
     dolt: {name: 'Doltgres', requirement: 'Doltgres and psql (libpq) on PATH.', keys: []},
+    seekdb: {name: 'SeekDB', requirement: 'SeekDB (OceanBase) binary installed.', keys: []},
+    matrixone: {name: 'MatrixOne', requirement: 'MatrixOne (mo-service) binary installed.', keys: []},
+    file_copy: {name: 'PostgreSQL (FILE_COPY)', requirement: 'PostgreSQL 18 (postgres, pg_ctl, initdb) and psql (libpq) on PATH.', keys: []},
+    neon: {name: 'Neon', requirement: 'psql (libpq) on PATH.', keys: ['NEON_API_KEY_ORG']},
+    xata: {name: 'Xata', requirement: 'psql (libpq) on PATH.', keys: ['XATA_API_KEY', 'XATA_ORGANIZATION_ID']},
 };
 const SCENARIOS = ['rl_env', 'context_mgmt', 'multi_agent', 'dev_agent', 'ops_agent', 'data_agent'];
 function shellQuote(value) { return "'" + value.replaceAll("'", "'\\''") + "'"; }

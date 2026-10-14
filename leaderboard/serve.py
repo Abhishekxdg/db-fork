@@ -27,7 +27,8 @@ from leaderboard.validate_macro import ATTEMPT_RE, CAMPAIGN_FILE_RE, PRESETS, SC
 ROOT = BOARD.parent
 PYTHON = str(ROOT / ".venv/bin/python") if (ROOT / ".venv/bin/python").exists() else sys.executable
 SYSTEMS = {
-    "dolt_mysql": (), "dolt": (), "neon": ("NEON_API_KEY_ORG",),
+    "dolt_mysql": (), "dolt": (), "seekdb": (), "matrixone": (), "file_copy": (),
+    "neon": ("NEON_API_KEY_ORG",),
     "tiger": ("TIGER_ACCESS_KEY", "TIGER_SECRET_KEY", "TIGER_PROJECT_ID"),
     "xata": ("XATA_API_KEY", "XATA_ORGANIZATION_ID"),
 }

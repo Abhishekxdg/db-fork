@@ -112,7 +112,16 @@ def _get_primary_key_columns(
         ORDER BY ordinal_position DESC;
     """
     pk_columns = _run_sql_query(conn, query, (table_name, table_name))
-    return [(col[0], col[1]) for col in pk_columns]
+    if not pk_columns and _is_mysql(conn):
+        escaped = table_name.replace("`", "``")
+        rows = _run_sql_query(conn, f"SHOW KEYS FROM `{escaped}`;")
+        pk = sorted(
+            ((int(r[3]), str(r[4])) for r in rows
+             if r[2] == "PRIMARY" and not str(r[4]).startswith("__mo_")),
+            reverse=True,
+        )
+        return [(name, seq) for seq, name in pk]
+    return [(col[0], col[1]) for col in pk_columns if not str(col[0]).startswith("__mo_")]
 
 
 def get_pk_column_names(
@@ -258,7 +267,7 @@ def get_all_columns(
     if _is_mysql(conn):
         query += "AND table_schema = DATABASE()\n"
     columns = _run_sql_query(conn, query, (table_name,))
-    return [col[0] for col in columns]
+    return [col[0] for col in columns if not str(col[0]).startswith("__mo_")]
 
 def get_foreign_key_columns(
     conn: psycopg2.extensions.connection, table_name: str
@@ -304,11 +313,13 @@ def get_column_types(
         Mapping of column_name -> information_schema data_type
         (e.g. 'integer', 'character varying', 'timestamp without time zone')
     """
-    _run_sql_query(conn, "SET search_path TO public")
+    _set_search_path(conn)
     query = """
     SELECT column_name, data_type
     FROM information_schema.columns
     WHERE table_name = %s
     """
+    if _is_mysql(conn):
+        query += "AND table_schema = DATABASE()\n"
     rows = _run_sql_query(conn, query, (table_name,))
-    return {r[0]: r[1] for r in rows}
+    return {r[0]: r[1] for r in rows if not str(r[0]).startswith("__mo_")}

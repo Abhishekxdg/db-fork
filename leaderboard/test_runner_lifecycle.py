@@ -13,7 +13,7 @@ from unittest import mock
 
 import psycopg2
 
-from dblib import dolt as dolt_pg, dolt_mysql
+from dblib import dolt as dolt_pg, dolt_mysql, file_copy, matrixone, seekdb
 from leaderboard import run as runner
 from leaderboard.connector import load_connector
 
@@ -46,7 +46,13 @@ class Recovery(unittest.TestCase):
             self.assertTrue(path.exists())
 
     def test_scopes_identify_actual_targets(self):
-        for key, module, host in (("dolt", dolt_pg, "DOLT_HOST"), ("dolt_mysql", dolt_mysql, "DOLT_MYSQL_HOST")):
+        for key, module, host in (
+            ("dolt", dolt_pg, "DOLT_HOST"),
+            ("dolt_mysql", dolt_mysql, "DOLT_MYSQL_HOST"),
+            ("seekdb", seekdb, "SEEKDB_HOST"),
+            ("matrixone", matrixone, "MO_HOST"),
+            ("file_copy", file_copy, "PGSQL_HOST"),
+        ):
             server = load_connector(key)
             original = server.scope()
             with mock.patch.object(module, host, "other-host"):
