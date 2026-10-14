@@ -314,7 +314,7 @@ assert.equal(run("pick([0.3, 0.2, null], 'best')"), null);
 assert.equal(run('seconds(0.017706)'), '0.017706s', 'Close first-query results remain distinguishable');
 assert.equal(run('seconds(0.017746)'), '0.017746s');
 assert.deepEqual([1, 2, 3, 4, 11, 12, 13, 21, 22, 101].map(n => run(`ordinal(${n})`)), ['1st', '2nd', '3rd', '4th', '11th', '12th', '13th', '21st', '22nd', '101st']);
-assert.match(byClass('group-heading')[0].textContent, /^Self-hosted/);
+assert.match(byClass('group-heading')[0].textContent, /^Operations/);
 // A "?" opens the definition below the board and moves focus there.
 // Following a link: the hash changes, the section opens on the linked definition and keyboard focus moves there.
 const follow = (page, hash) => { page.run(`window.location.hash = ${JSON.stringify(hash)}`); page.run('{ const before = routeKey(); applyHash(); if (before !== routeKey()) render(); reveal(true); }'); };
@@ -413,10 +413,10 @@ assert.equal(macroPage.run('state.workflow'), 'rl_env', 'The definition selectio
 assert.equal(macroPage.document.getElementById('status-legend'), null, 'No status key: every status is spelled out in its cell');
 assert.deepEqual(macroEl('selectors-suite').children.map(b => b.getAttribute('aria-selected')), ['true', 'false']);
 assert.equal(macroEl('nav-board').href, '#agent-workflows'); assert.equal(macroEl('nav-workflows').href, '#workflows?workflow=rl_env');
-// Campaigns compare only within a comparison group, so each group is its own table, headed on one line by its machine and how many systems it compares.
-assert.equal(boards().length, 2, 'Two comparison groups, two tables, never one comparison');
+// All campaigns render in one unified table, headed by 'Agent workflows' and how many systems it compares.
+assert.equal(boards().length, 1, 'One unified table for all campaigns');
 assert.deepEqual(classNodes(macroEl('macro-groups'), 'group-heading').map(h => [h.children[0].textContent, h.children[1].textContent]),
-    [['Test CPU', '2 systems · 8 CPUs · 16 GiB · Darwin 27.0.0 arm64 · box · revision 0000000'], ['Other CPU', '1 system · 4 CPUs · 8 GiB · Darwin 27.0.0 arm64 · box2 · revision 1111111']]);
+    [['Agent workflows', '3 systems · ranked by Evaluate agent rollouts · lower is better']]);
 for (const table of boards()) {
     assert.deepEqual(headRow(table).map(firstText), ['System', ...NAMES_6, 'Completed'], 'Workflows are columns, named by the job; the upstream id is secondary');
     assert.deepEqual(headRow(table).slice(1, 7).map(th => [th.children.length, classNodes(th, 'sort-label')[0].textContent, classNodes(th, 'sort-button')[0].title]), NAMES_6.map(name => [1, name, name]), 'A header is one sort button: its label, clamped to two lines, with the full name as its title');
@@ -426,8 +426,10 @@ for (const table of boards()) {
     for (const row of bodyRows(table)) { assert.equal(row.children.length, 8); assert.equal(row.children[0].tag, 'th'); assert.equal(row.children[0].scope, 'row'); for (const td of row.children.slice(1)) assert.equal(td.tag, 'td'); }
 }
 assert.deepEqual(rowsOf().map(r => [classNodes(r, 'rank-number')[0].textContent, nameOf(r).textContent, classNodes(r, 'system-meta')[0].textContent]),
-    [['1', 'Dolt', 'v1.81.2 · 2026-10-10'], ['2', 'Doltgres', 'v1.81.2 · 2026-10-10'], ['1', 'MatrixOne', 'v1.81.2 · 2026-10-09']], 'The newest run of each system and machine; the machine is in the heading, not every row');
-assert.equal(classNodes(macroEl('macro-groups'), 'flag').length, 0, 'No badge on any row');
+    [['1', 'Dolt', 'v1.81.2 · 2026-10-10'], ['2', 'MatrixOne', 'v1.81.2 · 2026-10-09'], ['3', 'Doltgres', 'v1.81.2 · 2026-10-10']], 'The newest run of each system and machine in one unified ranking');
+assert.equal(classNodes(macroEl('macro-groups'), 'flag').length, 0, 'No caveat flag on any row');
+assert.deepEqual(rowsOf().map(r => classNodes(r, 'hosting-badge')[0].textContent), ['Self-hosted', 'Self-hosted', 'Self-hosted'], 'Hosting badge on every row');
+assert.deepEqual(rowsOf().map(r => classNodes(r, 'spec-badge')[0].textContent), ['8 CPUs · 16 GiB', '4 CPUs · 8 GiB', '8 CPUs · 16 GiB'], 'Hardware spec badge on every row');
 // One control per row: the Details button. The name is text, and no cell or row responds to a click.
 for (const row of rowsOf()) {
     assert.equal(nameOf(row).tag, 'span');
@@ -442,7 +444,7 @@ assert.deepEqual(KEYS.map(k => cellText('Doltgres', k)), ['20.000s', 'Incomplete
 assert.deepEqual(KEYS.map(k => classNodes(cellOf('Doltgres', k), 'best-mark').length), [0, 0, 0, 0, 1, 0], 'Each column marks its own fastest time');
 assert.deepEqual(KEYS.map(k => classNodes(cellOf('Dolt', k), 'best-mark').length), [1, 0, 0, 0, 0, 1], 'A time with nothing to compare against is never the fastest');
 assert.deepEqual(KEYS.map(k => cellOf('Dolt', k).style['--strength']), ['0.130', undefined, undefined, undefined, '0.080', '0.130'], 'Only a column that compares two times is shaded');
-assert.equal(classNodes(rowOf('MatrixOne'), 'best-mark').length + rowOf('MatrixOne').children.filter(td => td.style['--strength']).length, 0, 'A group of one compares nothing');
+assert.deepEqual(KEYS.map(k => cellOf('MatrixOne', k).style['--strength']), ['0.097', undefined, undefined, undefined, '0.063', '0.097']);
 assert.ok(rowsOf().every(r => r.children.slice(1).every(td => !/\bsorted\b/.test(td.className))), 'No column is tinted for being sorted');
 assert.deepEqual(KEYS.map(k => cellOf('Doltgres', k).style['--strength']), ['0.080', undefined, undefined, undefined, '0.130', '0.080'], 'A status is never shaded');
 assert.equal(cellOf('Doltgres', 'dev_agent').title, 'timed_out reason', 'The reason is one hover away; the partial time is in the details');
@@ -454,13 +456,12 @@ assert.doesNotMatch(css, /\.(wf|done|score|ratio|system)-cell\s*(,[^{]*)?\{[^}]*
 assert.match(css, /\.board \.system-col, \.board \.system-cell \{ position: sticky; left: 0;/, 'Narrow screens scroll the workflows past a pinned system column');
 assert.doesNotMatch(css, /data-label|attr\(data-label\)/, 'No stacked-card labels');
 assert.match(css, /\.status-chip \{[^}]*overflow-wrap: anywhere/); assert.doesNotMatch(css, /\.status-chip[^{]*\{[^}]*word-break: break-all/, 'Status words wrap at word boundaries, never letter by letter');
-// Below the card, each comparison group's evidence: its branch operations timed per call, beside the share of each
+// Below the card, the unified breakdown: branch operations timed per call, beside the share of each
 // completed workflow's operation time they take.
-assert.deepEqual(classNodes(macroEl('macro-breakdowns'), 'breakdown-title').map(h => h.textContent), ['Test CPU · box · revision 0000000', 'Other CPU · box2 · revision 1111111'], 'One breakdown per comparison group, each named');
+assert.deepEqual(classNodes(macroEl('macro-breakdowns'), 'breakdown-title').map(h => h.textContent), [], 'One unified breakdown needs no group heading');
 {
-    const solo = classNodes(macroEl('macro-breakdowns'), 'breakdown-group')[1];
-    assert.equal(classNodes(solo, 'heat').length + classNodes(solo, 'best-mark').length, 0, 'A group of one compares nothing');
-    assert.deepEqual([...new Set(classNodes(solo, 'dotplot-dot').map(d => d.style.backgroundColor))], ['var(--sys-other)'], 'A system without its own color takes the neutral one');
+    const soloGroup = classNodes(macroEl('macro-breakdowns'), 'breakdown-group')[0];
+    assert.ok(classNodes(soloGroup, 'dotplot-dot').some(d => d.style.backgroundColor === 'var(--sys-other)'), 'A system without its own color takes the neutral one');
     const dolt = campaign('d1000000', 'Dolt', 'dolt_mysql', '2026-10-10T12:00:00+00:00', six('0000011', V, Array(6).fill(10)));
     const pg = campaign('d2000000', 'Doltgres', 'dolt', '2026-10-10T11:00:00+00:00', six('0000012', ['verified', 'failed', 'failed', 'failed', 'verified', 'verified'], [20, 0, 0, 0, 5, 20]));
     for (const a of Object.values(pg.attempts)) a.evidence.op_status_counts.BRANCH.ok_seconds = 0.8;  // 100 ms a call against Dolt's 50
@@ -529,11 +530,11 @@ assert.equal(macroEl('run-dialog').open, true); assert.equal(macroEl('run-dialog
 assert.equal(macroPage.document.activeElement, macroEl('run-body'), 'Opening focuses the scrollable body');
 assert.equal(macroEl('run-title').textContent, 'Doltgres'); assert.equal(macroEl('run-subtitle').textContent, 'v1.81.2 · box · 2026-10-10');
 assert.equal(macroEl('run-source').href, 'dolt/macro/20261010/campaign_c2000000.json');
-assert.equal(classNodes(macroEl('run-body'), 'verdict')[0].textContent, '2nd of 2 by Evaluate agent rollouts: 20.000s, ×2.00 the fastest.');
+assert.equal(classNodes(macroEl('run-body'), 'verdict')[0].textContent, '3rd of 3 by Evaluate agent rollouts: 20.000s, ×2.00 the fastest.');
 const workflowItems = () => classNodes(macroEl('run-body'), 'why-item');
 assert.deepEqual(workflowItems().map(item => [item.tag, classNodes(item, 'why-name')[0].children[0].textContent]), NAMES_6.map(name => ['details', name]), 'Every workflow, in suite order, each a disclosure');
 assert.deepEqual(workflowItems().map(item => classNodes(item.children[0], 'why-value')[0].textContent),
-    ['20.000s2nd of 2', 'Incompleteincomplete reason', 'Failedfailed reason', 'Timed outtimed_out reason', '5.000s1st of 2', '20.000s2nd of 2']);
+    ['20.000s3rd of 3', 'Incompleteincomplete reason', 'Failedfailed reason', 'Timed outtimed_out reason', '5.000s1st of 3', '20.000s3rd of 3']);
 assert.equal(classNodes(macroEl('run-body'), 'bar-tick').length, 3, 'Each timed workflow bar marks the fastest time');
 const incompleteText = workflowItems()[1].textContent;
 for (const word of ['Incomplete', 'incomplete reason', 'Partial elapsed 12.500s, not a completion time', 'Setup time1.500s', 'Work units', 'Correctness checks', 'Every check (2)', 'Unsupported: MERGE:not implemented, MERGE:timed out, REBASE', 'Attempt record', 'Workload identity SHA-256']) assert.ok(incompleteText.includes(word), word);
@@ -576,7 +577,7 @@ assert.deepEqual(['campaign-c1000000', 'campaign-c4000000'].map(id => [macroEl(i
     [['2026-10-10 12:00 · 6 of 6 workflows completed', 'true'], ['2026-10-08 12:00 · 6 of 6 workflows completed', 'false']], 'Newest first');
 macroEl('campaign-c4000000').click();
 assert.equal(macroPage.run('window.location.hash'), '#agent-workflows?campaign=c4000000');
-assert.deepEqual(rowsOf().slice(0, 2).map(r => [classNodes(r, 'rank-number')[0].textContent, nameOf(r).textContent]), [['1', 'Doltgres'], ['2', 'Dolt']], 'The board ranks the chosen run');
+assert.deepEqual(rowsOf().slice(0, 2).map(r => [classNodes(r, 'rank-number')[0].textContent, nameOf(r).textContent]), [['1', 'MatrixOne'], ['2', 'Doltgres']], 'The board ranks the chosen run');
 assert.equal(macroEl('run-subtitle').textContent, 'v1.81.2 · box · 2026-10-08', 'The dialog follows the chosen run');
 macroEl('campaign-c1000000').click();
 assert.equal(macroPage.run('window.location.hash'), '#agent-workflows');
@@ -584,8 +585,18 @@ macroEl('close-run').click();
 assert.equal(macroPage.document.activeElement.id, 'details:dolt_mysql:box', 'Switching runs rebuilds the board, yet closing still returns focus to that row\'s Details');
 assert.equal(macroPage.document.activeElement, detailsOf(rowOf('Dolt')), 'and to the rebuilt button, not the detached one');
 // Screen readers hear the rank, or that there is none, before the name; the hover text says why a row is unranked.
-assert.deepEqual(rowsOf().map(r => classNodes(r.children[0], 'sr-only')[0].textContent), ['Rank 1, ', 'Rank 2, ', 'Rank 1, ']);
+assert.deepEqual(rowsOf().map(r => classNodes(r.children[0], 'sr-only')[0].textContent), ['Rank 1, ', 'Rank 2, ', 'Rank 3, ']);
 assert.equal(classNodes(rowOf('Dolt'), 'rank-number')[0].getAttribute('aria-hidden'), 'true');
+// Macrobench filter bar: filter by machine or hosting and reset.
+assert.equal(macroEl('macro-shown').textContent, '3 systems');
+assert.equal(macroEl('macro-reset-filters').hidden, true);
+check(macroPage, 'filter-macroMachine-1');  // uncheck 'box2' -> only 'box' remains
+assert.equal(macroEl('macro-shown').textContent, '2 systems · filtered');
+assert.equal(macroEl('macro-reset-filters').hidden, false);
+assert.deepEqual(rowsOf().map(r => nameOf(r).textContent), ['Dolt', 'Doltgres']);
+macroEl('macro-reset-filters').click();
+assert.equal(macroEl('macro-shown').textContent, '3 systems');
+assert.equal(rowsOf().length, 3);
 assert.equal(macroEl('nav-run').href, 'run.html#agent-workflows', 'Run a benchmark opens the wizard on the suite in view');
 // A header link to the section already in the URL fires no hashchange, so it reveals and focuses the section itself.
 macroPage.run("window.location.hash = '#workflows?workflow=rl_env'");
@@ -609,7 +620,7 @@ const rankedData = {suite: macroData.suite, excluded: [], campaigns: [timed('d00
 const ranked = mount(data, [], rankedData, '#agent-workflows');
 const rankedRows = () => rowsOf(ranked), rankedBoard = () => boards(ranked)[0];
 assert.equal(boards(ranked).length, 1, 'One comparison group, one table');
-assert.deepEqual(classNodes(ranked.el('macro-groups'), 'group-heading')[0].children.map(c => c.textContent), ['Test CPU', '4 systems · 8 CPUs · 16 GiB · Darwin 27.0.0 arm64 · box', 'SlowerFaster'], 'One group needs no revision to tell it apart, and its shading has a key');
+assert.deepEqual(classNodes(ranked.el('macro-groups'), 'group-heading')[0].children.map(c => c.textContent), ['Agent workflows', '4 systems · ranked by Evaluate agent rollouts · lower is better', 'SlowerFaster'], 'One unified table heading with shading key');
 assert.deepEqual(rankedRows().map(r => [nameOf(r).textContent, classNodes(r, 'rank-number')[0].textContent]), [['Dolt', '1'], ['Tie', '1'], ['Doltgres', '3'], ['Late', '—']], 'Tied times share a rank; the next rank skips; a failed workflow is listed last, unranked');
 assert.deepEqual([classNodes(rankedRows()[3].children[0], 'sr-only')[0].textContent, rankedRows()[3].children[0].title], ['Not ranked, ', 'Not ranked by Evaluate agent rollouts: Failed'], 'An unranked row says so, and why');
 assert.deepEqual(rankedRows().map(r => classNodes(r.children[1], 'best-mark').length), [1, 1, 0, 0]);
@@ -711,7 +722,7 @@ for (const [hash, rank, note] of [['#agent-workflows?workflow=%&view=old', 'rl_e
         ['#agent-workflows?%zz=1&workflow=ops_agent&view=old', 'ops_agent', 'a malformed key beside a valid pair'], ['#agent-workflows?view=old&workflow=ops_agent&group=%', 'ops_agent', 'a malformed trailing pair']]) {
     const mangled = mount(data, [], macroData, hash);
     assert.equal(mangled.run('state.suite'), 'macro', note); assert.equal(mangled.run('state.rank'), rank, note);
-    assert.equal(boards(mangled).length, 2, `${note}: the tables rendered`);
+    assert.equal(boards(mangled).length, 1, `${note}: the table rendered`);
 }
 assert.equal(mount(data, [], macroData, '#agent-workflows?a%ZZ=1&b=%C3&c=ok').run('JSON.stringify(parseHash().params)'), '{"c":"ok"}', 'Only the well-formed pair is kept');
 // Empty datasets are honest: no fabricated rows, one sentence in the table shell, and no rank control without a result.
@@ -1068,6 +1079,10 @@ assert.ok(commandsFor(['neon'], 'bench-01', "O'Brien $(touch nope)").includes("-
 assert.throws(() => commandsFor(['neon'], 'bench-01', '   '), /location/);
 assert.throws(() => commandsFor(['neon'], 'bench-01', 'US\tEast'), /location/);
 vm.runInContext('delete SYSTEMS.neon', wizardContext);
+assert.ok([...wizardHtml.matchAll(/<input\b[^>]*\bname="database"[^>]*>/g)].every(([input]) => /\btype="radio"/.test(input)), 'Wizard selects 1 database per run via radio inputs');
+const submissionScaffold = vm.runInContext('submissionScaffold', wizardContext);
+assert.match(submissionScaffold('AcmeDB', 'acmedb', false, 'dev-box', {preset: 'mini'}), /"system": "AcmeDB"[\s\S]*python -m leaderboard\.run_macro acmedb --preset mini --machine 'dev-box'/);
+assert.throws(() => submissionScaffold('AcmeDB', 'bad-slug!', false, 'dev-box', null), /adapter ID/);
 
 
 // Selecting data rows changes only the reads/writes score, the board names the subset it counts, and the last ticked
@@ -1151,17 +1166,12 @@ for (const excluded of [[], stale]) {
     }
 }
 const grouped = mount([entry('Local', 1, []), {...entry('Hosted', 5, []), hosted: 'yes', region: 'test-region', rtt_ms: 10}]);
-assert.equal(grouped.byClass('summary').length, 2, 'One ranking table per hosting group');
-assert.deepEqual(grouped.byClass('group-heading').map(h => h.children[0].textContent), ['Self-hosted', 'Managed service']);
-assert.equal(classNodes(grouped.el('breakdowns'), 'heatmap').length, 2);
-assert.deepEqual(classNodes(grouped.el('breakdowns'), 'breakdown-title').map(h => h.textContent), ['Self-hosted', 'Managed service'], 'Two groups name their breakdowns');
-assert.deepEqual(heatmapColors(grouped), Array(20).fill(undefined), 'Hosted and local scales stay separate, and a group of one compares nothing, so nothing is shaded');
-for (const score of grouped.byClass('score-value')) assert.equal(score.textContent, '×1.00', 'Local and hosted baselines remain independent');
-for (const point of classNodes(grouped.el('breakdowns'), 'chart-point')) {
-    assert.equal(point.getAttribute('data-x-score'), '1', 'Chart baselines stay within the hosting group');
-    assert.equal(point.getAttribute('data-y-score'), '1');
-}
-assert.deepEqual(classNodes(grouped.el('operation-results'), 'result-group').map(g => g.children[0].textContent), ['Self-hosted', 'Managed service'], 'Operation times keep the hosting groups apart');
+assert.equal(grouped.byClass('summary').length, 1, 'One unified ranking table for all systems');
+assert.deepEqual(grouped.byClass('group-heading').map(h => h.children[0].textContent), ['Operations']);
+assert.deepEqual(grouped.byClass('hosting-badge').map(b => b.textContent), ['Self-hosted', 'Managed service'], 'Each row carries a hosting badge');
+assert.equal(classNodes(grouped.el('breakdowns'), 'heatmap').length, 1);
+assert.equal(classNodes(grouped.el('breakdowns'), 'breakdown-title').length, 0, 'Unified breakdown needs no group title');
+assert.equal(classNodes(grouped.el('operation-results'), 'result-group').length, 1, 'Operation times are shown in one unified list');
 const zeroData = [entry('Zero', 1, []), entry('One', 1, []), entry('Missing', 1, [])];
 zeroData[0].result = suite.rows.map(() => [0, 0, 0]);
 zeroData[2].result = suite.rows.map(() => [null, null, null]);

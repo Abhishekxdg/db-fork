@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#f6f7f9">
+<title>BranchBench — Benchmark &amp; Submission Architecture</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+    <div class="shell header-bar">
+        <a class="brand" href="index.html">
+            <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M5 3v14M5 8c4 0 5 3 10 3M5 13c4 0 5-5 10-5"/><circle cx="5" cy="3" r="2"/><circle cx="5" cy="17" r="2"/><circle cx="15" cy="8" r="2"/><circle cx="15" cy="11" r="2"/></svg></span>
+            <span class="brand-name">BranchBench</span>
+        </a>
+        <nav class="site-nav" aria-label="Page sections">
+            <a href="index.html#agent-workflows">Leaderboard</a>
+            <a href="#what-we-test">What we test</a>
+            <a href="#submission-flow">DB submission (1 DB = 1 VM)</a>
+            <a href="#prod-vs-local">Official vs. Local Dev</a>
+        </nav>
+        <div class="header-actions"><a class="button" href="index.html">Back to leaderboard</a><a class="button button-primary" href="run.html">Run a benchmark</a></div>
+    </div>
+</header>
+
+<main class="shell">
+    <section class="board-section">
+        <div class="page-header">
+            <div class="board-title">
+                <h1>Benchmark &amp; Submission Architecture</h1>
+                <p class="page-subtitle">How BranchBench ranks branching databases fairly across self-hosted engines and managed cloud services.</p>
+            </div>
+        </div>
+
+        <section class="panel" id="what-we-test">
+            <h2>1. What We Measure</h2>
+            <p class="panel-note">BranchBench evaluates databases that support Git-like branching, copy-on-write forks, and point-in-time recovery for AI agent workloads.</p>
+            <dl class="rule-list">
+                <div>
+                    <dt>Macrobench (<code>Agent workflows</code>)</dt>
+                    <dd>Six end-to-end agent scenarios (<code>S1 RL environment</code>, <code>S2 Context management</code>, <code>S3 Multi-agent</code>, <code>S4 Dev agent</code>, <code>S5 Ops agent</code>, <code>S6 Data agent</code>) exercising nine branching verbs (<code>branch</code>, <code>commit</code>, <code>diff</code>, <code>log</code>, <code>merge</code>, <code>rebase</code>, <code>revert</code>, <code>reset</code>, <code>delete</code>) alongside concurrent SQL reads and writes.</dd>
+                </div>
+                <div>
+                    <dt>Microbench (<code>Operations</code>)</dt>
+                    <dd>Isolated primitive latencies on a seeded CH-benCHmark dataset: <strong>Time to first query</strong> on a new branch, branch creation &amp; connection chains, point/range reads &amp; writes, and initial data load.</dd>
+                </div>
+            </dl>
+        </section>
+
+        <section class="panel" id="fairness">
+            <h2>2. Hardware Fairness (ClickBench Approach)</h2>
+            <p class="panel-note">Databases range from single-binary engines (Dolt, Postgres) to distributed clusters (TiDB, MatrixOne, SeekDB) and cloud serverless services (Neon). BranchBench uses a unified table with explicit hardware attribution:</p>
+            <dl class="rule-list">
+                <div>
+                    <dt>Unified Table + Row Badges</dt>
+                    <dd>All systems appear in one unified table per suite. Every row displays a <strong>Hosting badge</strong> (<code>Self-hosted</code> vs. <code>Managed service</code>) and a <strong>Hardware / Spec badge</strong> (e.g. <code>16 CPUs · 32 GiB</code> or cloud region <code>aws-us-east-1</code>).</dd>
+                </div>
+                <div>
+                    <dt>Standard Reference VM Default</dt>
+                    <dd>Official self-hosted runs default to one standard cloud VM tier (e.g. AWS <code>c6i.4xlarge</code>: 16 vCPUs, 32 GiB RAM, NVMe SSD). If a distributed engine requires a larger VM tier to boot, its badge and the top-bar <strong>Machine</strong> filter make the hardware difference visible immediately.</dd>
+                </div>
+            </dl>
+        </section>
+
+        <section class="panel" id="submission-flow">
+            <h2>3. How Database Developers Submit a System (<code>1 Self-Hosted DB = 1 VM</code>)</h2>
+            <p class="panel-note">Contributors submit code and lifecycle hooks — never timing JSON files from their own laptops.</p>
+            <dl class="rule-list">
+                <div>
+                    <dt>Step 1 — Self-Contained Plugin Folder (<code>leaderboard/&lt;system&gt;/</code>)</dt>
+                    <dd>Add a self-contained directory inside <code>leaderboard/&lt;system&gt;/</code> without modifying core files outside <code>leaderboard/</code>:
+                        <code>system.json</code> (metadata, hosting mode, capability tags),
+                        <code>connector.py</code> (exporting <code>CONNECTOR</code> subclassing <code>leaderboard.connector.Connector</code>), and executable lifecycle scripts (<code>install</code>, <code>start</code>, <code>check</code>, <code>stop</code>) for self-hosted servers.</dd>
+                </div>
+                <div>
+                    <dt>Step 2 — Ephemeral VM per System</dt>
+                    <dd>CI launches <strong>1 dedicated ephemeral cloud VM per self-hosted system</strong> in parallel. Each database gets 100% of its VM's CPU, RAM, and disk I/O with zero noisy-neighbor interference or leftover OS page cache from other engines.</dd>
+                </div>
+                <div>
+                    <dt>Step 3 — Validate &amp; Publish</dt>
+                    <dd>Each VM executes the system's lifecycle hooks via <code>python -m leaderboard.run &lt;system&gt; --machine &lt;vm&gt;</code> and <code>python -m leaderboard.run_macro &lt;system&gt; --preset full --machine &lt;vm&gt;</code>, verifies all correctness invariants and cleanup checks, and records the validated result path in <code>leaderboard/publish.json</code>.</dd>
+                </div>
+            </dl>
+        </section>
+
+        <section class="panel" id="prod-vs-local">
+            <h2>4. Official Leaderboard (<code>prod</code>) vs. Local Dev Architecture (<code>local</code>)</h2>
+            <p class="panel-note">The same codebase powers both the public leaderboard and local developer benchmarking, separated by build phase:</p>
+            <div class="table-scroll">
+                <table class="detail-table" aria-label="Comparison between Official Prod Architecture and Local Dev Architecture">
+                    <thead>
+                        <tr>
+                            <th scope="col">Dimension</th>
+                            <th scope="col">Official Public Leaderboard (<code>--phase prod</code>)</th>
+                            <th scope="col">Local Developer Mode (<code>--phase local</code>)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <th scope="row">Primary Goal</th>
+                            <td>Universal, apples-to-apples public comparison across database systems.</td>
+                            <td>Fast connector development, local hardware testing, and debugging via <code>run.html</code>.</td>
+                        </tr>
+                        <tr>
+                            <th scope="row">Execution Environment</th>
+                            <td><strong>1 System = 1 Ephemeral Cloud VM</strong> (dedicated CPU/RAM/NVMe per database in CI).</td>
+                            <td>Developer's own workstation/laptop (e.g. <code>apple-m5-32gb</code>) running 1 database at a time.</td>
+                        </tr>
+                        <tr>
+                            <th scope="row">Database Lifecycle</th>
+                            <td>Fresh VM runs <code>leaderboard/&lt;system&gt;/{install,start,check,stop}</code> from scratch, then destroys the VM.</td>
+                            <td><code>leaderboard.run</code> invokes <code>leaderboard/&lt;system&gt;/{install,start,check,stop}</code> locally around the benchmark run.</td>
+                        </tr>
+                        <tr>
+                            <th scope="row">Data Source Gate</th>
+                            <td>Strictly allowlisted by <code>leaderboard/publish.json</code>; requires clean git commit &amp; <code>full</code> preset.</td>
+                            <td>Auto-discovers all validated local runs in <code>leaderboard/*/results/</code> and <code>leaderboard/*/macro/</code>.</td>
+                        </tr>
+                        <tr>
+                            <th scope="row">Interactive Runner UI</th>
+                            <td>Static read-only site (<code>run.html</code> and <code>/api/run</code> omitted).</td>
+                            <td>Includes <code>run.html</code> wizard + live <code>leaderboard.serve</code> HTTP runner (<code>/api/run</code>, live logs).</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </section>
+</main>
+<footer class="site-footer shell"><span>BranchBench <span aria-hidden="true">·</span> Open benchmarks, every attempt published.</span><a href="index.html">Back to leaderboard</a></footer>
+</body>
+</html>

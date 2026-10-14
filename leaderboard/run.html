@@ -17,11 +17,18 @@
 </header>
 <main class="shell" id="wizard">
     <h1 class="page-title">Run a benchmark</h1>
-    <p class="section-description">Choose a suite and databases, name this machine, and run the generated script in Terminal. Results are saved on this machine and added to its leaderboard.</p>
-    <p class="run-dataset"><span id="run-dataset"></span> <a class="text-link" id="run-dataset-link" href="index.html#dataset">Dataset and operations</a></p>
+    <p class="section-description">Run a single database in isolation on this machine, or scaffold a new database submission for the official <code>1 DB = 1 VM</code> leaderboard.</p>
+    <p class="run-dataset"><span id="run-dataset"></span> <a class="text-link" id="run-dataset-link" href="index.html#dataset">Dataset and operations</a> · <a class="text-link" href="architecture.html">1 DB = 1 VM architecture</a></p>
     <form id="run-form" class="wizard-layout">
         <fieldset id="run-config" class="wizard-card wizard-config">
             <legend class="sr-only">Benchmark configuration</legend>
+            <section class="wizard-section" aria-labelledby="mode-title">
+                <h2 id="mode-title">Workflow</h2>
+                <fieldset class="option-grid"><legend class="sr-only">Workflow</legend>
+                    <label class="option-card"><input id="mode-existing" type="radio" name="wizard-mode" value="existing" checked><strong>Run an integrated DB</strong><span>Benchmark 1 database in isolation on this machine.</span></label>
+                    <label class="option-card"><input id="mode-submit" type="radio" name="wizard-mode" value="submit"><strong>Submit your own DB</strong><span>Generate <code>system.json</code>, adapter hooks, and PR steps for <code>1 DB = 1 VM</code>.</span></label>
+                </fieldset>
+            </section>
             <section class="wizard-section" aria-labelledby="suite-title">
                 <h2 id="suite-title">Suite</h2>
                 <fieldset class="option-grid"><legend class="sr-only">Suite</legend>
@@ -29,30 +36,42 @@
                     <label class="option-card"><input id="suite-micro" type="radio" name="suite" value="micro" checked><strong>Microbench</strong><span>8 branch, read and write operations on one shared dataset, 3 tries each.</span></label>
                 </fieldset>
             </section>
-            <section class="wizard-section" aria-labelledby="databases-title">
-                <h2 id="databases-title">Databases</h2><p class="wizard-description">Select one or more databases to benchmark. Each selected database gets the same suite in its own run.</p>
+            <section class="wizard-section" id="existing-db-section" aria-labelledby="databases-title">
+                <h2 id="databases-title">Database (1 per run)</h2><p class="wizard-description">Select one database to benchmark in isolation. Running one database at a time prevents thermal throttling and shared page-cache interference.</p>
                 <fieldset class="option-grid" aria-describedby="database-selection"><legend class="sr-only">Databases</legend>
-                    <label class="option-card"><input id="database-dolt" type="checkbox" name="database" value="dolt_mysql" checked><span class="system-icon" data-system="dolt">D</span><strong>Dolt</strong><span>MySQL protocol</span><small>Self-hosted</small></label>
-                    <label class="option-card"><input id="database-doltgres" type="checkbox" name="database" value="dolt"><span class="system-icon" data-system="doltgres">D</span><strong>Doltgres</strong><span>Postgres protocol</span><small>Self-hosted</small></label>
-                    <label class="option-card"><input id="database-seekdb" type="checkbox" name="database" value="seekdb"><span class="system-icon" data-system="seekdb">S</span><strong>SeekDB</strong><span>MySQL protocol</span><small>Self-hosted</small></label>
-                    <label class="option-card"><input id="database-matrixone" type="checkbox" name="database" value="matrixone"><span class="system-icon" data-system="matrixone">M</span><strong>MatrixOne</strong><span>MySQL protocol</span><small>Self-hosted</small></label>
-                    <label class="option-card"><input id="database-file-copy" type="checkbox" name="database" value="file_copy"><span class="system-icon" data-system="postgresql-file-copy">P</span><strong>PostgreSQL (FILE_COPY)</strong><span>Full database copy</span><small>Self-hosted</small></label>
-                    <label class="option-card"><input id="database-neon" type="checkbox" name="database" value="neon"><span class="system-icon" data-system="neon">N</span><strong>Neon</strong><span>Serverless Postgres</span><small>Managed service</small></label>
-                    <label class="option-card"><input id="database-tiger" type="checkbox" name="database" value="tiger" disabled><span class="system-icon" data-system="tiger-cloud">T</span><strong>Tiger Cloud</strong><span>Postgres service forks</span><small>No connector yet</small></label>
-                    <label class="option-card"><input id="database-xata" type="checkbox" name="database" value="xata"><span class="system-icon" data-system="xata">X</span><strong>Xata</strong><span>Branching Postgres</span><small>Managed service</small></label>
+                    <label class="option-card"><input id="database-dolt" type="radio" name="database" value="dolt_mysql" checked><span class="system-icon" data-system="dolt">D</span><strong>Dolt</strong><span>MySQL protocol</span><small>Self-hosted</small></label>
+                    <label class="option-card"><input id="database-doltgres" type="radio" name="database" value="dolt"><span class="system-icon" data-system="doltgres">D</span><strong>Doltgres</strong><span>Postgres protocol</span><small>Self-hosted</small></label>
+                    <label class="option-card"><input id="database-seekdb" type="radio" name="database" value="seekdb"><span class="system-icon" data-system="seekdb">S</span><strong>SeekDB</strong><span>MySQL protocol</span><small>Self-hosted</small></label>
+                    <label class="option-card"><input id="database-matrixone" type="radio" name="database" value="matrixone"><span class="system-icon" data-system="matrixone">M</span><strong>MatrixOne</strong><span>MySQL protocol</span><small>Self-hosted</small></label>
+                    <label class="option-card"><input id="database-file-copy" type="radio" name="database" value="file_copy"><span class="system-icon" data-system="postgresql-file-copy">P</span><strong>PostgreSQL (FILE_COPY)</strong><span>Full database copy</span><small>Self-hosted</small></label>
+                    <label class="option-card"><input id="database-neon" type="radio" name="database" value="neon"><span class="system-icon" data-system="neon">N</span><strong>Neon</strong><span>Serverless Postgres</span><small>Managed service</small></label>
+                    <label class="option-card"><input id="database-tiger" type="radio" name="database" value="tiger" disabled><span class="system-icon" data-system="tiger-cloud">T</span><strong>Tiger Cloud</strong><span>Postgres service forks</span><small>No connector yet</small></label>
+                    <label class="option-card"><input id="database-xata" type="radio" name="database" value="xata"><span class="system-icon" data-system="xata">X</span><strong>Xata</strong><span>Branching Postgres</span><small>Managed service</small></label>
                 </fieldset>
                 <p id="database-selection" class="database-selection" role="status">1 database selected</p>
             </section>
+            <section class="wizard-section" id="custom-db-section" aria-labelledby="custom-db-title" hidden>
+                <h2 id="custom-db-title">Your database metadata (ClickBench style)</h2>
+                <p class="wizard-description">Database authors submit <code>system.json</code> and adapter code in a Pull Request — never local timing JSONs. CI runs each self-hosted system on its own dedicated cloud VM (<code>1 DB = 1 VM</code>).</p>
+                <div class="wizard-fields">
+                    <label for="custom-name">Display name<input id="custom-name" name="custom-name" maxlength="64" value="MyForkDB" placeholder="e.g. MyForkDB" autocomplete="off"><span>Shown on the leaderboard table and charts.</span></label>
+                    <label for="custom-slug">Folder / adapter ID<input id="custom-slug" name="custom-slug" maxlength="40" pattern="[a-z0-9_]{2,40}" value="myforkdb" placeholder="e.g. myforkdb" autocomplete="off" spellcheck="false"><span>Lowercase letters, digits, underscores (<code>leaderboard/&lt;id&gt;/</code>).</span></label>
+                </div>
+                <fieldset class="option-grid"><legend class="sr-only">Hosting model</legend>
+                    <label class="option-card"><input id="custom-hosted-no" type="radio" name="custom-hosted" value="no" checked><strong>Self-hosted</strong><span>Runs on 1 dedicated reference VM in CI.</span></label>
+                    <label class="option-card"><input id="custom-hosted-yes" type="radio" name="custom-hosted" value="yes"><strong>Managed service</strong><span>Cloud service benchmarked with region &amp; RTT badge.</span></label>
+                </fieldset>
+            </section>
             <section class="wizard-section" id="macro-section" aria-labelledby="macro-title" hidden>
-                <h2 id="macro-title">Workload size</h2><p class="wizard-description">Every run covers all six workflows and starts only from committed sources. The runner validates first and runs nothing if validation fails.</p>
+                <h2 id="macro-title">Workload size</h2><p class="wizard-description">Every run covers all six workflows and starts only from committed sources. Use Quick locally to verify your adapter; CI runs Full on an isolated reference VM for publication.</p>
                 <fieldset class="option-grid"><legend class="sr-only">Workload size</legend>
-                    <label class="option-card"><input id="preset-mini" type="radio" name="preset" value="mini" checked><strong>Quick</strong><span>Small workloads in minutes. Stays on this machine.</span></label>
-                    <label class="option-card"><input id="preset-full" type="radio" name="preset" value="full"><strong>Full</strong><span>Paper-size workloads, hours per database. The only kind that is published.</span></label>
+                    <label class="option-card"><input id="preset-mini" type="radio" name="preset" value="mini" checked><strong>Quick</strong><span>Small workloads in minutes for local verification.</span></label>
+                    <label class="option-card"><input id="preset-full" type="radio" name="preset" value="full"><strong>Full</strong><span>Paper-size workloads, run on 1 dedicated VM per database for official publication.</span></label>
                 </fieldset>
                 <p id="macro-selection" class="database-selection" role="status"></p>
             </section>
             <section class="wizard-section" aria-labelledby="environment-title">
-                <h2 id="environment-title">Environment</h2><p class="wizard-description">Use the same benchmark machine for every selected database.</p>
+                <h2 id="environment-title">Environment</h2><p class="wizard-description">Name this local machine for local runs, or preview the verification script for your database.</p>
                 <div class="wizard-fields"><label for="machine">Machine name<input id="machine" name="machine" required maxlength="64" pattern="[a-z0-9][a-z0-9._\-]{0,63}" placeholder="e.g. workstation-01" autocomplete="off" spellcheck="false" aria-describedby="machine-hint"><span id="machine-hint">Lowercase letters, numbers, dots, underscores, and hyphens.</span></label>
                 <label id="client-field" for="client-location" hidden>Client location<input id="client-location" name="client-location" maxlength="120" placeholder="e.g. US East" autocomplete="off"><span>Where the benchmark machine runs, not the database region.</span></label></div>
                 <details class="inline-more"><summary>Tools &amp; credentials</summary><ul id="database-requirements" class="database-requirements"></ul><div id="credential-requirements" hidden><p>Set these variables in Terminal, or enter them when prompted. <a class="text-link" href="README.md#hosted-connectors-not-implemented">Credential setup <span aria-hidden="true">↗</span></a></p></div></details>
@@ -121,6 +140,44 @@ function commandsFor(systems, machine, location, macro = null) {
     const commands = systems.map(system => `python -m leaderboard.run ${system} --machine ${shellQuote(machine)}${SYSTEMS[system].keys.length ? ` --client-location ${shellQuote(location.trim())}` : ''}`);
     return [...commands, 'python -m leaderboard.site --phase local'].join(' &&\n');
 }
+function submissionScaffold(name, slug, hosted, machine, macro) {
+    const cleanName = (name || '').trim() || 'MyForkDB';
+    const cleanSlug = (slug || '').trim();
+    if (!/^[a-z0-9_]{2,40}$/.test(cleanSlug)) throw new Error('Use a valid folder/adapter ID (lowercase letters, digits, underscores).');
+    const hostVal = hosted ? 'yes' : 'no';
+    const sysJson = JSON.stringify({system: cleanName, proprietary: 'no', hosted: hostVal, tuned: 'no', tags: ['SQL', 'copy-on-write', 'branching']}, null, 2);
+    const localMachine = /^[a-z0-9][a-z0-9._-]{0,63}$/.test(machine || '') ? machine : 'local-dev';
+    const runCmd = macro
+        ? `python -m leaderboard.run_macro ${cleanSlug} --preset mini --machine ${shellQuote(localMachine)}`
+        : `python -m leaderboard.run ${cleanSlug} --machine ${shellQuote(localMachine)}`;
+    const lifecycleLines = hosted
+        ? [`# 2. Implement hosted Connector contract in leaderboard/${cleanSlug}/connector.py:`,
+           `#    - Export CONNECTOR = YourConnector() (subclassing leaderboard.connector.Connector)`,
+           `#    - Define keys, region, service, scope(), preflight(), provision(), load(), delete(), exists(), version()`]
+        : [`# 2. Add executable VM lifecycle scripts in leaderboard/${cleanSlug}/:`,
+           `#    - leaderboard/${cleanSlug}/install  (optional: install binary/package inside the VM)`,
+           `#    - leaderboard/${cleanSlug}/start    (start server daemon and write leaderboard/.runs/${cleanSlug}.pid)`,
+           `#    - leaderboard/${cleanSlug}/check    (exit 0 once server accepts connections)`,
+           `#    - leaderboard/${cleanSlug}/stop     (stop server daemon cleanly)`,
+           `chmod +x leaderboard/${cleanSlug}/start leaderboard/${cleanSlug}/check leaderboard/${cleanSlug}/stop`,
+           ``,
+           `# 3. Implement Connector contract in leaderboard/${cleanSlug}/connector.py:`,
+           `#    - Export CONNECTOR = YourConnector() (subclassing leaderboard.connector.Connector)`];
+    const stepNum = hosted ? 3 : 4;
+    return [
+        `# 1. Create self-contained plugin folder & metadata (only touch leaderboard/${cleanSlug}/):`,
+        `mkdir -p leaderboard/${cleanSlug}`,
+        `cat <<'EOF' > leaderboard/${cleanSlug}/system.json`,
+        sysJson,
+        `EOF`,
+        ``,
+        ...lifecycleLines,
+        ``,
+        `# ${stepNum}. Verify locally on 1 database in isolation, then open a PR (CI runs 1 DB = 1 VM):`,
+        runCmd,
+        `python -m leaderboard.site --phase local`,
+    ].join('\n');
+}
 const form = document.getElementById('run-form');
 const el = id => document.getElementById(id);
 // A status region is announced only when its text actually changes, not on every keystroke that rewrites the same words.
@@ -137,12 +194,32 @@ function refreshPreview() {
     clearTimeout(previewTimer);
     const version = ++previewVersion;
     preparedRun = null;
+    const submitMode = el('mode-submit') && el('mode-submit').checked;
+    el('existing-db-section').hidden = submitMode;
+    el('custom-db-section').hidden = !submitMode;
     const systems = [...form.querySelectorAll('input[name="database"]:checked')].map(input => input.value);
-    const selected = systems.map(system => SYSTEMS[system]), hosted = selected.some(system => system.keys.length > 0);
+    const selected = systems.map(system => SYSTEMS[system]), hosted = submitMode ? el('custom-hosted-yes').checked : selected.some(system => system.keys.length > 0);
     const macro = el('suite-macro').checked ? {preset: el('preset-full').checked ? 'full' : 'mini'} : null;
     el('macro-section').hidden = !macro;
     for (const input of form.querySelectorAll('input[name="preset"]')) input.disabled = !macro;
     describeSuite(macro);
+    if (submitMode) {
+        el('client-field').hidden = true; el('client-location').required = false; el('client-location').disabled = true;
+        el('credential-requirements').hidden = true;
+        say('copy-status', ''); el('copy-command').textContent = 'Copy script';
+        el('run-benchmark').disabled = true; runLabel('Run in Terminal', true);
+        el('launcher-setup').hidden = true;
+        try {
+            el('run-command').textContent = submissionScaffold(el('custom-name').value, el('custom-slug').value, hosted, el('machine').value, macro);
+            el('copy-command').disabled = false;
+            say('launch-status', 'Copy the scaffold above to register your database, test locally, and submit a PR for 1 DB = 1 VM execution.');
+        } catch (error) {
+            el('run-command').textContent = `# ${error.message}`;
+            el('copy-command').disabled = true;
+            say('launch-status', error.message);
+        }
+        return;
+    }
     const selectionError = systems.length ? '' : 'Select at least one database.';
     el('database-dolt').setCustomValidity(selectionError);
     say('database-selection', selectionError || `${systems.length} database${systems.length === 1 ? '' : 's'} selected`);
@@ -176,16 +253,16 @@ function refreshPreview() {
 }
 function describeSuite(macro) {
     const preset = macro && (macro.preset === 'full' ? 'Full' : 'Quick'), rows = Object.values(suite.dataset.row_counts);
-    el('run-shape').textContent = macro ? `Each database runs all ${SCENARIOS.length} workflows, one attempt each, in its own run.` : `Each database runs ${suite.rows.length} operations, ${suite.tries} tries each, in its own run.`;
+    el('run-shape').textContent = macro ? `The selected database runs all ${SCENARIOS.length} workflows, one attempt each, in an isolated run.` : `The selected database runs ${suite.rows.length} operations, ${suite.tries} tries each, in an isolated run.`;
     el('steps-macro').hidden = !macro; el('steps-micro').hidden = Boolean(macro);
     el('run-dataset-link').href = macro ? 'index.html#workflows' : 'index.html#dataset';
     el('run-dataset-link').textContent = macro ? 'Workflow definitions' : 'Dataset and operations';
     el('run-dataset').textContent = macro
-        ? `${preset} workloads on the CH-benCHmark schema, with data generated for each workflow. Each workflow runs in its own bb_<id> database, which the runner creates, seeds and deletes; attempts are saved under leaderboard/<system>/macro/<date>/. ${macro.preset === 'full' ? 'Full runs can be published.' : 'Quick runs stay on this machine; only Full runs are published.'}`
-        : `The CH-benCHmark seed, the same for every selected database: ${rows.reduce((total, count) => total + count, 0).toLocaleString('en-US')} rows across ${rows.length} tables. Reads and writes target ${suite.table}, initially ${suite.dataset.row_counts[suite.table].toLocaleString('en-US')} rows.`;
+        ? `${preset} workloads on the CH-benCHmark schema, with data generated for each workflow. Each workflow runs in its own bb_<id> database, which the runner creates, seeds and deletes; attempts are saved under leaderboard/<system>/macro/<date>/. ${macro.preset === 'full' ? 'Official published Full runs execute on 1 dedicated VM per database.' : 'Quick runs verify your adapter on this machine; official Full runs execute on 1 dedicated VM per database.'}`
+        : `The CH-benCHmark seed, identical for every database: ${rows.reduce((total, count) => total + count, 0).toLocaleString('en-US')} rows across ${rows.length} tables. Reads and writes target ${suite.table}, initially ${suite.dataset.row_counts[suite.table].toLocaleString('en-US')} rows.`;
     el('run-note').textContent = macro
-        ? 'Commit source changes first: a run from uncommitted sources fails validation and does not start. Runs are sequential, and the leaderboard is rebuilt even when a run fails. An opened Terminal means the launch was accepted, not that a workflow started or succeeded.'
-        : 'Runs are sequential and stop on a failed command. Commit source changes first. Terminal prompts for missing service credentials with input hidden.';
+        ? 'Commit source changes first: a run from uncommitted sources fails validation and does not start. The local leaderboard is rebuilt even when a run fails. For official publication, submit your adapter via PR so CI runs it on an isolated VM.'
+        : 'Commit source changes first. Terminal prompts for missing service credentials with input hidden. For official publication, submit your connector via PR.';
     say('macro-selection', macro ? `All ${SCENARIOS.length} workflows · ${preset} workloads` : '');
 }
 form.addEventListener('submit', event => event.preventDefault());
