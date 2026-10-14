@@ -38,6 +38,11 @@ chronos = [
     "chronos-core @ git+https://github.com/mitdbg/chronos@607418d4d06ba1a67be0e9e5a7617132f265a87c#subdirectory=packages/chronos-core",
     "sqlglot>=25",
 ]
+# TerminusDB backend (dblib/terminusdb.py): maps the microbenchmark's
+# statement shapes to document-API and WOQL calls.
+terminusdb = [
+    "sqlglot>=25",
+]
 
 [dependency-groups]
 dev = ["pytest"]

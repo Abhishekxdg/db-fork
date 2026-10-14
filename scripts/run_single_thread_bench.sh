@@ -189,6 +189,9 @@ get_num_ops() {
         RANGE_UPDATE)
             echo 200
             ;;
+        BRANCH_COMMIT|BRANCH_DIFF|BRANCH_LOG|BRANCH_MERGE|BRANCH_REBASE|BRANCH_REVERT|BRANCH_RESET)
+            echo 100
+            ;;
         BRANCH_CONNECT|READ|INSERT|UPDATE|DELETE|RANGE_READ)
             echo 1000
             ;;

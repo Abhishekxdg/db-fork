@@ -24,6 +24,12 @@ def _schema_sql(conn) -> str:
     return "DATABASE()" if _is_mysql(conn) else "'public'"
 
 
+def _catalog(conn):
+    """Schema catalog carried by the connection of a backend that has no
+    information_schema to query (TerminusDB), else None."""
+    return getattr(conn, "catalog", None)
+
+
 def _set_search_path(conn) -> None:
     # MySQL has no search_path; the connection's database plays that role.
     if not _is_mysql(conn):
@@ -131,7 +137,11 @@ def get_pk_column_names(
     Raises:
         ValueError: If table has no primary key
     """
-    all_columns = [col[0] for col in _get_primary_key_columns(conn, table_name)]
+    catalog = _catalog(conn)
+    if catalog is not None:
+        all_columns = catalog.pk_columns(table_name)
+    else:
+        all_columns = [col[0] for col in _get_primary_key_columns(conn, table_name)]
     if not all_columns:
         raise ValueError(f"Table {table_name} has no primary key.")
     #  print(f" PK columns: {all_columns}")
@@ -190,6 +200,9 @@ def get_all_tables(conn: psycopg2.extensions.connection) -> list[str]:
     Returns:
         List of table names
     """
+    catalog = _catalog(conn)
+    if catalog is not None:
+        return catalog.tables()
     _set_search_path(conn)
     if _is_mysql(conn):
         schema_filter = "table_schema = DATABASE()"
@@ -215,6 +228,8 @@ def get_db_size(conn: psycopg2.extensions.connection) -> int:
     Returns:
         Database size in bytes, or 0 if unable to determine
     """
+    if _catalog(conn) is not None:
+        return 0
     # Get the current database name
     db_name_query = "SELECT current_database();"
     db_name_result = _run_sql_query(conn, db_name_query)
@@ -249,6 +264,9 @@ def get_all_columns(
     Returns:
         List of column names
     """
+    catalog = _catalog(conn)
+    if catalog is not None:
+        return catalog.columns(table_name)
     _set_search_path(conn)
     query = """
     SELECT column_name
@@ -276,6 +294,8 @@ def get_foreign_key_columns(
     Returns:
         List of column names that are part of a foreign key
     """
+    if _catalog(conn) is not None:
+        return []
     query = """
         SELECT DISTINCT kcu.column_name
         FROM information_schema.key_column_usage kcu
