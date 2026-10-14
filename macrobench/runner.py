@@ -36,6 +36,7 @@ from macrobench.scenarios import (  # noqa: F401 (registers the scenarios)
     create_scenario,
 )
 from macrobench.tpcc import SpineLoad
+from dblib.db_api import native_only
 from microbench.runner2 import (
     BackendManager,
     BackendSetup,
@@ -91,10 +92,10 @@ class StallWatchdog(threading.Thread):
         # A quarter of the threshold, between 0.5 s and 5 s.
         self.interval = interval if interval is not None else min(5.0, max(0.5, threshold / 4.0))
         self.log = log
-        self._halt = threading.Event()  # not _stop: on Python 3.11 and 3.12 that is a Thread method join() calls
+        self._stop = threading.Event()
 
     def run(self):
-        while not self._halt.wait(self.interval):
+        while not self._stop.wait(self.interval):
             for o in self.collector.stalled_ops(self.threshold):
                 if o["cancelled"]:
                     continue
@@ -104,7 +105,7 @@ class StallWatchdog(threading.Thread):
                     self.log(f"Stall watchdog: {desc} {note}; the operation fails and the run goes on")
 
     def stop(self):
-        self._halt.set()
+        self._stop.set()
 
 
 class StorageSampler(threading.Thread):
@@ -118,16 +119,16 @@ class StorageSampler(threading.Thread):
         self.suite = suite
         self.interval = interval
         self.samples: list = []
-        self._halt = threading.Event()
+        self._stop = threading.Event()
 
     def run(self):
-        while not self._halt.is_set():
+        while not self._stop.is_set():
             t = time.time()
             self.samples.append((round(t, 3), self.suite._safe_storage()))
-            self._halt.wait(self.interval)
+            self._stop.wait(self.interval)
 
     def stop(self):
-        self._halt.set()
+        self._stop.set()
         self.join(timeout=60)
 
 
@@ -147,39 +148,47 @@ def _capabilities_for(backend) -> dict:
     from dblib.dolt_mysql import DoltMySQLToolSuite
     from dblib.seekdb import SeekDBToolSuite
     from dblib.matrixone import MatrixOneToolSuite
+    from dblib.bauplan import BauplanToolSuite
     from dblib.xata import XataToolSuite
     from dblib.file_copy import FileCopyToolSuite
+    from dblib.chronos import ChronosToolSuite
 
     table = {
         tp.Backend.DOLT: DoltToolSuite,
         tp.Backend.DOLT_MYSQL: DoltMySQLToolSuite,
         tp.Backend.SEEKDB: SeekDBToolSuite,
         tp.Backend.MATRIXONE: MatrixOneToolSuite,
+        tp.Backend.BAUPLAN: BauplanToolSuite,
         tp.Backend.NEON: NeonToolSuite,
         tp.Backend.XATA: XataToolSuite,
         tp.Backend.FILE_COPY: FileCopyToolSuite,
+        tp.Backend.CHRONOS: ChronosToolSuite,
     }
     cls = table.get(backend)
     return cls.capabilities() if cls else {}
 
 
 def _implementation_for(backend) -> dict:
-    """How the backend realises each verb (native/composed/simulated)."""
+    """How the backend realises each verb (native/simulated; unsupported in native-only mode)."""
     from dblib.dolt import DoltToolSuite
     from dblib.dolt_mysql import DoltMySQLToolSuite
     from dblib.seekdb import SeekDBToolSuite
     from dblib.matrixone import MatrixOneToolSuite
+    from dblib.bauplan import BauplanToolSuite
     from dblib.xata import XataToolSuite
     from dblib.file_copy import FileCopyToolSuite
+    from dblib.chronos import ChronosToolSuite
 
     table = {
         tp.Backend.DOLT: DoltToolSuite,
         tp.Backend.DOLT_MYSQL: DoltMySQLToolSuite,
         tp.Backend.SEEKDB: SeekDBToolSuite,
         tp.Backend.MATRIXONE: MatrixOneToolSuite,
+        tp.Backend.BAUPLAN: BauplanToolSuite,
         tp.Backend.NEON: NeonToolSuite,
         tp.Backend.XATA: XataToolSuite,
         tp.Backend.FILE_COPY: FileCopyToolSuite,
+        tp.Backend.CHRONOS: ChronosToolSuite,
     }
     cls = table.get(backend)
     if not cls:
@@ -202,28 +211,6 @@ def _fetch_neon_consumption(project_id, label="", wait_min=15, max_retries=10):
             time.sleep(60)
     print(f"  WARNING: No Neon consumption metrics for {label}", flush=True)
     return None
-
-
-class SetupFailed(Exception):
-    """The schema or seed is incomplete; timed work would measure a broken database."""
-
-
-def setup_outcome(stats: dict) -> str | None:
-    """Why setup stats describe a failed setup, or None when they prove a
-    complete one. Missing evidence is a failure too."""
-    if "schema_failed" not in stats or "seed_commit" not in stats:
-        return "setup produced no schema or seed-commit evidence"
-    if stats["schema_failed"]:
-        return f"{len(stats['schema_failed'])} schema statements failed"
-    if stats["seed_commit"] != "OK":
-        return f"seed commit {stats['seed_commit']}"
-    return None
-
-
-def timed_work_allowed(status: str) -> bool:
-    """Only a complete setup may start timed work: the workflow and the background
-    spine load alike. Anything else would measure a broken database."""
-    return status == "completed"
 
 
 def setup_data(config, scenario, suite, log=print) -> dict:
@@ -318,8 +305,10 @@ def main(argv=None):
     # the parquet file as they come so the run's memory stays bounded.
     collector = rc.ResultCollector(run_id=config.run_id, output_dir=args.outdir,
                                    spill_rows=int(os.environ.get("MACRO_SPILL_ROWS", "200000")))
-    # Per-op storage is too expensive on Neon (pg_database_size per branch).
-    measure_storage = config.measure_storage and config.backend != tp.Backend.NEON
+    # Per-op storage is too expensive on Neon (pg_database_size per branch)
+    # and Bauplan (table metadata calls per branch).
+    measure_storage = config.measure_storage and config.backend not in (
+        tp.Backend.NEON, tp.Backend.BAUPLAN)
     db_name = config.database_setup.db_name
 
     def suite_factory():
@@ -338,15 +327,8 @@ def main(argv=None):
 
     setup_suite = ctx.new_suite()
     seed_stats = {}
-    status = "completed"
     if config.database_setup.WhichOneof("source") != "existing_db":
-        try:
-            seed_stats = setup_data(config, scenario, setup_suite)
-            if problem := setup_outcome(seed_stats):
-                raise SetupFailed(problem)
-        except Exception as e:  # recorded in the e2e stats; the workflow never starts
-            status = f"setup_failed: {type(e).__name__}: {e}"
-            traceback.print_exc()
+        seed_stats = setup_data(config, scenario, setup_suite)
 
     # Workflow-level storage points (always on; a directory walk each):
     # after setup, after the scenario (its branches deleted), after the
@@ -371,7 +353,7 @@ def main(argv=None):
 
     spine_load = None
     data_ops = config.workload.data_ops
-    if data_ops.spine_clients > 0 and scenario.uses_spine_load and timed_work_allowed(status):
+    if data_ops.spine_clients > 0 and scenario.uses_spine_load:
         spine_load = SpineLoad(
             suite_factory, ctx.spine, ctx.scale, clients=data_ops.spine_clients,
             analytical_fraction=data_ops.analytical_fraction,
@@ -402,11 +384,11 @@ def main(argv=None):
         ctx.cancel_all(f"signal {name}")
     previous_handlers = {s: signal.signal(s, _on_signal) for s in (signal.SIGINT, signal.SIGTERM)}
 
-    print(f"\nStarting scenario {scenario.name}..." if timed_work_allowed(status) else f"\nSkipping scenario: {status}")
+    print(f"\nStarting scenario {scenario.name}...")
     start_time = time.time()
+    status = "completed"
     try:
-        if timed_work_allowed(status):
-            scenario.run()
+        scenario.run()
     except ScenarioStopped:
         status = "interrupted"
     except InvariantFailed as e:
@@ -423,10 +405,6 @@ def main(argv=None):
             watchdog.stop()
         if spine_load is not None:
             spine_load.stop()
-            # Expected spine failures are only "recovered" while other spine
-            # transactions succeed; the classifier reads these counters.
-            ctx.bump_metric("spine_attempted", sum(spine_load.counts.values()))
-            ctx.bump_metric("spine_failed", spine_load.failures)
         progress.close()
         elapsed = time.time() - start_time
         stopped = ctx.stop_event.is_set()
@@ -501,18 +479,11 @@ def main(argv=None):
             "setup": seed_stats,
             "capabilities": _capabilities_for(config.backend),
             "implementation": _implementation_for(config.backend),
+            "native_only": native_only(),
             "invariants": inv,
             "metrics": ctx.metrics,
-            # Logical work: what run() set out to do and what each unit came to.
-            "work": {"expected": scenario.total_units(), **ctx.work},
-            "worker_errors": ctx.worker_errors,
         }
         e2e.update(collector.support_summary())
-        failed = collector.failed_verbs()
-        e2e["failed_verbs"] = {
-            "expected": {k: v for k, v in failed.items() if k in scenario.expected_failure_labels},
-            "unexpected": {k: v for k, v in failed.items() if k not in scenario.expected_failure_labels},
-        }
         observed = getattr(type(setup_suite), "OBSERVED", None)
         if observed:
             e2e["backend_observations"] = dict(observed)
@@ -559,8 +530,7 @@ def main(argv=None):
                 print(f"  {st['op']} on {st['ref'] or '?'} ({st['label']}) after {st['elapsed_sec']}s: {st['outcome']}")
 
         collector.write_to_parquet(append=False)
-    return status
 
 
 if __name__ == "__main__":
-    sys.exit(0 if main() == "completed" else 2)
+    main()

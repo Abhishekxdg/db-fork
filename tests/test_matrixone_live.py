@@ -11,6 +11,13 @@ from dblib import matrixone
 DB = "bb_test_mo"
 
 
+# Tests that use an operation the adapter simulates (log, revert, the
+# diff-driven reset) or a resolver that reads the log; skipped in
+# native-only mode, where those operations run as unsupported.
+from dblib.db_api import native_only
+needs_simulated = pytest.mark.skipif(native_only(), reason="uses a simulated operation; native-only mode")
+
+
 def _server_up() -> bool:
     try:
         with socket.create_connection((matrixone.MO_HOST, matrixone.MO_PORT), timeout=1):
@@ -39,13 +46,15 @@ def rows(suite, ref, sql):
     return [tuple(r) for r in suite.exec([sql], refs=[ref])[0].rows]
 
 
+@needs_simulated
 def test_implementation_summary():
     impl = matrixone.MatrixOneToolSuite.implementation()
-    assert impl["branch"] == "native" and impl["merge"] == "composed"
+    assert impl["branch"] == "native" and impl["merge"] == "native" and impl["revert"] == "simulated"
     assert set(impl) >= {"branch", "commit", "diff", "log", "merge", "rebase", "revert",
                          "reset", "delete", "commit_refs", "multi_ref_exec"}
 
 
+@needs_simulated
 def test_commit_log_diff_reset_revert(suite):
     c1 = suite.commit("main", "one")
     assert c1.ok and c1.value, c1.error
@@ -93,6 +102,7 @@ def test_branch_from_commit_and_multi_ref_exec(suite):
     assert suite.delete("old").ok
 
 
+@needs_simulated
 def test_three_way_merge_and_conflicts(suite):
     suite.commit("main", "base")
     assert suite.branch("feat", "main").ok
@@ -138,6 +148,7 @@ def test_merge_ours_keeps_target_rows(suite):
     assert got == {1: 200, 2: 22, 3: 3}
 
 
+@needs_simulated
 def test_rebase_with_callable_resolver(suite):
     suite.commit("main", "base")
     assert suite.branch("dev", "main").ok
@@ -215,6 +226,7 @@ def test_branch_from_commit_has_old_schema(suite):
     assert suite.exec(["ALTER TABLE t ADD COLUMN later INT"], refs=["old"])[0].ok
 
 
+@needs_simulated
 def test_revert_of_deleted_branch_commit_after_fast_forward(suite):
     """S2: a candidate's commit is fast-forwarded into the spine, the
     candidate is deleted, then the commit is reverted on the spine."""
@@ -233,6 +245,7 @@ def test_revert_of_deleted_branch_commit_after_fast_forward(suite):
     assert 7 not in got and got[1] == "a"
 
 
+@needs_simulated
 def test_reset_to_inherited_commit(suite):
     c = suite.commit("main", "base").value
     suite.exec(["UPDATE t SET v = 'x' WHERE id = 1"], refs=["main"])
@@ -265,6 +278,7 @@ def test_rebase_carries_column_default(suite):
     assert got[40] == "general" and got[60] == "general"
 
 
+@needs_simulated
 def test_rebase_spine_onto_its_own_branch(suite):
     """S2: the spine is rebased onto a candidate that was forked from it."""
     suite.commit("main", "pre")
@@ -305,6 +319,7 @@ def test_rebase_when_upstream_added_a_table(suite):
     assert m.ok and m.value["conflicts"] == 0
 
 
+@needs_simulated
 def test_reset_keeps_lineage_for_rebase_at_scale(suite):
     """S6: a batch resets to an earlier commit, continues, and is rebased
     and merged; the branch's delta must only hold its own changes."""
@@ -338,3 +353,114 @@ def test_reset_keeps_lineage_for_rebase_at_scale(suite):
     got = dict(rows(suite, "main", "SELECT id, v FROM big WHERE id IN (100, 200, 600, 1000000, 2000001, 3000000)"))
     assert got == {100: -1, 200: 201, 600: 600, 1000000: 1000000, 2000001: 1, 3000000: 3}
     assert rows(suite, "main", "SELECT COUNT(*) FROM big") == [(201002,)]
+
+
+@needs_simulated
+def test_second_rebase_keeps_replayed_column_backfill(suite):
+    """S4.4: a branch adds a column and backfills it (no other column
+    changes, which MatrixOne's diff does not list), is rebased twice over a
+    moving spine, and must still carry every backfilled row; the branch
+    moves to a new generation per rebase and old commits stay readable."""
+    suite.commit("main", "base")
+    assert suite.branch("dev", "main").ok
+    suite.exec(["ALTER TABLE t ADD COLUMN tier VARCHAR(8)",
+                "UPDATE t SET tier = 'gold' WHERE id IN (1, 2)"], refs=["dev"])
+    c1 = suite.commit("dev", "backfill 1")
+    suite.exec(["UPDATE t SET n = n + 10 WHERE id = 1"], refs=["main"])
+    suite.commit("main", "spine 1")
+    rb1 = suite.rebase("dev", "main", on_conflict="theirs")
+    assert rb1.ok, rb1.error
+    assert rb1.value["generation"] == 1 and suite._db_for("dev").endswith("__g1")
+    assert sorted(k for (k,) in rows(suite, "dev", "SELECT id FROM t WHERE tier = 'gold'")) == [1, 2]
+    suite.exec(["UPDATE t SET tier = 'gold' WHERE id = 3"], refs=["dev"])
+    suite.commit("dev", "backfill 2")
+    suite.exec(["INSERT INTO t VALUES (7,'m7',7)"], refs=["main"])
+    suite.commit("main", "spine 2")
+    rb2 = suite.rebase("dev", "main", on_conflict="theirs")
+    assert rb2.ok, rb2.error
+    assert rb2.value["generation"] == 2
+    assert sorted(k for (k,) in rows(suite, "dev", "SELECT id FROM t WHERE tier = 'gold'")) == [1, 2, 3]
+    assert rows(suite, "dev", "SELECT n FROM t WHERE id = 7") == [(7,)]
+    # The first backfill's commit, taken on generation 0, is still readable.
+    assert rows(suite, f"dev@{c1.value}", "SELECT COUNT(*) FROM t WHERE tier = 'gold'") == [(2,)]
+    msgs = [e["message"] for e in suite.log("dev", limit=10).value]
+    assert msgs[:2] == ["backfill 2", "backfill 1"]
+    assert suite.list_branches() == ["main", "dev"]
+    m = suite.merge("main", "dev")
+    assert m.ok and m.value["conflicts"] == 0, m.error
+    assert rows(suite, "main", "SELECT COUNT(*) FROM t WHERE tier = 'gold'") == [(3,)]
+    assert suite.delete("dev").ok
+    assert suite.list_branches() == ["main"]
+
+
+def test_generations_resolve_across_workers(suite):
+    """Another suite on the same database sees the branch where a rebase
+    moved it, and a readability probe raises on an unknown snapshot
+    instead of reporting the table absent."""
+    suite.commit("main", "base")
+    assert suite.branch("dev", "main").ok
+    other = matrixone.MatrixOneToolSuite.init_for_bench(rc.ResultCollector(), DB)
+    try:
+        assert other.list_branches() == ["main", "dev"]
+        suite.exec(["INSERT INTO t VALUES (40,'d',40)"], refs=["dev"])
+        suite.commit("dev", "dev work")
+        other.exec(["INSERT INTO t VALUES (41,'m',41)"], refs=["main"])
+        other.commit("main", "spine work")
+        assert suite.rebase("dev", "main").ok
+        assert sorted(k for (k,) in rows(other, "dev", "SELECT id FROM t WHERE id > 39")) == [40, 41]
+        with pytest.raises(Exception, match="snapshot"):
+            other._readable(matrixone._State(other._db_for("dev"), "bb_no_such_snapshot"), "t")
+        assert other._readable(matrixone._State(other._db_for("dev")), "no_such_table") is False
+    finally:
+        other.close_connection()
+
+
+def test_second_rebase_keeps_picked_rows_on_fk_table(suite):
+    """On a table with a foreign key, rows a rebase's PICK wrote are not
+    seen by the next rebase's PICK once the old generation is dropped
+    (v4.2.5); the adapter rewrites them, so a second rebase keeps them."""
+    suite.exec(["CREATE TABLE parent (p INT PRIMARY KEY)", "INSERT INTO parent VALUES (1)",
+                "CREATE TABLE child (id INT PRIMARY KEY, p INT, v INT, "
+                "FOREIGN KEY (p) REFERENCES parent (p) ON DELETE CASCADE)",
+                "INSERT INTO child VALUES " + ", ".join(f"({i}, 1, 0)" for i in range(1, 201))],
+               refs=["main"])
+    suite.commit("main", "base")
+    assert suite.branch("dev", "main").ok
+    suite.exec(["ALTER TABLE child ADD COLUMN tier VARCHAR(8)",
+                "UPDATE child SET tier = 'gold' WHERE id <= 100"], refs=["dev"])
+    suite.commit("dev", "backfill 1")
+    suite.exec(["UPDATE child SET v = 1 WHERE id = 150"], refs=["main"])
+    suite.commit("main", "spine 1")
+    rb1 = suite.rebase("dev", "main", on_conflict="theirs")
+    assert rb1.ok, rb1.error
+    suite.exec(["UPDATE child SET tier = 'gold' WHERE id > 100"], refs=["dev"])
+    suite.commit("dev", "backfill 2")
+    suite.exec(["UPDATE child SET v = 2 WHERE id = 160"], refs=["main"])
+    suite.commit("main", "spine 2")
+    rb2 = suite.rebase("dev", "main", on_conflict="theirs")
+    assert rb2.ok, rb2.error
+    assert rows(suite, "dev", "SELECT COUNT(*) FROM child WHERE tier = 'gold'") == [(200,)]
+    # Row 150 changed upstream before the first rebase and is carried; row
+    # 160 changed upstream after it while the branch tiered it, and PICK
+    # resolves per row, so the branch's whole row wins there (v back to 0).
+    assert rows(suite, "dev", "SELECT v FROM child WHERE id = 150") == [(1,)]
+
+
+def test_schema_diff_reports_tables_and_columns(suite):
+    main = "main"
+    c = suite.commit(main, "base")
+    base = f"{main}@{c.value}"
+    assert suite.branch("sd", main).ok
+    r = suite.exec(["ALTER TABLE t ADD COLUMN w INT", "CREATE TABLE extra (id INT PRIMARY KEY, z VARCHAR(4))"],
+                   refs=["sd"])[0]
+    assert r.ok, r.error
+    d = suite.schema_diff(base, "sd")
+    assert d.ok, d.error
+    assert d.value["tables_added"] == ["extra"] and d.value["tables_dropped"] == []
+    assert d.value["columns_added"] == {"t": ["w"]} and d.value["changed"]
+    assert not d.value["columns_dropped"] and not d.value["columns_changed"]
+    back = suite.schema_diff("sd", base)
+    assert back.ok and back.value["tables_dropped"] == ["extra"] and back.value["columns_dropped"] == {"t": ["w"]}
+    same = suite.schema_diff("sd", "sd")
+    assert same.ok and not same.value["changed"]
+    assert suite.delete("sd").ok

@@ -63,7 +63,7 @@ SCENARIO_TITLES = {
     "ops_agent": "S5 Ops agent",
     "data_agent": "S6 Data agent",
 }
-BRANCH_VERBS = ["BRANCH", "COMMIT", "DIFF", "LOG", "MERGE", "REBASE", "REVERT", "RESET", "DELETE"]
+BRANCH_VERBS = ["BRANCH", "COMMIT", "DIFF", "SCHEMA_DIFF", "LOG", "MERGE", "REBASE", "REVERT", "RESET", "DELETE"]
 DATA_OPS = ["READ", "INSERT", "UPDATE", "DELETE_ROWS", "DDL"]
 # EXEC rows summarise the statements they contain, so they are excluded from
 # time sums to avoid double counting.
@@ -1058,18 +1058,27 @@ def _storage_series(run: Run):
 
 
 def plot_storage(runs: list[Run], outdir: str) -> None:
-    """Storage over the run (sampler or per-op), with the workflow-level
-    points after setup, after the scenario, after GC and after cleanup
-    drawn as markers at the right edge. Server-scope backends (SeekDB,
-    MatrixOne) report the whole data directory."""
+    """Two figures. ``storage.png``: storage over the run as growth since the
+    after-setup point (so database-scope and server-scope backends share one
+    linear axis), with the after-setup point at t=0 (o) and the
+    after-workflow point at the end of the series (s). ``storage_points.png``:
+    the workflow-level points per backend as bars of growth over the
+    after-setup size: after the workflow, after GC, after cleanup. Server-
+    scope backends (SeekDB, MatrixOne) report the whole data directory, so
+    their numbers include compaction and other databases' activity."""
     with_storage = [r for r in runs if _storage_series(r) is not None]
     if not with_storage:
         return
     scenarios, backends = _grid(with_storage)
     ncols = min(3, len(scenarios))
     nrows = int(np.ceil(len(scenarios) / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 3.5 * nrows), squeeze=False)
-    point_markers = {"after_setup": "o", "after_workflow": "s", "after_gc": "^", "after_cleanup": "x"}
+
+    def base_mb(r):
+        points = (r.stats.get("storage") or {}).get("points") or {}
+        b = points.get("after_setup")
+        return (b / 1e6) if b else None
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.5 * ncols, 3.6 * nrows), squeeze=False)
     for idx, s in enumerate(scenarios):
         ax = axes[idx // ncols][idx % ncols]
         for i, b in enumerate(backends):
@@ -1078,33 +1087,86 @@ def plot_storage(runs: list[Run], outdir: str) -> None:
                 continue
             t, mb = _storage_series(r)
             scope = (r.stats.get("storage") or {}).get("scope") or ""
-            ax.plot(t, mb, color=PALETTE(i), label=f"{b}" + (f" ({scope})" if scope else ""))
+            base = base_mb(r)
+            if base is None:
+                base = float(mb[0]) if len(mb) else 0.0
             points = (r.stats.get("storage") or {}).get("points") or {}
-            x_end = t[-1] if len(t) else 0
-            for j, (name, m) in enumerate(point_markers.items()):
-                if points.get(name) is not None:
-                    ax.plot([x_end + (j + 1) * max(1.0, x_end * 0.02)], [points[name] / 1e6],
-                            marker=m, color=PALETTE(i), linestyle="none", markersize=6)
+            label = f"{b}" + (f" ({scope})" if scope else "") + f", setup {base:,.0f} MB"
+            ax.plot(t, mb - base, color=PALETTE(i), label=label, linewidth=1.2)
+            ax.plot([0], [0], marker="o", color=PALETTE(i), linestyle="none", markersize=5)
+            if points.get("after_workflow") is not None and len(t):
+                ax.plot([t[-1]], [points["after_workflow"] / 1e6 - base], marker="s",
+                        color=PALETTE(i), linestyle="none", markersize=5)
+        ax.axhline(0, color="grey", linewidth=0.6)
         ax.set_xlabel("seconds into run")
-        ax.set_ylabel("MB")
+        # Server-scope compaction makes swings of gigabytes; symlog keeps
+        # the database-scope series readable next to them.
+        ys = np.concatenate([np.abs(l.get_ydata()) for l in ax.get_lines() if len(l.get_ydata())] or [np.zeros(1)])
+        if np.nanmax(ys) > 300:
+            ax.set_yscale("symlog", linthresh=100)
+            ax.set_ylabel("MB over the after-setup size (symlog)")
+        else:
+            ax.set_ylabel("MB over the after-setup size")
         ax.set_title(SCENARIO_TITLES.get(s, s))
-        ax.grid(alpha=0.3, which="both")
-        # Database-scope and server-scope series differ by orders of
-        # magnitude; a log axis keeps both readable.
-        ys = [y for y in ax.get_lines() for y in [y.get_ydata()] if len(y)]
-        lo = min((float(np.nanmin(y)) for y in ys if np.nanmax(y) > 0), default=0)
-        hi = max((float(np.nanmax(y)) for y in ys), default=0)
-        if lo > 0 and hi / lo > 20:
-            ax.set_yscale("log")
-        ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=7)
     for idx in range(len(scenarios), nrows * ncols):
         axes[idx // ncols][idx % ncols].axis("off")
-    fig.suptitle("Storage over the run")
-    fig.text(0.5, 0.005, "markers right of each series: after setup o, after workflow s, after gc ^, "
-             "after cleanup x (a zero-byte point is not drawn on a log axis)",
-             ha="center", fontsize=8)
-    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    fig.suptitle("Storage growth over the run (o after setup at t=0, s after the workflow)")
+    fig.text(0.5, 0.005, "growth since the after-setup point; server-scope backends report the whole data "
+             "directory, so compaction shows as negative growth", ha="center", fontsize=8)
+    fig.tight_layout(rect=(0, 0.03, 1, 0.97))
     fig.savefig(os.path.join(outdir, "storage.png"), dpi=150)
+    plt.close(fig)
+
+    # Workflow-level points as bars of growth over the after-setup size.
+    names = [("after_workflow", "after workflow"), ("after_gc", "after GC"), ("after_cleanup", "after cleanup")]
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.5 * ncols, 3.6 * nrows), squeeze=False)
+    width = 0.8 / len(names)
+    for idx, s in enumerate(scenarios):
+        ax = axes[idx // ncols][idx % ncols]
+        xs = np.arange(len(backends))
+        for j, (key, title) in enumerate(names):
+            vals, notes = [], []
+            for b in backends:
+                r = _find(with_storage, s, b)
+                points = ((r.stats.get("storage") or {}).get("points") or {}) if r else {}
+                base = points.get("after_setup")
+                v = points.get(key)
+                if r is None or base is None or v is None:
+                    vals.append(np.nan); notes.append("")
+                    continue
+                gc = (r.stats.get("storage") or {}).get("gc") or {}
+                if key == "after_gc" and gc.get("status") and gc["status"] != "OK":
+                    notes.append("no gc")
+                else:
+                    notes.append("")
+                vals.append((v - base) / 1e6)
+            bars = ax.bar(xs + (j - (len(names) - 1) / 2) * width, vals, width, label=title,
+                          color=plt.cm.Greys(0.35 + 0.25 * j), edgecolor="black", linewidth=0.4)
+            for bar, v, n in zip(bars, vals, notes):
+                if np.isnan(v):
+                    continue
+                txt = f"{v:+,.0f}" + (f"\n{n}" if n else "")
+                ax.annotate(txt, (bar.get_x() + bar.get_width() / 2, v), textcoords="offset points",
+                            xytext=(0, 3 if v >= 0 else -10), ha="center", fontsize=6)
+        ax.set_xticks(xs)
+        ax.set_xticklabels([f"{b}\n{(( _find(with_storage, s, b).stats.get('storage') or {}).get('scope') or '') if _find(with_storage, s, b) else ''}"
+                            for b in backends], fontsize=7)
+        ax.axhline(0, color="grey", linewidth=0.6)
+        ax.set_yscale("symlog", linthresh=10)
+        ax.set_ylabel("MB over the after-setup size (symlog)")
+        ax.set_title(SCENARIO_TITLES.get(s, s))
+        ax.grid(alpha=0.3, axis="y")
+        if idx == 0:
+            ax.legend(fontsize=7)
+    for idx in range(len(scenarios), nrows * ncols):
+        axes[idx // ncols][idx % ncols].axis("off")
+    fig.suptitle("Storage at the workflow-level points, as growth over the after-setup size")
+    fig.text(0.5, 0.005, "after cleanup = the run's database dropped (and purged on Dolt); a server-scope backend "
+             "keeps its directory, so its cleanup bar is not a leak", ha="center", fontsize=8)
+    fig.tight_layout(rect=(0, 0.03, 1, 0.97))
+    fig.savefig(os.path.join(outdir, "storage_points.png"), dpi=150)
     plt.close(fig)
 
 

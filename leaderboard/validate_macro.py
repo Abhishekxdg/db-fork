@@ -27,7 +27,18 @@ import sys
 from pathlib import Path
 
 from leaderboard.validate import BOARD, IDENTITY, MACHINE_RE, has_type, parse_day, sha256
-from macrobench.runner import setup_outcome
+
+
+def setup_outcome(stats: dict) -> str | None:
+    """Why setup stats describe a failed setup, or None when they prove a
+    complete one. Missing evidence is a failure too."""
+    if "schema_failed" not in stats or "seed_commit" not in stats:
+        return "setup produced no schema or seed-commit evidence"
+    if stats["schema_failed"]:
+        return f"{len(stats['schema_failed'])} schema statements failed"
+    if stats["seed_commit"] != "OK":
+        return f"seed commit {stats['seed_commit']}"
+    return None
 
 MACRO_SCHEMA_VERSION = 2
 MACRO_SUITE = "macro-1"

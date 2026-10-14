@@ -35,6 +35,7 @@ VERB_OP_TYPES = frozenset(
         rslt.OpType.REVERT,
         rslt.OpType.RESET,
         rslt.OpType.DELETE,
+        rslt.OpType.SCHEMA_DIFF,
         rslt.OpType.EXEC,
     }
 )
@@ -190,11 +191,8 @@ class ResultCollector:
         self._writer = None
         self._spill_path = None
         self._spilled_rows = 0
-        # Per-op-type status counts and OK time, history-ref fallbacks, and
-        # FAILED verb or exec rows by label, over every row emitted (spilled or not)
+        # Per-op-type status counts over every row emitted (spilled or not)
         self._status_counts: dict = {}
-        self._commit_ref_fallbacks = 0
-        self._failed_verbs: dict = {}
         # Operations in flight: token -> {op, ref, label, thread_id, start,
         # cancel (callable or None), note (set when a watchdog cancelled it)}
         self._in_flight: dict = {}
@@ -267,8 +265,6 @@ class ResultCollector:
             self.failed_operations = []
             self.unsupported_ops = set()
             self._status_counts = {}
-            self._commit_ref_fallbacks = 0
-            self._failed_verbs = {}
         with self._spill_lock:
             path = self._close_spill()
             self._spilled_rows = 0
@@ -484,24 +480,13 @@ class ResultCollector:
                 self.results.append(result)
                 self.iteration_counter += 1
                 c = self._status_counts.setdefault(
-                    rslt.OpType.Name(op_type), {"ok": 0, "unsupported": 0, "failed": 0, "ok_seconds": 0.0})
-                bucket = _status_bucket(status)
-                c[bucket] += 1
-                if bucket == "ok":
-                    c["ok_seconds"] += latency
-                self._commit_ref_fallbacks += bool(commit_ref_fallback)
-                if op_type in VERB_OP_TYPES and status == rslt.OpStatus.FAILED:
-                    self._failed_verbs[result.label] = self._failed_verbs.get(result.label, 0) + 1
+                    rslt.OpType.Name(op_type), {"ok": 0, "unsupported": 0, "failed": 0})
+                c[_status_bucket(status)] += 1
                 batch = None
                 if self.spill_rows and len(self.results) >= self.spill_rows:
                     batch, self.results = self.results, []
             if batch:
-                try:
-                    self._write_batch(batch)
-                except Exception:
-                    with self._lock:  # kept, ahead of the rows emitted since, for the next spill or the final write
-                        self.results[:0] = batch
-                    raise
+                self._write_batch(batch)
         except Exception as e:
             import sys
             import traceback
@@ -556,23 +541,13 @@ class ResultCollector:
     def support_summary(self) -> dict:
         """Support information for the run's summary JSON."""
         with self._lock:
-            counts = {k: {**v, "ok_seconds": round(v["ok_seconds"], 6)} for k, v in self._status_counts.items()}
+            counts = {k: dict(v) for k, v in self._status_counts.items()}
             unsupported = sorted(self.unsupported_ops)
-            fallbacks = self._commit_ref_fallbacks
         return {
             "workflow_supported": not unsupported,
             "unsupported_ops": unsupported,
             "op_status_counts": counts,
-            # Rows that fell back to a branch head because a commit ref was
-            # unavailable: the history the scenario asked for was not used.
-            "commit_ref_fallbacks": fallbacks,
         }
-
-    def failed_verbs(self) -> dict:
-        """FAILED verb and exec rows by label: the failures a scenario must
-        account for, as opposed to per-statement rows inside an exec."""
-        with self._lock:
-            return dict(self._failed_verbs)
 
     def write_to_parquet(self, filename: str = None, append: bool = True):
         """Write all collected rows to a parquet file, appending if it

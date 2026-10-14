@@ -27,6 +27,8 @@ enum Backend {
     DOLT_MYSQL = 7;
     SEEKDB = 8;
     MATRIXONE = 9;
+    CHRONOS = 10;
+    BAUPLAN = 11;
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +212,10 @@ message DevAgentParams {
     // with a type different from the one the feature branch added: a
     // schema conflict for every branch alive at that point.
     int32 schema_conflict_migration = 9;
+    // Spine transactions between two production checkpoints (commits on
+    // the spine); migrations commit on their own schedule. 0 = 200. Without
+    // a spine load the checkpoint falls back to a fixed period.
+    int32 spine_commit_every_txns = 10;
 }
 
 // S5 Operations agent: dense commits on the spine, a corrupting deploy,
@@ -222,6 +228,13 @@ message OpsAgentParams {
     // Investigation branches fork from the last history_offset commits.
     int32 history_offset = 4;
     bool load_during_investigation = 5;
+    // Spine transactions between two production commits (phase 1); the
+    // commit loop waits for the spine load to complete this many, so each
+    // commit captures the same amount of change on every backend (0 = 20).
+    int32 commit_every_txns = 6;
+    // The bad deployment also changes the schema (a new table, a new
+    // column, a widened column type); the reset must undo it (S5.3).
+    bool schema_fault = 7;
 }
 
 // S6 Data agent: ingest batches on branches, derived tables, reset on

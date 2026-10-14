@@ -57,6 +57,7 @@ operation and the verb is recorded as FAILED with the reason.
 
 import inspect
 import contextlib
+import os
 import time
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
@@ -79,6 +80,7 @@ VERBS = (
     "revert",
     "reset",
     "delete",
+    "schema_diff",
 )
 
 _VERB_OP_TYPES = {
@@ -91,11 +93,22 @@ _VERB_OP_TYPES = {
     "revert": OpType.REVERT,
     "reset": OpType.RESET,
     "delete": OpType.DELETE,
+    "schema_diff": OpType.SCHEMA_DIFF,
 }
 
 
 class OperationCancelled(RuntimeError):
     """The operation was aborted (a stall watchdog cancelled it)."""
+
+
+# Native-only mode: every verb an adapter simulates is treated as
+# unsupported, so a run shows what the engine does on its own. Read at call
+# time so tests can toggle it.
+NATIVE_ONLY = os.environ.get("DBFORK_NATIVE_ONLY", "").lower() in ("1", "true", "yes")
+
+
+def native_only() -> bool:
+    return NATIVE_ONLY
 
 
 class UnsupportedOperation(Exception):
@@ -433,6 +446,12 @@ class DBToolSuite(ABC):
             return cls.SUPPORTS_MULTI_REF_EXEC
         if verb == "exec_async":
             return cls.open_async_pool is not DBToolSuite.open_async_pool
+        if verb == "schema_diff":
+            # The base class simulates it from the catalog when the adapter
+            # names its SQL dialect; an adapter may also override the hook.
+            return (cls.SCHEMA_DIALECT is not None
+                    or cls._schema_diff_impl is not DBToolSuite._schema_diff_impl
+                    or cls._schema_at is not DBToolSuite._schema_at)
         hook = f"_{verb}_impl"
         return getattr(cls, hook, None) is not getattr(DBToolSuite, hook, None)
 
@@ -444,19 +463,30 @@ class DBToolSuite(ABC):
         caps["exec_async"] = cls.supports("exec_async")
         return caps
 
-    # How each supported verb is realised, for the report: "native" (one
-    # backend primitive), "composed" (several native primitives driven from
-    # here) or "simulated" (SQL emulation of something the backend lacks).
-    # Backends list only the verbs that are not plain "native".
+    # How each supported verb is realised, for the report: "native" (the
+    # engine holds the versions and does the work; the adapter only records
+    # a handle) or "simulated" (the adapter materialises or computes the
+    # result with SQL, copies or foreign tables). Backends list only the
+    # verbs that are not "native". In native-only mode (DBFORK_NATIVE_ONLY=1)
+    # every simulated verb is reported and executed as unsupported.
     IMPLEMENTATION: dict = {}
     # Free-text detail per verb (optional).
     IMPLEMENTATION_NOTES: dict = {}
 
     @classmethod
+    def _is_native(cls, verb: str) -> bool:
+        return cls.IMPLEMENTATION.get(verb, "native") == "native"
+
+    @classmethod
+    def _available(cls, verb: str) -> bool:
+        """Supported by the adapter and, in native-only mode, native."""
+        return cls.supports(verb) and (not native_only() or cls._is_native(verb))
+
+    @classmethod
     def implementation(cls) -> dict:
         out = {}
         for verb in VERBS + ("commit_refs", "multi_ref_exec"):
-            if not cls.supports(verb):
+            if not cls._available(verb):
                 out[verb] = "unsupported"
             else:
                 out[verb] = cls.IMPLEMENTATION.get(verb, "native")
@@ -489,6 +519,69 @@ class DBToolSuite(ABC):
         """Summary of the differences between two refs (backend-specific)."""
         raise self._unsupported("diff")
 
+
+    # Schema diff: simulated from the catalog unless an adapter overrides
+    # it. SCHEMA_DIALECT ("mysql" | "postgres") selects the catalog query
+    # the base implementation runs on each ref through exec().
+    SCHEMA_DIALECT: Optional[str] = None
+    # Adapter bookkeeping tables and hidden columns to leave out.
+    SCHEMA_SKIP_TABLE_PREFIXES: tuple = ("_bb_",)
+    SCHEMA_SKIP_COLUMN_PREFIXES: tuple = ("__mo_",)
+
+    _CATALOG_QUERIES = {
+        "mysql": ("SELECT table_name, column_name, column_type FROM information_schema.columns "
+                  "WHERE table_schema = DATABASE() ORDER BY table_name, ordinal_position"),
+        "postgres": ("SELECT c.table_name, c.column_name, "
+                     "CASE WHEN c.character_maximum_length IS NOT NULL THEN c.data_type || '(' || "
+                     "c.character_maximum_length || ')' WHEN c.numeric_precision IS NOT NULL AND "
+                     "c.data_type IN ('numeric', 'decimal') THEN c.data_type || '(' || c.numeric_precision "
+                     "|| ',' || COALESCE(c.numeric_scale, 0) || ')' ELSE c.data_type END "
+                     "FROM information_schema.columns c JOIN information_schema.tables t "
+                     "ON t.table_schema = c.table_schema AND t.table_name = c.table_name "
+                     "WHERE c.table_schema = current_schema() AND t.table_type = 'BASE TABLE' "
+                     "ORDER BY c.table_name, c.ordinal_position"),
+    }
+
+    def _schema_at(self, ref: Ref) -> dict:
+        """{table: {column: type}} of ``ref``, read from the catalog with
+        the dialect's query through an untimed exec()."""
+        query = self._CATALOG_QUERIES.get(self.SCHEMA_DIALECT or "")
+        if query is None:
+            raise self._unsupported("schema_diff", "no catalog query for this backend")
+        res = self.exec(lambda db: db.sql(query), refs=[ref], timed=False, raise_on_error=True)[0]
+        out: dict = {}
+        for table, column, ctype in res.value or []:
+            if any(str(table).startswith(pf) for pf in self.SCHEMA_SKIP_TABLE_PREFIXES):
+                continue
+            if any(str(column).startswith(pf) for pf in self.SCHEMA_SKIP_COLUMN_PREFIXES):
+                continue
+            out.setdefault(str(table), {})[str(column)] = str(ctype).lower()
+        return out
+
+    @staticmethod
+    def _compare_schemas(a: dict, b: dict) -> dict:
+        """Schema changes from ``a`` to ``b``: tables added/dropped, and for
+        tables on both sides columns added/dropped/changed (type)."""
+        out = {"tables_added": sorted(set(b) - set(a)), "tables_dropped": sorted(set(a) - set(b)),
+               "columns_added": {}, "columns_dropped": {}, "columns_changed": {}}
+        for t in sorted(set(a) & set(b)):
+            ca, cb = a[t], b[t]
+            added = sorted(set(cb) - set(ca))
+            dropped = sorted(set(ca) - set(cb))
+            changed = [[c, ca[c], cb[c]] for c in sorted(set(ca) & set(cb)) if ca[c] != cb[c]]
+            if added:
+                out["columns_added"][t] = added
+            if dropped:
+                out["columns_dropped"][t] = dropped
+            if changed:
+                out["columns_changed"][t] = changed
+        out["changed"] = bool(out["tables_added"] or out["tables_dropped"] or out["columns_added"]
+                              or out["columns_dropped"] or out["columns_changed"])
+        return out
+
+    def _schema_diff_impl(self, ref_a: Ref, ref_b: Ref) -> dict:
+        """Schema changes from ``ref_a`` to ``ref_b`` (see _compare_schemas)."""
+        return self._compare_schemas(self._schema_at(ref_a), self._schema_at(ref_b))
     def _log_impl(self, ref: Ref, limit: int) -> list:
         """Most recent ``limit`` commits reachable from ``ref``."""
         raise self._unsupported("log")
@@ -620,7 +713,7 @@ class DBToolSuite(ABC):
                 raise ValueError("No ref given and no current ref")
             return self._current_ref, False
         r = Ref.parse(ref)
-        if r.commit and not self.SUPPORTS_COMMIT_REFS:
+        if r.commit and not self._available("commit_refs"):
             if str(r) not in self._fallback_warned:
                 self._fallback_warned.add(str(r))
                 print(
@@ -650,6 +743,8 @@ class DBToolSuite(ABC):
         start = time.perf_counter()
         token = self._begin_op(verb.upper(), str(ref) if ref else "", label)
         try:
+            if native_only() and not self._is_native(verb):
+                raise self._unsupported(verb, "simulated by the adapter; native-only mode")
             value = fn()
         except UnsupportedOperation as e:
             status, error, exc = OpStatus.UNSUPPORTED, e.reason or str(e), e
@@ -707,6 +802,20 @@ class DBToolSuite(ABC):
         b, fb = self._resolve(ref_b)
         return self._run_verb(
             "diff", lambda: self._diff_impl(a, b), b, timed=timed,
+            storage=storage, label=label, raise_on_error=raise_on_error,
+            fallback=fa or fb,
+        )
+
+    def schema_diff(self, ref_a: RefLike, ref_b: RefLike, *, timed: bool = True,
+                    storage: bool = None, label: str = "",
+                    raise_on_error: bool = False) -> OpResult:
+        """Schema changes from ``ref_a`` to ``ref_b``: tables added and
+        dropped; columns added, dropped and changed in type on tables
+        present on both sides (value: dict, see _compare_schemas)."""
+        a, fa = self._resolve(ref_a)
+        b, fb = self._resolve(ref_b)
+        return self._run_verb(
+            "schema_diff", lambda: self._schema_diff_impl(a, b), b, timed=timed,
             storage=storage, label=label, raise_on_error=raise_on_error,
             fallback=fa or fb,
         )
@@ -887,7 +996,7 @@ class DBToolSuite(ABC):
         if mode == "multi":
             all_refs = [r for r, _ in resolved]
             fallback = any(f for _, f in resolved)
-            if not self.SUPPORTS_MULTI_REF_EXEC:
+            if not self._available("multi_ref_exec"):
                 return [self._exec_unsupported(all_refs, exec_id, timed, label,
                                                text, raise_on_error)]
             return [self._exec_one(script, text, resolved[0][0], all_refs,
@@ -929,18 +1038,29 @@ class DBToolSuite(ABC):
                 raise connect._exc
             return result
 
-        session = Session(self, self.conn, ref, all_refs, exec_id, timed,
-                          label, keys)
         exc = None
         start_wall = time.time()
         start = time.perf_counter()
         token = self._begin_op("EXEC", result.ref, label)
         try:
-            result.value = self._run_script(script, session, params, self)
-        except UnsupportedOperation as e:
-            result.status, result.error, exc = OpStatus.UNSUPPORTED, e.reason or str(e), e
-        except Exception as e:
-            result.status, result.error, exc = OpStatus.FAILED, f"{type(e).__name__}: {e}", e
+            attempt = 0
+            while True:
+                session = Session(self, self.conn, ref, all_refs, exec_id, timed,
+                                  label, keys)
+                try:
+                    result.value = self._run_script(script, session, params, self)
+                    self._exec_finish(session)
+                except Exception as e:
+                    self._exec_abort(session)
+                    # A script the watchdog cancelled is not run again.
+                    if not self._cancel_requested and self._exec_retry(e, attempt):
+                        attempt += 1
+                        continue
+                    if isinstance(e, UnsupportedOperation):
+                        result.status, result.error, exc = OpStatus.UNSUPPORTED, e.reason or str(e), e
+                    else:
+                        result.status, result.error, exc = OpStatus.FAILED, f"{type(e).__name__}: {e}", e
+                break
         finally:
             result.error = self._end_op(token, result.error)
         result.latency = time.perf_counter() - start
@@ -951,6 +1071,22 @@ class DBToolSuite(ABC):
         if raise_on_error and exc is not None:
             raise exc
         return result
+
+    # Hooks around one run of an exec() script. A backend that buffers a
+    # script's writes (instead of autocommitting each statement) publishes
+    # them in _exec_finish, which is part of the EXEC row's latency, and
+    # discards them in _exec_abort. When _exec_retry returns True for the
+    # exception a run raised, the script is run again from the start (e.g.
+    # a publish lost a race with another writer).
+
+    def _exec_finish(self, session: "Session") -> None:
+        """The script ran without raising."""
+
+    def _exec_abort(self, session: "Session") -> None:
+        """The script, or _exec_finish, raised."""
+
+    def _exec_retry(self, exc: Exception, attempt: int) -> bool:
+        return False
 
     def _emit_exec(self, result: ExecResult, timed, exec_id, label, text,
                    fallback, start_wall, end_wall, pool_wait: float = 0.0):
@@ -1015,7 +1151,7 @@ class DBToolSuite(ABC):
         if mode == "multi":
             all_refs = [r for r, _ in resolved]
             fallback = any(f for _, f in resolved)
-            if not self.SUPPORTS_MULTI_REF_EXEC:
+            if not self._available("multi_ref_exec"):
                 return [self._exec_unsupported(all_refs, exec_id, timed, label,
                                                text, raise_on_error)]
             return [await self._exec_one_async(

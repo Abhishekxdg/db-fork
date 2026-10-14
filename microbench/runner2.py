@@ -51,9 +51,13 @@ from dblib import seekdb
 from dblib.seekdb import SeekDBToolSuite
 from dblib import matrixone
 from dblib.matrixone import MatrixOneToolSuite
+from dblib import bauplan
+from dblib.bauplan import BauplanToolSuite
 from dblib import neon as neon_mod
 from dblib.neon import NeonToolSuite
 from dblib.file_copy import FileCopyToolSuite
+from dblib.chronos import ChronosToolSuite
+from dblib import chronos as chronos_mod
 from dblib.xata import XataToolSuite
 from dblib.db_api import DBToolSuite, Ref
 from dblib import result_collector as rc
@@ -297,6 +301,7 @@ class BackendInfo:
     neon_project_id: Optional[str] = None
     xata_project_id: Optional[str] = None
     file_copy_info: Optional[FileCopyToolSuite.FileCopyInfo] = None
+    chronos_info: Optional[ChronosToolSuite.ChronosInfo] = None
     setup_branches: list = None
 
 
@@ -329,6 +334,10 @@ def create_db_tools(
         return MatrixOneToolSuite.init_for_bench(
             result_collector, db_name, default_branch, measure_storage
         )
+    if backend == tp.Backend.BAUPLAN:
+        return BauplanToolSuite.init_for_bench(
+            result_collector, db_name, default_branch, measure_storage
+        )
     if backend == tp.Backend.FILE_COPY:
         return FileCopyToolSuite.init_for_bench(
             result_collector,
@@ -338,6 +347,10 @@ def create_db_tools(
             backend_info.file_copy_info.branches_lock,
             backend_info.file_copy_info.create_db_lock,
             measure_storage,
+        )
+    if backend == tp.Backend.CHRONOS:
+        return ChronosToolSuite.init_for_bench(
+            result_collector, db_name, default_branch, measure_storage
         )
     if backend == tp.Backend.NEON:
         return NeonToolSuite.init_for_bench(
@@ -441,11 +454,24 @@ class BackendManager:
             info.default_branch_id = db_name
             print(f"Default MatrixOne connection URI: {info.default_uri}")
 
+        elif backend == tp.Backend.BAUPLAN:
+            info.default_uri = BauplanToolSuite.get_default_connection_uri()
+            info.default_branch_name = bauplan.MAIN_BRANCH
+            # The run's root branch is <user>.<db_name>.
+            info.default_branch_id = db_name
+
         elif backend == tp.Backend.FILE_COPY:
             info.file_copy_info = FileCopyToolSuite.FileCopyInfo(db_name)
             info.default_uri = FileCopyToolSuite.get_default_connection_uri()
             info.default_branch_name = db_name
             print(f"Default FILE_COPY connection URI: {info.default_uri}")
+
+        elif backend == tp.Backend.CHRONOS:
+            info.chronos_info = ChronosToolSuite.ChronosInfo(db_name)
+            info.default_uri = ChronosToolSuite.get_default_connection_uri()
+            info.default_branch_name = chronos_mod.MAIN_BRANCH
+            info.root_branch_name = chronos_mod.MAIN_BRANCH
+            print(f"Default CHRONOS connection URI: {info.default_uri}")
 
         elif backend == tp.Backend.NEON:
             if require_db_setup:
@@ -501,6 +527,8 @@ class BackendManager:
             seekdb.setup_database(db_name, sql_dump_path)
         elif require_db_setup and backend == tp.Backend.MATRIXONE:
             matrixone.setup_database(db_name, sql_dump_path)
+        elif require_db_setup and backend == tp.Backend.BAUPLAN:
+            bauplan.setup_database(db_name, sql_dump_path)
         elif require_db_setup:
             self._create_database(info.default_uri, db_name)
 
@@ -529,6 +557,8 @@ class BackendManager:
         # Backend-specific cleanup
         if info.file_copy_info:
             FileCopyToolSuite.cleanup(info.file_copy_info)
+        elif info.chronos_info:
+            ChronosToolSuite.cleanup(info.chronos_info)
         elif self.config.backend == tp.Backend.DOLT_MYSQL and db_name:
             try:
                 dolt_mysql.drop_database(db_name)
@@ -544,6 +574,12 @@ class BackendManager:
             try:
                 # Also drops every branch database and snapshot of the run.
                 matrixone.drop_database(db_name)
+            except Exception as e:
+                print(f"Error deleting database: {e}")
+        elif self.config.backend == tp.Backend.BAUPLAN and db_name:
+            try:
+                # The run's branches, tags and S3 files.
+                bauplan.drop_database(db_name)
             except Exception as e:
                 print(f"Error deleting database: {e}")
         elif info.default_uri and db_name:
@@ -598,8 +634,12 @@ class BackendManager:
             return SeekDBToolSuite.get_initial_connection_uri(db_name)
         elif backend == tp.Backend.MATRIXONE:
             return MatrixOneToolSuite.get_initial_connection_uri(db_name)
+        elif backend == tp.Backend.BAUPLAN:
+            return BauplanToolSuite.get_initial_connection_uri(db_name)
         elif backend == tp.Backend.FILE_COPY:
             return FileCopyToolSuite.get_initial_connection_uri(db_name)
+        elif backend == tp.Backend.CHRONOS:
+            return ChronosToolSuite.get_initial_connection_uri(db_name)
         elif backend == tp.Backend.NEON:
             return NeonToolSuite._get_neon_connection_uri(
                 info.neon_project_id, info.default_branch_id, db_name
@@ -977,7 +1017,6 @@ class WorkerContext:
         self._table_datagen: Optional[DynamicDataGenerator] = None
         self._pk_columns: List[str] = []
         self._existing_pks: List[Tuple] = []
-        self._known_pks: set[Tuple] = set()
         self._modified_keys: Dict[str, List[Tuple]] = {}
 
         # Index tracking for DDL operations
@@ -1040,17 +1079,11 @@ class WorkerContext:
     def connect(self, branch: str, timed: bool = True) -> None:
         """Switch to ``branch`` (an exec with an empty script, so the
         CONNECT row carries the switch cost)."""
-        prev = self.current_branch
         self.db_tools.exec([], refs=[branch], timed=timed).pop().raise_for_status()
-        if self.current_branch != prev:
-            self.clear_pk_cache()
 
     async def connect_async(self, branch: str, timed: bool = True) -> None:
-        prev = self.current_branch
         res = await self.db_tools.exec_async([], refs=[branch], timed=timed)
         res[0].raise_for_status()
-        if self.current_branch != prev:
-            self.clear_pk_cache()
 
     def run_sql(self, sql: str, params=None, timed: bool = True):
         """Run one statement on the current branch through exec() and
@@ -1108,7 +1141,6 @@ class WorkerContext:
         # Cache PKs
         if not self._existing_pks and existing_pks:
             self._existing_pks = existing_pks
-            self._known_pks.update(existing_pks)
 
         if not existing_pks:
             return None
@@ -1127,29 +1159,15 @@ class WorkerContext:
             self._table_datagen = DynamicDataGenerator(table_schema)
         return self._table_datagen.generate_row()
 
-    def is_known_pk(self, table_name: str, key: Tuple) -> bool:
-        """Check whether a primary key tuple is already known to exist on this branch."""
-        if not self._existing_pks:
-            pk_columns = self.get_pk_columns(table_name)
-            existing_pks = dbh.get_pk_values(
-                self.db_tools.get_current_connection(), table_name, pk_columns
-            )
-            if existing_pks:
-                self._existing_pks = existing_pks
-                self._known_pks.update(existing_pks)
-        return key in self._known_pks
-
     def track_modified_key(self, key: Tuple) -> None:
         """Track a modified primary key."""
         cur_branch_id = self.current_branch
-        self._known_pks.add(key)
         if key not in self._modified_keys.get(cur_branch_id, []):
             self._modified_keys.setdefault(cur_branch_id, []).append(key)
 
     def untrack_modified_key(self, key: Tuple) -> None:
         """Remove a key from modified tracking (e.g., after delete)."""
         cur_branch_id = self.current_branch
-        self._known_pks.discard(key)
         if cur_branch_id in self._modified_keys:
             if key in self._modified_keys[cur_branch_id]:
                 self._modified_keys[cur_branch_id].remove(key)
@@ -1186,7 +1204,6 @@ class WorkerContext:
     def clear_pk_cache(self) -> None:
         """Clear cached primary keys (e.g., after branch switch)."""
         self._existing_pks = []
-        self._known_pks = set()
 
     def get_existing_key_count(self, table_name: str) -> int:
         """Number of existing primary keys in the table.
@@ -1199,7 +1216,6 @@ class WorkerContext:
         )
         if not self._existing_pks and existing_pks:
             self._existing_pks = existing_pks
-            self._known_pks.update(existing_pks)
         return len(existing_pks) if existing_pks else 0
 
     def prepare_range_query(
@@ -1219,7 +1235,6 @@ class WorkerContext:
 
         if not self._existing_pks and existing_pks:
             self._existing_pks = existing_pks
-            self._known_pks.update(existing_pks)
 
         if not existing_pks:
             raise ValueError(f"No existing keys for {operation_name}")
@@ -1336,15 +1351,12 @@ class WorkerContext:
         insert_sql = f"INSERT INTO {table_name} ({', '.join(col_names)}) VALUES ({placeholders});"
 
         for _ in range(5):
-            for _ in range(100):
-                row_data = self.generate_row(table_name)
-                pk_tuple = tuple(row_data[pk] for pk in pk_columns)
-                if not self.is_known_pk(table_name, pk_tuple):
-                    break
+            row_data = self.generate_row(table_name)
+            pk_tuple = tuple(row_data[pk] for pk in pk_columns)
 
             try:
                 self.run_sql(insert_sql, row_data, timed=False)
-                self.track_modified_key(pk_tuple)
+                self._modified_keys.setdefault(cur_branch_id, []).append(pk_tuple)
                 return
             except Exception:
                 continue

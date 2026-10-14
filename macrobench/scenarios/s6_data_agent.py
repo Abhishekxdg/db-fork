@@ -83,8 +83,7 @@ class DataAgentScenario(Scenario):
             raise ValueError("data_agent needs batches, batch_rows, steps_per_batch and days_back > 0")
 
     def total_units(self) -> int:
-        # Every load step of every batch, plus the batch's rebase and merge.
-        return self.params.batches * (self.params.steps_per_batch + 1)
+        return self.params.batches * self.params.steps_per_batch
 
     # ------------------------------------------------------------------
 
@@ -147,7 +146,7 @@ class DataAgentScenario(Scenario):
         res = ctx.branch(suite, branch, ctx.spine, label="batch_branch")
         if not res.ok:
             ctx.note(f"batch {b}: branch {res.status_name} {res.error}")
-            ctx.tick(p.steps_per_batch + 1, outcome="failed")
+            ctx.tick(p.steps_per_batch)
             return None
         branches = [branch]
         w.exec([("INSERT INTO batch_manifest (batch_id, branch_name, days_back, rows_loaded, status, created_at) "
@@ -179,20 +178,14 @@ class DataAgentScenario(Scenario):
         while step < p.steps_per_batch:
             ctx.check_stop()
             r = w.exec(self._load_step(b, step, rows_per_step, rng), branch, label="ingest")
-            ok = r.ok
             if r.ok and isinstance(r.value, dict):
                 loaded_by_step[step] = r.value["rows"]
                 mismatches += r.value["mismatches"]
-                ok = r.value["mismatches"] == 0  # loaded, but the derived table disagrees with the base rows
             last = step == p.steps_per_batch - 1
             if ctx.should_commit(step, last_step=last):
                 c = w.commit(branch, f"batch {b} step {step}", label="batch_commit")
-                ok &= c.ok
                 if c.ok and c.value:
                     committed.append((step, c.value))
-            if step >= ticked:  # steps replayed after a reset are not new units
-                ctx.tick(outcome="succeeded" if ok else "failed")
-                ticked = step + 1
             if (not last and committed and rng.random() < p.reset_prob):
                 # Pipeline stage failed: go back to an earlier commit.
                 back_step, back_hash = rng.choice(committed)
@@ -221,6 +214,9 @@ class DataAgentScenario(Scenario):
                     step = back_step + 1
                     continue
             step += 1
+            if step > ticked:  # steps replayed after a reset are not new units
+                ctx.tick()
+                ticked = step
 
         loaded = sum(loaded_by_step.values())
         w.exec([("UPDATE batch_manifest SET status = 'validated', rows_loaded = %s WHERE batch_id = %s",
@@ -243,8 +239,6 @@ class DataAgentScenario(Scenario):
         elif m.failed:
             ctx.bump_metric("merges_failed")
             ctx.note(f"batch {b}: merge {m.error[:120]}")
-        ctx.tick(outcome="skipped" if rb.unsupported or m.unsupported
-                 else "succeeded" if rb.ok and m.ok else "failed")
         if m.unsupported:
             inv.not_applicable(f"S6.1 manifest hidden until merge (batch {b})", "merge unsupported")
         else:

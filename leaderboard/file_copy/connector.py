@@ -14,6 +14,10 @@ from microbench.runner2 import BackendInfo
 from util.import_db import load_sql_file
 
 
+def _quote(ident: str) -> str:
+    return '"' + ident.replace('"', '""') + '"'
+
+
 class FileCopy(Connector):
     """PostgreSQL CREATE DATABASE ... STRATEGY = FILE_COPY: backend file_copy."""
 
@@ -33,7 +37,7 @@ class FileCopy(Connector):
 
     def provision(self, db: str) -> BackendInfo:
         with closing(self._admin()) as conn, conn.cursor() as cur:
-            cur.execute(f"CREATE DATABASE {file_copy._quote(db)}")
+            cur.execute(f"CREATE DATABASE {_quote(db)}")
         return BackendInfo(
             default_uri=FileCopyToolSuite.get_default_connection_uri(),
             default_branch_name=db,
@@ -55,8 +59,11 @@ class FileCopy(Connector):
 
     def exists(self, db: str) -> bool:
         with closing(self._admin()) as conn, conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM pg_catalog.pg_database WHERE datname = %s", (db,))
-            return cur.fetchone() is not None or bool(file_copy.branch_databases(cur, db))
+            cur.execute(
+                "SELECT 1 FROM pg_catalog.pg_database WHERE datname = %s OR datname LIKE %s",
+                (db, db.replace("_", r"\_") + r"\_\_%"),
+            )
+            return cur.fetchone() is not None
 
     def version(self) -> str:
         with closing(self._admin()) as conn, conn.cursor() as cur:
@@ -65,3 +72,4 @@ class FileCopy(Connector):
 
 
 CONNECTOR = FileCopy()
+

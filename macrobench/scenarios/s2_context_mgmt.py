@@ -66,17 +66,17 @@ class ContextMgmtScenario(Scenario):
                 # Interactions on the spine.
                 for k in range(p.compaction_interval):
                     ctx.check_stop()
-                    ok = suite.exec(self._interaction_script(step, rng), refs=[ctx.spine],
-                                    label="interaction")[0].ok
+                    suite.exec(self._interaction_script(step, rng), refs=[ctx.spine],
+                               label="interaction")
                     if ctx.should_commit(k):
-                        ok &= suite.commit(ctx.spine, f"work step {step}", label="work_commit").ok
+                        suite.commit(ctx.spine, f"work step {step}", label="work_commit")
                     step += 1
                     pending_delete = self._retire(suite, pending_delete, step)
-                    ctx.tick(outcome="succeeded" if ok else "failed")
+                    ctx.tick()
 
                 # Compaction point.
                 ctx.check_stop()
-                ok = suite.commit(ctx.spine, f"pre-compaction {cycle}", label="pre_compaction_commit").ok
+                suite.commit(ctx.spine, f"pre-compaction {cycle}", label="pre_compaction_commit")
                 cands = []
                 for j in range(p.fanout):
                     name = f"cand_{cycle}_{LETTERS[j]}"
@@ -84,19 +84,17 @@ class ContextMgmtScenario(Scenario):
                     res = ctx.branch(suite, name, ctx.spine, label="candidate_branch")
                     if not res.ok:
                         ctx.note(f"candidate {name}: {res.status_name} {res.error}")
-                        ok = False
                         continue
-                    ok &= suite.exec(self._curation_script(name, strategy, step, rng),
-                                     refs=[name], label="curation")[0].ok
+                    suite.exec(self._curation_script(name, strategy, step, rng),
+                               refs=[name], label="curation")
                     c = suite.commit(name, f"compaction {cycle} {strategy} ({name})",
                                      label="curation_commit")
-                    ok &= c.ok
-                    ok &= suite.exec([f"SELECT COUNT(*), SUM(token_count) FROM context_v_{name}"],
-                                     refs=[name], label="curated_context")[0].ok
+                    suite.exec([f"SELECT COUNT(*), SUM(token_count) FROM context_v_{name}"],
+                               refs=[name], label="curated_context")
                     cands.append({"branch": name, "commit": c.value if c.ok else None,
                                   "strategy": strategy})
                 if not cands:
-                    ctx.tick(outcome="failed")
+                    ctx.tick()
                     continue
 
                 pick = self._policy_check(suite, cands)
@@ -115,11 +113,11 @@ class ContextMgmtScenario(Scenario):
                 for c in cands:
                     if c is not alternatives.get(cycle):
                         pending_delete.append((c["branch"], step + retention))
-                # A compaction the spine could not adopt is a skipped unit.
-                ctx.tick(outcome="skipped" if m.unsupported else "succeeded" if ok and m.ok else "failed")
+                ctx.tick()
 
             # Rejection of a previous compaction.
-            ctx.tick(outcome=self._reject(suite, chosen, alternatives, step))
+            self._reject(suite, chosen, alternatives, step)
+            ctx.tick()
         finally:
             for branch, _ in pending_delete:
                 ctx.delete(suite, branch, label="candidate_delete")
@@ -239,16 +237,14 @@ class ContextMgmtScenario(Scenario):
         best = min(range(len(refs)), key=lambda i: sizes.get(refs[i], float("inf")))
         return best
 
-    def _reject(self, suite, chosen, alternatives, step) -> str:
-        """Returns the unit outcome: skipped when the backend lacks the
-        verbs or the run never produced a rejectable cycle."""
+    def _reject(self, suite, chosen, alternatives, step):
         ctx, inv, p = self.ctx, self.ctx.invariants, self.params
         cycle = p.rejected_cycle
         if cycle not in chosen or cycle not in alternatives:
             inv.not_applicable("S2.1 rejected candidate's sentinel removed after revert",
                                "no rejected cycle configured or fewer than 2 candidates")
             inv.not_applicable("S2.2 alternative's sentinel present after rebase+merge", "same")
-            return "skipped"
+            return
         rejected, alt = chosen[cycle], alternatives[cycle]
 
         def present(candidate):
@@ -257,7 +253,6 @@ class ContextMgmtScenario(Scenario):
             return int(res.rows[0][0]) if res.rows else None
 
         alt_before = present(alt["branch"])
-        r = None
         if rejected["commit"] is None:
             inv.not_applicable("S2.1 rejected candidate's sentinel removed after revert",
                                "backend has no commits to revert")
@@ -282,7 +277,3 @@ class ContextMgmtScenario(Scenario):
                       alt_before == 0 and present(alt["branch"]) == 1,
                       f"before={alt_before} after={present(alt['branch'])} "
                       f"(rebase {rb.status_name}, merge {m.status_name})")
-        steps = [x for x in (r, rb, m) if x is not None]
-        if r is None or any(x.unsupported for x in steps):
-            return "skipped"
-        return "succeeded" if all(x.ok for x in steps) else "failed"

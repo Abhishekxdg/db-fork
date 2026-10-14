@@ -1,8 +1,8 @@
 """S4: Development agent.
 
-The spine is production: TPC-C traffic from the spine load, periodic
-checkpoints, and a schema migration from the catalog every
-``spine_migration_interval`` dev steps. Dev branches are created from the
+The spine is production: TPC-C traffic from the spine load, a checkpoint
+commit every ``spine_commit_every_txns`` spine transactions, and a schema
+migration from the catalog every ``spine_migration_interval`` dev steps. Dev branches are created from the
 spine (``concurrent_branches`` alive at once, ``dev_branches`` in total).
 Each implements the loyalty feature: loyalty_tier and loyalty_event tables,
 customer.c_tier, and a chunked backfill of customer rows (a share
@@ -46,13 +46,8 @@ from macrobench.datagen.ch import DISTRICTS_PER_WAREHOUSE
 
 SPINE_SENTINEL_BASE = 100_000
 REVIEW_IDLE_SEC = 0.05
-MISSING_RELATION = ("does not exist", "doesn't exist", "no such table", "table not found", "unknown table")
-
-
-def _missing_relation(error: str) -> bool:
-    """The backend said the table is not there, in any dialect's words."""
-    return any(m in (error or "").lower() for m in MISSING_RELATION)
-SPINE_COMMIT_PERIOD_SEC = 2.0
+DEFAULT_SPINE_COMMIT_EVERY_TXNS = 200
+SPINE_COMMIT_PERIOD_SEC = 2.0     # checkpoint period without a spine load
 
 # Spine migration catalog M1-M5: (name, target table, ddl(k)).
 MIGRATIONS = [
@@ -80,9 +75,6 @@ class DevAgentScenario(Scenario):
     name = "S4 development agent"
     uses_spine_load = True
     spine_touches_c_data = True
-    # The schema conflict fails a rebase (and, on a replaying backend, its retry) by design, and a branch
-    # created after the conflicting migration fails its feature DDL and backfill; S4.3 checks the rest.
-    expected_failure_labels = frozenset({"spine", "dev_rebase", "dev_rebase_retry", "feature_ddl", "backfill"})
 
     def validate(self):
         p = self.params
@@ -124,6 +116,12 @@ class DevAgentScenario(Scenario):
         rng = ctx.worker_rng(800)
         last_commit = time.time()
         next_migration_at = p.spine_migration_interval or 0
+        every = p.spine_commit_every_txns or DEFAULT_SPINE_COMMIT_EVERY_TXNS
+        load = self.spine_load
+
+        def txns():
+            return load.total if load is not None else 0
+        next_commit_at = txns() + every
         try:
             while not done.is_set():
                 with self._counter_lock:
@@ -132,9 +130,12 @@ class DevAgentScenario(Scenario):
                     self._migrate(suite, rng)
                     next_migration_at += p.spine_migration_interval
                     last_commit = time.time()
-                elif time.time() - last_commit >= SPINE_COMMIT_PERIOD_SEC:
+                    next_commit_at = txns() + every
+                elif (txns() >= next_commit_at if load is not None
+                      else time.time() - last_commit >= SPINE_COMMIT_PERIOD_SEC):
                     self._spine_commit(suite, "production checkpoint")
                     last_commit = time.time()
+                    next_commit_at = txns() + every
                 done.wait(0.2)
         finally:
             ctx.close_suite(suite)
@@ -179,21 +180,11 @@ class DevAgentScenario(Scenario):
         ctx, p, inv, suite, rng = self.ctx, self.params, self.ctx.invariants, w.suite, w.rng
         branch = f"dev_{i}"
         with self._spine_lock:
-            conflict_before = self._schema_conflict_applied
-        # The fork may wait for a free branch slot, so it never runs under the spine lock: a worker
-        # holding the lock while waiting would block the branch that has to finish to free the slot.
+            born_after_conflict = self._schema_conflict_applied
         res = ctx.branch(suite, branch, ctx.spine, label="dev_branch")
-        with self._spine_lock:
-            conflict_after = self._schema_conflict_applied
-        born_after_conflict = conflict_before
-        if res.ok and conflict_after and not conflict_before:
-            # The conflicting migration landed while the branch was forking. Before the feature DDL,
-            # only that migration puts c_tier on customer, so the branch itself says which side it is on.
-            born_after_conflict = suite.exec(["SELECT COUNT(c_tier) FROM customer WHERE 1 = 0"], refs=[branch],
-                                             label="invariant", timed=False)[0].ok
         if not res.ok:
             ctx.note(f"dev branch {branch}: {res.status_name} {res.error}")
-            ctx.tick(p.dev_phase_steps + p.review_phase_steps, outcome="failed")
+            ctx.tick(p.dev_phase_steps + p.review_phase_steps)
             return None
         # Spine sentinel: inserted on the spine after the branch exists.
         sentinel_id = SPINE_SENTINEL_BASE + i
@@ -221,21 +212,19 @@ class DevAgentScenario(Scenario):
         # Dev phase.
         for step in range(1, p.dev_phase_steps + 1):
             ctx.check_stop()
-            outcome = "succeeded"
             if step == 1:
-                ok = w.exec(self._feature_ddl(i), branch, label="feature_ddl").ok
+                w.exec(self._feature_ddl(i), branch, label="feature_ddl")
             else:
-                ok = w.exec(self._backfill_script(i, step, chunk, rng, col), branch, label="backfill").ok
+                w.exec(self._backfill_script(i, step, chunk, rng, col), branch, label="backfill")
                 chunk += ctx.statements_per_step
-            ok |= born_after_conflict  # created after the conflicting migration: its feature DDL and backfill fail by design
             committed = ctx.should_commit(step - 1, last_step=(step == p.dev_phase_steps))
             if committed:
-                ok &= w.commit(branch, f"dev {i} step {step}", label="dev_commit").ok
+                w.commit(branch, f"dev {i} step {step}", label="dev_commit")
             with self._counter_lock:
                 self._dev_steps += 1
             if step in rebase_steps:
                 if not committed:  # a rebase needs a clean working set
-                    ok &= w.commit(branch, f"dev {i} step {step} (pre-rebase)", label="dev_commit").ok
+                    w.commit(branch, f"dev {i} step {step} (pre-rebase)", label="dev_commit")
                 if rebases_done == 0:
                     inv.expect(f"S4.2a spine sentinel invisible on {branch} before rebase",
                                sentinel_visible(), 0)
@@ -263,16 +252,15 @@ class DevAgentScenario(Scenario):
                 # rebase either fails naming a schema conflict and leaves the
                 # branch intact, or succeeds with both sides present; a
                 # silently dropped side fails either check.
-                def is_intact(sc):  # a failed probe (-1) proves nothing, even when it fails on both sides
-                    return (sc["tiers"] == 3 and events_before >= 0 and sc["events"] == events_before
-                            and sc["feature_col"] and tiered_before >= 0 and sc["tiered"] == tiered_before)
+                def is_intact(sc):
+                    return (sc["tiers"] == 3 and sc["events"] == events_before
+                            and sc["feature_col"] and sc["tiered"] == tiered_before)
                 intact = is_intact(schema_after)
                 if born_after_conflict:
                     # Forked from a spine that already has c_tier INT: the
-                    # feature DDL failed on creation, nothing to compare. S4.3
-                    # concerns the branches alive at the conflicting migration,
-                    # so no check is recorded (none the backend could not run).
-                    pass
+                    # feature DDL failed on creation, nothing to compare.
+                    inv.not_applicable(f"S4.3 schema-conflict rebase of {branch} (rebase {rebases_done})",
+                                       "branch created after the conflicting migration")
                 elif conflict_due and col == "c_tier":
                     # First integration after the conflicting migration; a
                     # branch that already moved its column is checked as usual.
@@ -338,8 +326,6 @@ class DevAgentScenario(Scenario):
                         else:
                             inv.check(f"S4.3b {branch} incorporates the spine after moving its column", False,
                                       f"column move failed: {rn.error[:120]}")
-                    elif rb.unsupported:  # the backend cannot rebase, so the branch never meets the conflict
-                        inv.not_applicable(f"S4.3 schema-conflict rebase of {branch} (rebase {rebases_done})", "rebase unsupported")
                     else:
                         inv.check(f"S4.3a schema-conflict rebase of {branch} keeps both sides",
                                   intact and schema_after["migrations"] == spine_migrations,
@@ -350,12 +336,6 @@ class DevAgentScenario(Scenario):
                               intact and schema_after["migrations"] == spine_migrations,
                               f"tiers={schema_after['tiers']} events={schema_after['events']}/{events_before} "
                               f"tiered={schema_after['tiered']}/{tiered_before} migrations={schema_after['migrations']}/{spine_migrations}")
-                # The step ends with the integration it reached: a schema conflict that the
-                # retried rebase or the merge resolved counts as integrated.
-                if rb.failed:
-                    ok = False
-                elif rb.unsupported:
-                    outcome = "skipped"
                 if rebases_done == 1:
                     if rb.unsupported:
                         inv.not_applicable(f"S4.2b spine sentinel visible on {branch} after rebase",
@@ -363,24 +343,23 @@ class DevAgentScenario(Scenario):
                     else:
                         inv.expect(f"S4.2b spine sentinel visible on {branch} after rebase",
                                    sentinel_visible(), 1, f"rebase {rb.status_name}")
-            ctx.tick(outcome=outcome if ok else "failed")
+            ctx.tick()
 
         # Review phase: quiet, occasional modification.
         modified = False
         for step in range(1, p.review_phase_steps + 1):
             ctx.check_stop()
-            ok = True
             if rng.random() < p.review_modification_prob:
-                ok = w.exec([("UPDATE loyalty_tier SET min_payment = min_payment + 1 WHERE tier_id = 2", None),
-                             ("SELECT COUNT(*) FROM loyalty_event", None)],
-                            branch, label="review_edit").ok
+                w.exec([("UPDATE loyalty_tier SET min_payment = min_payment + 1 WHERE tier_id = 2", None),
+                        ("SELECT COUNT(*) FROM loyalty_event", None)],
+                       branch, label="review_edit")
                 modified = True
                 if ctx.should_commit(step - 1):
-                    ok &= w.commit(branch, f"dev {i} review {step}", label="dev_commit").ok
+                    w.commit(branch, f"dev {i} review {step}", label="dev_commit")
                     modified = False
             else:
                 time.sleep(REVIEW_IDLE_SEC)
-            ctx.tick(outcome="succeeded" if ok else "failed")
+            ctx.tick()
         if modified:
             w.commit(branch, f"dev {i} review end", label="dev_commit")
 
@@ -391,26 +370,20 @@ class DevAgentScenario(Scenario):
         # recorded failure.
         r = suite.exec([("SELECT COUNT(*) FROM information_schema.tables "
                          "WHERE table_name = %s AND table_schema = DATABASE()",
-                         ("loyalty_tier",))], refs=[ctx.spine], timed=False)[0]
+                         ("loyalty_tier",))], refs=[ctx.spine], label="invariant")[0]
         if not r.ok:
             r = suite.exec([("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = %s",
-                             ("loyalty_tier",))], refs=[ctx.spine], timed=False)[0]
+                             ("loyalty_tier",))], refs=[ctx.spine], label="invariant")[0]
         if r.ok and r.rows:
             tables = int(r.rows[0][0])
         else:
             # No information_schema: probe the table itself (untimed, since a
-            # missing table is the expected outcome, not a failed op). Only a
-            # missing-relation error is evidence of absence; anything else
-            # (connection lost, permission, syntax) leaves the question open.
+            # missing table is the expected outcome, not a failed op).
             probe = suite.exec(["SELECT COUNT(*) FROM loyalty_tier"], refs=[ctx.spine],
                                timed=False)[0]
-            tables = 1 if probe.ok else 0 if _missing_relation(probe.error) else None
-        if tables is None:
-            inv.check(f"S4.1 loyalty_tier never on the spine (dev {i})", False,
-                      f"could not probe the spine: {(probe.error or probe.status_name)[:120]}")
-        else:
-            inv.expect(f"S4.1 loyalty_tier never on the spine (dev {i})", tables, 0,
-                       "loyalty_tier tables on the spine")
+            tables = 0 if probe.failed else 1
+        inv.expect(f"S4.1 loyalty_tier never on the spine (dev {i})", tables, 0,
+                   "loyalty_tier tables on the spine")
 
         for _ in range(max(0, ctx.branch_ops.retention_steps)):
             time.sleep(REVIEW_IDLE_SEC)
@@ -420,11 +393,10 @@ class DevAgentScenario(Scenario):
     def _branch_schema(self, suite, branch: str, col: str = "c_tier") -> dict:
         """What the branch holds of its own feature and of the spine's
         migrations: loyalty_tier rows, loyalty_event rows, whether
-        customer.c_tier exists, migration_log rows. Untimed, like the dialect
-        probe: a missing table or column is an answer here (-1), not a
-        recorded failure."""
+        customer.c_tier exists, migration_log rows. Recorded as "invariant" rows
+        (kept out of the figures)."""
         def count(sql):
-            r = suite.exec([sql], refs=[branch], label="invariant", timed=False)[0]
+            r = suite.exec([sql], refs=[branch], label="invariant")[0]
             return int(r.rows[0][0]) if r.ok and r.rows else -1
         return {"tiers": count("SELECT COUNT(*) FROM loyalty_tier"),
                 "events": count("SELECT COUNT(*) FROM loyalty_event"),

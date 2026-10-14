@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -178,6 +179,23 @@ class Connectors(unittest.TestCase):
                 for file in files:
                     (Path(board) / name / file).write_text("")
             self.assertEqual(connector_names(Path(board)), ["new"])
+
+    def test_no_files_outside_leaderboard_differ_from_main_merge_base(self) -> None:
+        merge_head = subprocess.run(["git", "-C", str(BOARD.parent), "rev-parse", "-q", "--verify", "MERGE_HEAD"],
+                                    capture_output=True, text=True)
+        if merge_head.returncode == 0:
+            ref = merge_head.stdout.strip()
+        else:
+            base = subprocess.run(["git", "-C", str(BOARD.parent), "merge-base", "HEAD", "origin/main"],
+                                  capture_output=True, text=True)
+            if base.returncode != 0:
+                self.skipTest("origin/main is not available in this git clone")
+            ref = base.stdout.strip()
+        changed = subprocess.run(
+            ["git", "-C", str(BOARD.parent), "diff", "--name-only", ref, "--", ".", ":!leaderboard"],
+            capture_output=True, text=True, check=True,
+        ).stdout.splitlines()
+        self.assertEqual(changed, [], f"files outside leaderboard/ differ from {ref}: {changed}")
 
 
 if __name__ == "__main__":

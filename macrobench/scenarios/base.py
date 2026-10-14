@@ -80,10 +80,11 @@ class InvariantRecorder:
 
 def is_retryable_error(msg: str) -> bool:
     """Errors worth retrying after a wait: Neon/Xata rate- and
-    resource-limit errors, and a connection the server dropped (a compute
-    restarted or suspended under it). A verb that failed this way left no
-    partial state (the composed merges run in one transaction), so the
-    retry repeats the whole operation; the failed attempt stays recorded."""
+    resource-limit errors, a connection the server dropped (a compute
+    restarted or suspended under it), and Bauplan's branch moving while an
+    operation ran. A verb that failed this way left no partial state (the
+    composed merges run in one transaction, or on a temporary branch), so
+    the retry repeats the whole operation; the failed attempt stays recorded."""
     msg = (msg or "").lower()
     return any(p in msg for p in (
         "429", "too many", "running operations", "branches limit",
@@ -91,6 +92,8 @@ def is_retryable_error(msg: str) -> bool:
         "ssl connection has been closed", "connection already closed",
         "server closed the connection", "ssl syscall error",
         "terminating connection", "could not connect to server",
+        # Bauplan: the branch moved while the operation ran.
+        "branch_head_changed",
     ))
 
 
@@ -106,13 +109,6 @@ class ScenarioContext:
     stop_reason: str = ""
     log: Callable[[str], None] = print
     metrics: dict = field(default_factory=dict)
-    # Terminal outcomes of the scenario's logical work units, counted by
-    # tick(outcome=...). A unit is one agent step, rollout, batch step, ...
-    # as total_units() counts them; "skipped" means the backend could not
-    # do what the unit needed (unsupported verb), not that it was fast.
-    work: dict = field(default_factory=lambda: {"succeeded": 0, "failed": 0, "skipped": 0})
-    # Exceptions that escaped a worker item: never part of a normal run.
-    worker_errors: list = field(default_factory=list)
     worker_conns: dict = field(default_factory=dict)
     _slots: Optional[threading.BoundedSemaphore] = None
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -163,18 +159,9 @@ class ScenarioContext:
         if self.stop_event.is_set():
             raise ScenarioStopped()
 
-    def tick(self, n: int = 1, outcome: str = "succeeded") -> None:
-        """Record n finished work units with their terminal outcome
-        (succeeded, failed or skipped) and advance the progress bar."""
-        with self._lock:
-            self.work[outcome] += n
+    def tick(self, n: int = 1) -> None:
         if self.progress is not None:
             self.progress.update(n)
-
-    def worker_error(self, worker_id: int, item, error: Exception) -> None:
-        with self._lock:
-            self.worker_errors.append({"worker": worker_id, "item": str(item),
-                                       "error": f"{type(error).__name__}: {error}"[:300]})
 
     def note(self, msg: str) -> None:
         if self.progress is not None:
@@ -249,7 +236,6 @@ class ScenarioContext:
                 results[i] = e
             except Exception as e:
                 results[i] = e
-                self.worker_error(w.id, item, e)
                 self.note(f"[W{w.id}] {type(e).__name__}: {e}")
             return i
 
@@ -262,7 +248,6 @@ class ScenarioContext:
                 except Exception as e:
                     results[i] = e
                     if not isinstance(e, ScenarioStopped):
-                        self.worker_error(w.id, item, e)
                         self.note(f"[W{w.id}] {type(e).__name__}: {e}")
             self.close_suite(w.suite)
             return results
@@ -365,10 +350,6 @@ class Scenario(ABC):
     uses_spine_load: bool = False
     # Payment transactions rewrite customer.c_data (S4 rebase conflicts).
     spine_touches_c_data: bool = False
-    # Row labels whose FAILED verbs the scenario expects and absorbs
-    # (background spine traffic that retries, injected faults). Every other
-    # FAILED verb or exec row is an unexplained failure of the workflow.
-    expected_failure_labels: frozenset = frozenset({"spine"})
 
     def __init__(self, ctx: ScenarioContext):
         self.ctx = ctx

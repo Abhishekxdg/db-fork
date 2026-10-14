@@ -6,20 +6,11 @@ leaves merge, rebase and revert unsupported to exercise that path.
 """
 
 import hashlib
-import re
 import sqlite3
 import time
 from contextlib import asynccontextmanager, contextmanager
 
 from dblib.db_api import DBToolSuite, Ref
-
-
-def _sqlite(q, vars):
-    """The query in sqlite's dialect: DB-API "%s" placeholders (psycopg2/pymysql)
-    become "?", and CAST(x AS DATE), which sqlite reads as a number, becomes DATE(x)."""
-    if vars is not None and "%s" in q:
-        q = q.replace("%s", "?")
-    return re.sub(r"CAST\(([^()]+?) AS DATE\)", r"DATE(\1)", q, flags=re.I)
 
 
 class _Cursor:
@@ -35,7 +26,11 @@ class _Cursor:
         self._cur.close()
 
     def execute(self, q, vars=None):
-        self._cur.execute(_sqlite(q, vars), vars if vars is not None else ())
+        # Scripts use DB-API "%s" placeholders (psycopg2/pymysql); sqlite
+        # wants "?".
+        if vars is not None and "%s" in q:
+            q = q.replace("%s", "?")
+        self._cur.execute(q, vars if vars is not None else ())
 
     def fetchall(self):
         return self._cur.fetchall()
@@ -83,7 +78,9 @@ class _AsyncCursor:
         self._cur.close()
 
     async def execute(self, q, vars=None):
-        self._cur.execute(_sqlite(q, vars), vars if vars is not None else ())
+        if vars is not None and "%s" in q:
+            q = q.replace("%s", "?")
+        self._cur.execute(q, vars if vars is not None else ())
         self.description = self._cur.description
 
     async def fetchall(self):
@@ -154,6 +151,18 @@ class FakeSuite(DBToolSuite):
             raise ValueError(f"unknown branch {ref.branch}")
         self.conn = self.branches[ref.branch]
 
+    def _schema_at(self, ref: Ref) -> dict:
+        """sqlite's catalog: table list plus PRAGMA table_info per table."""
+        self._connect_impl(ref)
+        out = {}
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '_bb_%'")
+            tables = [r[0] for r in cur.fetchall()]
+            for t in tables:
+                cur.execute(f"PRAGMA table_info({t})")
+                out[t] = {r[1]: str(r[2]).lower() for r in cur.fetchall()}
+        return out
+
     def _branch_impl(self, name: str, from_ref: Ref) -> None:
         if name in self.branches:
             raise ValueError(f"branch {name} exists")
@@ -178,14 +187,9 @@ class FakeSuite(DBToolSuite):
             c = (self.commits[ref.commit][1] if ref.commit
                  else self.branches[ref.branch])
             cur = c.raw.cursor()
-            try:
-                cur.execute("SELECT count(*) FROM t")
-            except sqlite3.OperationalError:  # schemas without the probe table
-                return None
+            cur.execute("SELECT count(*) FROM t")
             return cur.fetchone()[0]
-        rows_a, rows_b = count(a), count(b)
-        # Without the probe table the fake has no row counts to report, rather than invented zeros.
-        return None if rows_a is None or rows_b is None else {"rows_a": rows_a, "rows_b": rows_b}
+        return {"rows_a": count(a), "rows_b": count(b)}
 
     def _reset_impl(self, ref: Ref, to: str) -> None:
         self.branches[ref.branch] = self.commits[to][1].copy()

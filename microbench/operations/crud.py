@@ -99,15 +99,6 @@ class InsertOperation(Operation):
 
         return (insert_sql, col_names, pk_columns)
 
-    def _next_unique_row(self, context: 'WorkerContext', pk_columns):
-        """Generate a row whose primary key is not already known on this branch."""
-        for _ in range(100):
-            row_data = context.generate_row(self.table_name)
-            pk_tuple = tuple(row_data[pk] for pk in pk_columns)
-            if not context.is_known_pk(self.table_name, pk_tuple):
-                return row_data, pk_tuple
-        return row_data, pk_tuple
-
     def execute(self, context: 'WorkerContext') -> None:
         """Execute a timed insert operation."""
         insert_sql, col_names, pk_columns = self._generate_insert_data(context)
@@ -115,7 +106,8 @@ class InsertOperation(Operation):
         # Try to insert with retries for PK collisions
         inserted = False
         for attempt in range(5):
-            row_data, pk_tuple = self._next_unique_row(context, pk_columns)
+            row_data = context.generate_row(self.table_name)
+            pk_tuple = tuple(row_data[pk] for pk in pk_columns)
 
             try:
                 context.run_sql(insert_sql, row_data)
@@ -138,8 +130,8 @@ class InsertOperation(Operation):
         # Try to insert with retries for PK collisions
         inserted = False
         for attempt in range(5):
-            row_data, pk_tuple = self._next_unique_row(context, pk_columns)
-            context._known_pks.add(pk_tuple)
+            row_data = context.generate_row(self.table_name)
+            pk_tuple = tuple(row_data[pk] for pk in pk_columns)
 
             try:
                 await context.run_sql_async(insert_sql, row_data)
@@ -148,7 +140,6 @@ class InsertOperation(Operation):
 
                 break
             except Exception as e:
-                context._known_pks.discard(pk_tuple)
                 if attempt == 4:  # Last attempt
                     raise
                 continue  # Retry with new data

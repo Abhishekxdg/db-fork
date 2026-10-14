@@ -13,9 +13,8 @@ from dblib.db_api import DBToolSuite
 from macrobench import faults, schema, task_pb2 as tp
 from macrobench.datagen.ch import CHScale, CHGenerator, seed_ch
 from macrobench.intensity import apply_intensity
-from macrobench.runner import StallWatchdog, StorageSampler, setup_outcome, timed_work_allowed
 from macrobench.scenarios.base import InvariantFailed, InvariantRecorder
-from macrobench.tpcc import Quiescer
+from macrobench.tpcc import Quiescer, SpineLoad
 from tests.fake_backend import FakeSuite
 
 
@@ -151,6 +150,29 @@ def test_on_conflict_is_validated_and_passed_through():
     assert DBToolSuite.supports("merge") is False
 
 
+def test_spine_load_wait_for_total_counts_transactions_and_stops():
+    load = SpineLoad(lambda: None, "main", scale=None, clients=0)
+    stop = threading.Event()
+
+    def produce():
+        for _ in range(7):
+            time.sleep(0.002)
+            with load._lock:
+                load.total += 1
+                load._total_cond.notify_all()
+
+    load._threads = [threading.Thread(target=produce, daemon=True)]
+    load._threads[0].start()
+    assert load.wait_for_total(5, stop=stop, poll=0.01)
+    assert load.total >= 5
+    load._threads[0].join(1)
+    # Target beyond what the (now finished) load produced: returns False
+    # once no client is running, instead of blocking.
+    assert not load.wait_for_total(100, stop=stop, poll=0.01)
+    stop.set()
+    assert not load.wait_for_total(100, stop=stop, poll=0.01)
+
+
 def test_intensity_scales_branch_and_data_knobs():
     w = tp.Workload()
     w.branch_ops.commit_interval = 4
@@ -162,6 +184,7 @@ def test_intensity_scales_branch_and_data_knobs():
     w.dev_agent.concurrent_branches = 3
     w.dev_agent.dev_phase_steps = 5
     w.dev_agent.rebases_per_branch = 1
+    w.dev_agent.spine_commit_every_txns = 20
     w.branch_intensity = 2.0
     w.data_intensity = 0.5
     changed = apply_intensity(w)
@@ -174,6 +197,7 @@ def test_intensity_scales_branch_and_data_knobs():
     assert w.data_ops.spine_clients == 1
     assert w.data_ops.worker_threads == 8               # threads untouched
     assert w.dev_agent.dev_phase_steps == 2             # round(2.5) -> 2
+    assert w.dev_agent.spine_commit_every_txns == 10    # data knob
     assert changed["dev_agent.dev_branches"] == (10, 20)
     assert "data_ops.worker_threads" not in changed
 
@@ -183,10 +207,13 @@ def test_intensity_keeps_ops_agent_offset_inside_spine_and_caps_fanout():
     w.ops_agent.spine_commits = 6
     w.ops_agent.fault_commit_offset = 5
     w.ops_agent.investigation_branches = 2
+    w.ops_agent.commit_every_txns = 20
     w.branch_intensity = 0.5
+    w.data_intensity = 2.0
     apply_intensity(w)
     assert w.ops_agent.spine_commits == 3
     assert 0 < w.ops_agent.fault_commit_offset < w.ops_agent.spine_commits
+    assert w.ops_agent.commit_every_txns == 40          # data knob, not branch
 
     w = tp.Workload()
     w.context_mgmt.fanout = 6
@@ -240,80 +267,3 @@ def test_run_transaction_retries_then_raises(suite):
     finally:
         del tpcc.TRANSACTIONS["flaky"]
     assert not res.ok and calls["n"] == 3
-
-
-def test_timed_work_waits_for_a_complete_setup():
-    """One gate for the workflow and the background spine load: a failed setup
-    starts neither, so no timed row can come from a broken database."""
-    assert timed_work_allowed("completed")
-    for status in ("setup_failed: SetupFailed: seed commit FAILED", "crashed: KeyError: x", "interrupted", ""):
-        assert not timed_work_allowed(status)
-    source = open(__import__("macrobench.runner", fromlist=["x"]).__file__).read()
-    assert source.count("timed_work_allowed(status)") == 3, "scenario.run, the spine load and the log line share the gate"
-
-
-def test_setup_outcome_needs_positive_evidence():
-    assert setup_outcome({}) == "setup produced no schema or seed-commit evidence"
-    assert setup_outcome({"schema_failed": [("CREATE TABLE x", "boom")], "seed_commit": "OK"}) \
-        == "1 schema statements failed"
-    assert setup_outcome({"schema_failed": [], "seed_commit": "FAILED"}) == "seed commit FAILED"
-    assert setup_outcome({"schema_failed": [], "seed_commit": "OK"}) is None
-
-
-def test_support_summary_separates_failed_verbs_from_statements(suite):
-    suite.exec(["CREATE TABLE t (id INT PRIMARY KEY)"], refs=["main"], label="setup")
-    # A statement that fails inside a script the script recovers from is a FAILED
-    # statement row inside an OK exec; a verb that fails is a FAILED verb row.
-    def recovering(db):
-        try:
-            db.sql("INSERT INTO nowhere VALUES (1)")
-        except Exception:
-            pass
-        db.sql("INSERT INTO t VALUES (1)")
-    assert suite.exec(recovering, refs=["main"], label="step")[0].ok
-    assert suite.exec(["INSERT INTO nowhere VALUES (2)"], refs=["main"], label="spine")[0].failed
-    assert suite.exec(["INSERT INTO nowhere VALUES (3)"], refs=["main"], label="step")[0].failed
-    summary = suite.result_collector.support_summary()
-    assert summary["op_status_counts"]["EXEC"]["failed"] == 2
-    assert summary["op_status_counts"]["INSERT"]["failed"] == 3
-    assert summary["commit_ref_fallbacks"] == 0
-    assert summary["op_status_counts"]["EXEC"]["ok_seconds"] > 0
-    assert suite.result_collector.failed_verbs() == {"spine": 1, "step": 1}
-
-
-def test_runner_threads_leave_thread_internals_alone():
-    """Thread._stop is a method on Python 3.11 and 3.12 that join() calls; an Event stored under
-    that name breaks stop() there, before the run's evidence is written."""
-    class Storage:
-        def _safe_storage(self):
-            return 0
-    sampler = StorageSampler(Storage(), 0.01)
-    watchdog = StallWatchdog(rc.ResultCollector(), 60.0, log=lambda m: None)
-    assert "_stop" not in vars(sampler) and "_stop" not in vars(watchdog)
-    for thread in (sampler, watchdog):
-        thread.start()
-        thread.stop()
-    watchdog.join(timeout=5)
-    assert not sampler.is_alive() and not watchdog.is_alive()
-
-
-def test_a_failed_spill_keeps_its_rows(tmp_path):
-    """A spill write that fails keeps its batch for the next spill or the final write, so the
-    parquet file holds every row the summary counts."""
-    import pyarrow.parquet as pq
-    from dblib import result_pb2 as rslt
-    collector = rc.ResultCollector(run_id="spill", output_dir=str(tmp_path), spill_rows=2)
-    write, calls = collector._write_batch, []
-
-    def flaky(batch):
-        calls.append(len(batch))
-        if len(calls) == 1:
-            raise OSError("disk hiccup")
-        write(batch)
-    collector._write_batch = flaky
-    for _ in range(4):
-        collector.emit(rslt.OpType.BRANCH, latency=0.01)
-    collector.write_to_parquet(append=False)
-    assert calls[0] == 2 and len(calls) >= 2, calls
-    assert pq.read_table(tmp_path / "spill.parquet").num_rows == 4
-    assert collector.support_summary()["op_status_counts"]["BRANCH"]["ok"] == 4

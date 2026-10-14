@@ -9,9 +9,14 @@ Branches are whole databases, as on SeekDB:
 
     main branch      -> <db_name>
     branch "X"       -> <db_name>__X
+    after N rebases  -> <db_name>__X__gN   (main: <db_name>__main__gN)
 
-The mapping is derived from the names alone, so every worker resolves a
-branch to the same database without shared state.
+A rebase re-forks the branch into a new database (its next *generation*)
+and drops the old one, so the branch name -> database mapping lives in a
+registry table, ``<db_name>___bb_meta.branches``, that every worker reads
+(a point lookup, ~0.2 ms). The generation suffix keeps old snapshot names
+unambiguous: a commit made before a rebase is still read through the
+database it was taken on, which stays readable by name after it is dropped.
 
 A commit is a database snapshot. Its message and ordering live in the
 branch database's ``_bb_commits`` table (branches inherit it, since a
@@ -32,30 +37,56 @@ report uses):
                SKIP|ACCEPT per table ("ours" | "theirs"); the conflict
                count and the rows handed to a resolve callable come from
                two native diffs against the fork snapshot joined in SQL
-    rebase     re-fork: a temporary branch from the upstream's head
-               snapshot receives the branch's delta since its fork through
-               DATA BRANCH PICK ... BETWEEN SNAPSHOT, conflicts with the
-               upstream's delta are resolved per on_conflict, and the clone
-               replaces the branch (its lineage now starts at the upstream
+    rebase     re-fork: the branch's next generation is cloned from the
+               upstream's head snapshot and snapshotted at once (the new
+               base), then receives the branch's delta since its previous
+               base: the keys a native diff of the branch's own two
+               snapshots lists (plus rows with a value in a column the
+               branch added, which that diff does not see) are copied in
+               with SQL from the head snapshot's time-travel view, or, in
+               native-only mode, replayed with DATA BRANCH PICK ... BETWEEN
+               SNAPSHOT; conflicts with the upstream's delta are resolved
+               per on_conflict; the registry is repointed and the old
+               generation dropped (the lineage now starts at the upstream
                head, so a later merge back sees only newer changes)
     revert     DATA BRANCH DIFF between the commit's snapshot and its
                predecessor; the inverse is applied with SQL
     reset      DATA BRANCH DIFF between the head and the commit's snapshot,
                the differences undone with SQL (RESTORE DATABASE does it in
-               one statement, MO_NATIVE_RESET=1, but later diffs across the
-               restore misreport updated rows); a commit inherited from the
+               one statement, used in native-only mode, but later diffs
+               across the restore misreport updated rows); a commit inherited from the
                parent is restored row by row from its time-travel view
     delete     DATA BRANCH DELETE DATABASE (DROP DATABASE as fallback)
 
-A multi-ref script addresses another branch as `<db>__<branch>`.`<table>`
-and a commit as `<db>`.`<table>`{snapshot = '<name>'}.
+A multi-ref script addresses another branch through its current
+database (`<db>__<branch>[__gN]`.`<table>`, resolved by the adapter) and a
+commit as `<db>`.`<table>`{snapshot = '<name>'}.
 
 Conflict semantics follow git: in a merge "ours" is the target branch,
 in a rebase "ours" is the upstream (the branch being rebased onto) and
 "theirs" the branch's own commits.
+
+Known limitations (MatrixOne v4.2.5):
+
+- The native-only rebase (DATA BRANCH PICK) is not fully reliable. In a
+  long S4 run, from roughly 500 s in, about every other rebase's PICK
+  carries none of the branch's rows even though a time-travel read of
+  the same snapshots shows them all; the branch then silently loses that
+  backfill. Not reproduced standalone (spine load, delays, flushes,
+  checkpoints, intermediate commits, composite keys, migrations in the
+  window, prior ALTERs and sibling branch churn were all ruled out). The
+  default rebase copies the rows from the snapshot with SQL instead.
+- PICK and MERGE resolve conflicts per row, so "theirs" replaces the
+  upstream's whole row, including columns only the upstream changed.
+- DATA BRANCH DIFF does not report a change confined to a column added
+  since the base, and diffing a clone against an older snapshot of its
+  ancestor drops the ancestor's updates and deletes (see
+  tarLCASnapshot/baseLCASnapshot in pkg/frontend/data_branch_types.go).
 """
 
+import json
 import os
+import re
 import time
 import random
 
@@ -63,14 +94,14 @@ import aiomysql
 import pymysql
 from pymysql.constants import CLIENT
 
-from dblib.db_api import DBToolSuite, Ref
+from dblib.db_api import DBToolSuite, Ref, native_only
 from dblib import mysql_common
 import dblib.result_collector as rc
 import dblib.util as dbutil
 
 MO_USER = os.environ.get("MO_USER", "root")
 MO_PASSWORD = os.environ.get("MO_PASSWORD", "111")
-MO_HOST = os.environ.get("MO_HOST", "127.0.0.1")
+MO_HOST = os.environ.get("MO_HOST") or os.environ.get("DBFORK_SERVER_HOST", "127.0.0.1")
 MO_PORT = int(os.environ.get("MO_PORT", "6001"))
 MO_DATA_DIR = os.path.expanduser(os.environ.get("MO_DATA_DIR", "~/mo/matrixone/mo-data"))
 
@@ -78,16 +109,21 @@ MO_DATA_DIR = os.path.expanduser(os.environ.get("MO_DATA_DIR", "~/mo/matrixone/m
 # even when on_conflict is "ours"/"theirs" and the count is only reported.
 MO_COUNT_CONFLICTS = os.environ.get("MO_COUNT_CONFLICTS", "1").lower() not in ("0", "false", "no")
 
-# Use RESTORE DATABASE for reset(). It is the native primitive, but it
-# gives the restored tables new identities and MatrixOne's later diffs
-# across that edge report updated rows as inserted on both sides (checked
-# on v4.2.5 with a 300k-row table), which breaks rebase/merge afterwards.
-# Off by default: reset() then restores the rows a native diff lists.
-MO_NATIVE_RESET = os.environ.get("MO_NATIVE_RESET", "").lower() in ("1", "true", "yes")
+# Native-only mode (DBFORK_NATIVE_ONLY=1) uses the engine's own primitives
+# as they are: RESTORE DATABASE for reset() (it gives the restored tables
+# new identities and later lineage diffs across that edge misreport
+# updated rows) and DATA BRANCH PICK to replay the branch's delta in
+# rebase() (sporadically carries nothing late in long runs). Otherwise
+# both are done from a native diff of the branch's own two snapshots,
+# applied with SQL.
+MO_NATIVE_RESET = native_only()
 
 MAIN_BRANCH = "main"
 _BRANCH_SEP = "__"
 _TEMP_PREFIX = "tmp_"
+_GEN_SEP = "__g"
+_META_NAME = "_bb_meta"
+BRANCHES_TABLE = "branches"
 _MAX_DB_NAME_LEN = 64
 # Snapshot names are silently truncated to 64 characters.
 _MAX_SNAPSHOT_LEN = 64
@@ -106,7 +142,17 @@ CREATE TABLE IF NOT EXISTS {table} (
     prev_snap VARCHAR(64),
     prev_db VARCHAR(64),
     ts DATETIME(6),
+    schema_json TEXT,
     PRIMARY KEY (seq)
+)
+"""
+
+_BRANCHES_DDL = """
+CREATE TABLE IF NOT EXISTS {table} (
+    name VARCHAR(64) NOT NULL,
+    db VARCHAR(64) NOT NULL,
+    gen INT NOT NULL,
+    PRIMARY KEY (name)
 )
 """
 
@@ -137,12 +183,35 @@ def _qt(db: str, table: str) -> str:
 
 
 def branch_db_name(db_name: str, branch_name: str) -> str:
-    if branch_name == MAIN_BRANCH:
+    """The database of a branch's first generation."""
+    return gen_db_name(db_name, branch_name, 0)
+
+
+def gen_db_name(db_name: str, branch_name: str, gen: int) -> str:
+    """The database that holds generation ``gen`` of a branch (a rebase
+    moves a branch to its next generation)."""
+    if gen == 0 and branch_name == MAIN_BRANCH:
         return db_name
     name = f"{db_name}{_BRANCH_SEP}{branch_name}"
+    if gen:
+        name += f"{_GEN_SEP}{int(gen)}"
     if len(name) > _MAX_DB_NAME_LEN:
         raise ValueError(f"MatrixOne database name '{name}' is longer than {_MAX_DB_NAME_LEN}")
     return name
+
+
+def branch_of_db(db_name: str, db: str) -> str:
+    """Inverse of gen_db_name: the branch a (possibly old) database held."""
+    if db == db_name:
+        return MAIN_BRANCH
+    prefix = db_name + _BRANCH_SEP
+    name = db[len(prefix):] if db.startswith(prefix) else db
+    m = re.match(rf"^(.*){re.escape(_GEN_SEP)}\d+$", name)
+    return m.group(1) if m else name
+
+
+def meta_db_name(db_name: str) -> str:
+    return f"{db_name}{_BRANCH_SEP}{_META_NAME}"
 
 
 def snapshot_prefix(db_name: str) -> str:
@@ -220,18 +289,20 @@ class MatrixOneToolSuite(DBToolSuite):
     BACKEND_NAME = "matrixone"
     STORAGE_SCOPE = "server"
     SUPPORTS_COMMIT_REFS = True
+    SCHEMA_DIALECT = "mysql"
     SUPPORTS_MULTI_REF_EXEC = True
     IMPLEMENTATION = {
         "branch": "native",
-        "commit": "composed",
+        "commit": "native",
         "diff": "native",
         "log": "simulated",
-        "merge": "composed",
-        "rebase": "composed",
+        "merge": "native",
+        "rebase": "native" if MO_NATIVE_RESET else "simulated",
         "revert": "simulated",
-        "reset": "native" if MO_NATIVE_RESET else "composed",
+        "reset": "native" if MO_NATIVE_RESET else "simulated",
         "delete": "native",
         "commit_refs": "native",
+        "schema_diff": "simulated",
         "multi_ref_exec": "native",
     }
     IMPLEMENTATION_NOTES = {
@@ -242,9 +313,13 @@ class MatrixOneToolSuite(DBToolSuite):
         "merge": "DATA BRANCH MERGE per table WHEN CONFLICT SKIP|ACCEPT; conflict rows/count "
                  "from two native diffs against the fork snapshot; a resolve callable writes "
                  "over the SKIP result",
-        "rebase": "re-fork from the upstream's head snapshot, DATA BRANCH PICK ... BETWEEN "
-                  "SNAPSHOT replays the branch's delta, conflicts from two native diffs, "
-                  "swap databases",
+        "rebase": ("re-fork: the branch's next generation is cloned from the upstream's head "
+                   "snapshot and snapshotted (the new base); the branch's delta since its previous "
+                   "base (a native diff of its own two snapshots) is "
+                   + ("replayed with DATA BRANCH PICK ... BETWEEN SNAPSHOT" if MO_NATIVE_RESET else
+                      "copied in with SQL from its head snapshot's time-travel view")
+                   + "; conflicts from two native diffs; the registry is repointed and the old "
+                   "generation dropped"),
         "revert": "DATA BRANCH DIFF commit vs predecessor; inverse applied with SQL",
         "reset": ("RESTORE DATABASE {snapshot}" if MO_NATIVE_RESET else
                   "DATA BRANCH DIFF head vs the commit's snapshot, rows put back with SQL "
@@ -252,6 +327,7 @@ class MatrixOneToolSuite(DBToolSuite):
                  + "; SQL row restore for commits inherited from a parent",
         "delete": "DATA BRANCH DELETE DATABASE (DROP DATABASE fallback)",
         "commit_refs": "time-travel reads t{snapshot = ...}",
+        "schema_diff": "catalog columns of each ref compared by the adapter",
         "multi_ref_exec": "cross-database queries",
     }
 
@@ -278,6 +354,8 @@ class MatrixOneToolSuite(DBToolSuite):
         self._current_db = None
         self._temp_dbs: dict = {}
         self._warned = set()
+        self._meta_db = meta_db_name(db_name)
+        self._ensure_registry()
         self._ensure_meta(self._db_for(default_branch_name))
         self._connect_impl(Ref(default_branch_name))
         self._current_ref = Ref(default_branch_name)
@@ -286,8 +364,47 @@ class MatrixOneToolSuite(DBToolSuite):
     # Names and connection
     # ------------------------------------------------------------------
 
+    # MatrixOne reports a catalog deadlock when several workers run DDL at
+    # once; the statements below are safe to retry.
+    _ER_DEADLOCK = 20701
+    _DDL_RETRIES = 5
+
+    def _execute_ddl(self, sql: str) -> None:
+        for attempt in range(self._DDL_RETRIES):
+            try:
+                self._execute(sql)
+                return
+            except pymysql.MySQLError as e:
+                if e.args and e.args[0] == self._ER_DEADLOCK and attempt < self._DDL_RETRIES - 1:
+                    time.sleep(0.2 * (attempt + 1))
+                    continue
+                raise
+
+    def _ensure_registry(self) -> None:
+        """The branch -> database registry; main is its first row."""
+        self._execute_ddl(f"CREATE DATABASE IF NOT EXISTS {_quote(self._meta_db)};")
+        self._execute_ddl(_BRANCHES_DDL.format(table=_qt(self._meta_db, BRANCHES_TABLE)))
+        self._execute(f"INSERT IGNORE INTO {_qt(self._meta_db, BRANCHES_TABLE)} (name, db, gen) "
+                      "VALUES (%s, %s, 0)", (MAIN_BRANCH, self.db_name))
+
+    def _registry_row(self, branch: str):
+        rows = self._execute(f"SELECT db, gen FROM {_qt(self._meta_db, BRANCHES_TABLE)} "
+                             "WHERE name = %s", (branch,))
+        return (rows[0][0], int(rows[0][1])) if rows else None
+
+    def _register(self, branch: str, db: str, gen: int) -> None:
+        self._execute(f"INSERT INTO {_qt(self._meta_db, BRANCHES_TABLE)} (name, db, gen) "
+                      "VALUES (%s, %s, %s) ON DUPLICATE KEY UPDATE db = VALUES(db), gen = VALUES(gen)",
+                      (branch, db, int(gen)))
+
+    def _unregister(self, branch: str) -> None:
+        self._execute(f"DELETE FROM {_qt(self._meta_db, BRANCHES_TABLE)} WHERE name = %s", (branch,))
+
     def _db_for(self, branch: str) -> str:
-        return branch_db_name(self.db_name, branch)
+        row = self._registry_row(branch)
+        if row is None:
+            raise ValueError(f"unknown branch '{branch}' on {self.db_name}")
+        return row[0]
 
     def _use(self, db: str) -> None:
         self._execute(f"USE {_quote(db)};")
@@ -320,11 +437,10 @@ class MatrixOneToolSuite(DBToolSuite):
         return mysql_common.normalize_column_types(rows)
 
     def list_branches(self) -> list:
-        with self.conn.cursor() as cur:
-            dbs = _branch_databases(cur, self.db_name)
-        prefix = self.db_name + _BRANCH_SEP
-        names = [d[len(prefix):] for d in dbs]
-        return [MAIN_BRANCH] + [n for n in names if not n.startswith(_TEMP_PREFIX)]
+        rows = self._execute(f"SELECT name FROM {_qt(self._meta_db, BRANCHES_TABLE)} "
+                             "ORDER BY name") or []
+        names = [r[0] for r in rows if r[0] != MAIN_BRANCH]
+        return [MAIN_BRANCH] + names
 
     # ------------------------------------------------------------------
     # Commit log
@@ -337,21 +453,59 @@ class MatrixOneToolSuite(DBToolSuite):
             self._add_commit(db, "root", "initial state", None, db, None, None,
                              take_snapshot=True)
 
+    def _schema_at(self, ref: Ref) -> dict:
+        """A commit's schema is the fingerprint recorded with its log row;
+        a branch head is read from the catalog."""
+        if ref.commit:
+            row = self._find_commit(self._db_for(ref.branch), ref.commit)
+            if row.get("schema_json"):
+                fp = json.loads(row["schema_json"])
+                return {t: dict(spec["cols"]) for t, spec in fp.items()}
+        return super()._schema_at(ref)
+
+    def _fingerprint(self, db: str) -> dict:
+        """{table: {"cols": {column: type}, "pk": [columns]}} of db's data
+        tables, one catalog query; recorded with every log row so that a
+        reset can put the schema back (types, dropped tables included)."""
+        rows = self._execute(
+            "SELECT c.table_name, c.column_name, c.column_type, c.column_key "
+            "FROM information_schema.columns c JOIN information_schema.tables t "
+            "ON t.table_schema = c.table_schema AND t.table_name = c.table_name "
+            "WHERE c.table_schema = %s AND t.table_type = 'BASE TABLE' AND c.table_name NOT LIKE %s "
+            "ORDER BY c.table_name, c.ordinal_position",
+            (db, META_PREFIX.replace("_", r"\_") + "%")) or []
+        out: dict = {}
+        for table, col, ctype, key in rows:
+            if str(col).startswith("__mo_"):
+                continue
+            t = out.setdefault(str(table), {"cols": {}, "pk": []})
+            t["cols"][str(col)] = str(ctype).lower()
+            if str(key or "").upper() == "PRI":
+                t["pk"].append(str(col))
+        return out
+
     def _add_commit(self, db: str, kind: str, message: str, snap, snap_db: str,
                     prev_snap, prev_db, commit_id: str = None, take_snapshot: bool = False,
-                    seq: int = None) -> str:
+                    seq: int = None, schema_json: str = None) -> str:
         """Append a log row. With ``take_snapshot`` the snapshot named in
-        the row is created after the row, so it contains its own entry."""
+        the row is created after the row, so it contains its own entry.
+        ``schema_json`` is the schema fingerprint of the state the row
+        records (captured from snap_db when not given)."""
         seq = seq or time.time_ns()
         commit_id = commit_id or f"{seq:x}"
         snap = snap or self._new_snapshot_name()
+        if schema_json is None:
+            try:
+                schema_json = json.dumps(self._fingerprint(snap_db))
+            except pymysql.MySQLError as e:
+                self._warn(("fingerprint", snap_db), f"schema fingerprint of {snap_db} failed: {e}")
         for _ in range(8):
             try:
                 self._execute(
                     f"INSERT INTO {_qt(db, COMMITS_TABLE)} "
-                    "(seq, id, kind, message, snap, db, prev_snap, prev_db, ts) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(6))",
-                    (seq, commit_id, kind, message or "", snap, snap_db, prev_snap, prev_db))
+                    "(seq, id, kind, message, snap, db, prev_snap, prev_db, ts, schema_json) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(6), %s)",
+                    (seq, commit_id, kind, message or "", snap, snap_db, prev_snap, prev_db, schema_json))
                 break
             except pymysql.err.IntegrityError:
                 seq += 1
@@ -361,7 +515,7 @@ class MatrixOneToolSuite(DBToolSuite):
             self._snapshot(snap_db, snap)
         return commit_id
 
-    _LOG_COLS = ("seq", "id", "kind", "message", "snap", "db", "prev_snap", "prev_db", "ts")
+    _LOG_COLS = ("seq", "id", "kind", "message", "snap", "db", "prev_snap", "prev_db", "ts", "schema_json")
 
     def _log_rows(self, db: str, limit: int = None, max_seq: int = None) -> list:
         sql = f"SELECT {', '.join(self._LOG_COLS)} FROM {_qt(db, COMMITS_TABLE)}"
@@ -404,7 +558,9 @@ class MatrixOneToolSuite(DBToolSuite):
         cands = []
         for child, parent in ((x_db, y_db), (y_db, x_db)):
             row = self._base_row(child)
-            if row["prev_db"] == parent and row["kind"] in ("fork", "rebase"):
+            # prev_db names the parent's generation at fork/rebase time.
+            if (row["kind"] in ("fork", "rebase")
+                    and branch_of_db(self.db_name, row["prev_db"]) == branch_of_db(self.db_name, parent)):
                 cands.append((child, parent, row))
         if not cands:
             return None
@@ -454,12 +610,20 @@ class MatrixOneToolSuite(DBToolSuite):
                     if r[2] == "PRIMARY" and not str(r[4]).startswith("__mo_"))
         return [name for _, name in pk]
 
+    # "table does not exist" (also for a table absent at the snapshot).
+    _ER_NO_TABLE = 1064
+
     def _readable(self, state: _State, table: str) -> bool:
+        """Does the table exist at ``state``? Any other error (unknown
+        database or snapshot, a server fault) is raised: silently treating
+        it as "absent" would drop the table from a merge or rebase."""
         try:
             self._execute(f"SELECT 1 FROM {state.expr(table)} LIMIT 0")
             return True
-        except pymysql.MySQLError:
-            return False
+        except pymysql.MySQLError as e:
+            if e.args and e.args[0] == self._ER_NO_TABLE and "does not exist" in str(e.args[1]):
+                return False
+            raise
 
     @staticmethod
     def _join(a: str, b: str, pk: list) -> str:
@@ -516,7 +680,7 @@ class MatrixOneToolSuite(DBToolSuite):
     def _storage_bytes(self) -> int:
         """Size of the server's data directory (object store plus log
         service): MatrixOne has no per-database directory."""
-        return dbutil.get_directory_size_bytes(MO_DATA_DIR)
+        return dbutil.get_directory_size_bytes(MO_DATA_DIR, ssh=dbutil.ssh_target("MO_SSH"))
 
     def _gc_impl(self) -> None:
         # No GC command; a forced checkpoint flushes memtables to objects.
@@ -559,6 +723,7 @@ class MatrixOneToolSuite(DBToolSuite):
         # snapshot it was cloned from (prev_*): the base of later merges.
         self._add_commit(db, "fork", f"fork from {from_ref}", None, db, snap, snap_db,
                          take_snapshot=True)
+        self._register(name, db, 0)
 
     def _commit_impl(self, ref: Ref, message: str) -> str:
         db = self._on(ref)
@@ -829,13 +994,19 @@ class MatrixOneToolSuite(DBToolSuite):
     # -- rebase -------------------------------------------------------------
 
     def _rebase_impl(self, ref: Ref, onto: Ref, on_conflict="ours") -> dict:
-        """Re-fork: a temporary clone of the upstream's head snapshot
-        receives the branch's delta since its fork (DATA BRANCH PICK ...
-        BETWEEN SNAPSHOT, the branch's own snapshots), conflicts with the
-        upstream's delta over the same period are resolved per
-        on_conflict ("ours" = upstream, "theirs" = the branch, as in git),
-        and the clone replaces the branch. Its lineage now starts at the
-        upstream head, so MatrixOne's LCA for a later merge is that head."""
+        """Re-fork: the branch's next generation is cloned from the
+        upstream's head snapshot and snapshotted at once (that snapshot is
+        the new base, so a later rebase's delta window starts before the
+        work replayed now), the branch's delta since its previous base
+        (a native diff of the branch's own two snapshots) is replayed into
+        it table by table, by SQL from the head snapshot's time-travel
+        view, or by DATA BRANCH PICK ... BETWEEN SNAPSHOT in native-only
+        mode, conflicts with the upstream's
+        delta over the same period are resolved per on_conflict ("ours" =
+        upstream, "theirs" = the branch, as in git), the registry is
+        repointed and the old generation dropped. The lineage now starts
+        at the upstream head, so MatrixOne's LCA for a later merge is that
+        head."""
         branch_db = self._on(ref)
         onto_db = self._db_for(onto.branch)
         if onto_db == branch_db:
@@ -861,61 +1032,98 @@ class MatrixOneToolSuite(DBToolSuite):
         upstream = self._state(onto) if onto.commit else _State(onto_db, self._snapshot(onto_db))
         info = {"conflicts": 0, "conflict_tables": [], "merged_tables": [],
                 "ours_changes": 0, "theirs_changes": 0, "up_to_date": False}
-        tmp = branch_db_name(self.db_name, f"{_TEMP_PREFIX}rb_{ref.branch}"[:50])
-        self._execute(f"DROP DATABASE IF EXISTS {_quote(tmp)};")
-        self._execute(f"DATA BRANCH CREATE DATABASE {_quote(tmp)} FROM {_quote(upstream.db)} "
+        gen = self._registry_row(ref.branch)[1] + 1
+        new_db = gen_db_name(self.db_name, ref.branch, gen)
+        self._execute_ddl(f"DROP DATABASE IF EXISTS {_quote(new_db)};")
+        self._execute(f"DATA BRANCH CREATE DATABASE {_quote(new_db)} FROM {_quote(upstream.db)} "
                       f"{{snapshot = '{upstream.snap}'}};")
         want_rows = callable(on_conflict)
         conflicts = []
+        touches = []
+        base_snap = self._new_snapshot_name()
         try:
+            # The new base: the branch's own snapshot of the upstream head,
+            # taken before anything is replayed into it; the rebase row goes
+            # in first so that the snapshot contains it.
+            now = time.time_ns()
+            self._add_commit(new_db, "rebase", f"rebase onto {onto}", base_snap, new_db,
+                             upstream.snap, upstream.db, seq=now, take_snapshot=True)
             # PICK needs the source to have every column of the target, so
             # the branch (dropped after the swap) first gets the upstream's
-            # new columns; then the clone gets the branch's.
-            up_schema = self._reconcile_schema(branch_db, _State(tmp))
+            # new columns; then the new generation gets the branch's.
+            up_schema = self._reconcile_schema(branch_db, _State(new_db))
             s_now = self._snapshot(branch_db)
             branch_now = _State(branch_db, s_now)
-            schema = self._reconcile_schema(tmp, branch_now)
+            schema = self._reconcile_schema(new_db, branch_now)
             schema["added_tables"] = sorted(set(schema["added_tables"]) - set(up_schema["added_tables"]))
             upstream_moved = bool(up_schema["added_tables"] or up_schema["added_columns"])
             self._fk_checks(False)
             try:
                 branch_base = _State(branch_db, s_b0)
-                for table in sorted(set(self._tables(tmp)) & set(self._tables(branch_db))):
-                    if table in schema["added_tables"] or table in up_schema["added_tables"] \
-                            or not self._readable(branch_now, table):
+                for table in sorted(set(self._tables(new_db)) & set(self._tables(branch_db))):
+                    if table in schema["added_tables"] or table in up_schema["added_tables"]:
                         continue
+                    if not self._readable(branch_now, table):
+                        # The table exists now, so its snapshot must show it.
+                        raise RuntimeError(f"{table} is unreadable at {branch_db}'s snapshot {s_now}")
                     if not self._readable(branch_base, table):
                         # Created on both sides since the fork: nothing to replay.
                         self._warn(("rebase_new_both", table),
                                    f"{table} was created on both {branch_db} and {onto_db}; "
                                    "the upstream's version is kept")
                         continue
-                    pk = self._pk(tmp, table)
-                    cols = self._common_cols(tmp, branch_db, table)
+                    pk = self._pk(new_db, table)
+                    cols = self._common_cols(new_db, branch_db, table)
                     rest = [c for c in cols if c not in pk]
                     if not pk:
                         # PICK needs a primary key: replay the delta row by row.
                         n = self._apply_nopk_delta(
-                            _qt(tmp, table), cols,
-                            self._diff_rows(branch_now.expr(table), _State(branch_db, s_b0).expr(table)))
+                            _qt(new_db, table), cols,
+                            self._diff_rows(branch_now.expr(table), branch_base.expr(table)))
                         info["theirs_changes"] += n
                         if n:
                             info["merged_tables"].append(table)
                         continue
-                    # The branch's delta since its fork and the upstream's over the same period.
-                    d_b = self._delta(branch_now.expr(table), _State(branch_db, s_b0).expr(table), pk)
-                    if not d_b:
-                        continue
+                    # The branch's delta since its base and the upstream's over
+                    # the same period, for the conflict count. The native diff
+                    # does not list a row whose only change is in a column
+                    # added since the base, so an empty delta cannot mean
+                    # "nothing to replay": PICK runs for every table.
+                    d_b = self._delta(branch_now.expr(table), branch_base.expr(table), pk)
                     d_u = {}
                     if up_base.snap and up_base.db == upstream.db and self._readable(up_base, table):
                         d_u = self._delta(upstream.expr(table), up_base.expr(table), pk)
-                    info["theirs_changes"] += len(d_b or {})
+                    info["theirs_changes"] += len(d_b)
                     info["ours_changes"] += len(d_u)
                     if d_u:
                         upstream_moved = True
-                    self._execute(f"DATA BRANCH PICK {_qt(branch_db, table)} INTO {_qt(tmp, table)} "
-                                  f"BETWEEN SNAPSHOT '{s_b0}' AND '{s_now}' WHEN CONFLICT ACCEPT")
-                    info["merged_tables"].append(table)
+                    new_cols = [c.split(".", 1)[1] for c in schema["added_columns"]
+                                if c.startswith(table + ".")]
+                    keys = self._replayed_keys(d_b, branch_now, table, pk, new_cols)
+                    if MO_NATIVE_RESET:
+                        self._execute(f"DATA BRANCH PICK {_qt(branch_db, table)} INTO {_qt(new_db, table)} "
+                                      f"BETWEEN SNAPSHOT '{s_b0}' AND '{s_now}' WHEN CONFLICT ACCEPT")
+                        # On a table with a foreign key, rows PICK writes are
+                        # invisible to a later PICK from this generation once
+                        # the source generation is dropped (v4.2.5, whether or
+                        # not foreign_key_checks is on), so they are rewritten
+                        # as ordinary writes of this generation after the drop.
+                        if keys:
+                            touches.append((table, pk, rest, keys))
+                    else:
+                        # Simulated replay: the branch's deletes, then its
+                        # inserted/updated rows copied from the head snapshot's
+                        # time-travel view (server-side; only keys travel).
+                        deleted = [k for k, (flag, _) in d_b.items() if flag == "DELETE"]
+                        for chunk in self._chunks(deleted):
+                            self._execute(f"DELETE FROM {_qt(new_db, table)} WHERE {self._in_keys(pk, chunk)}")
+                        for chunk in self._chunks(keys):
+                            self._execute(self._upsert(
+                                _qt(new_db, table), cols, pk,
+                                f"SELECT {self._cols('s', cols)} FROM {branch_now.expr(table)} s "
+                                f"WHERE {self._in_keys(pk, chunk)}"))
+                    if keys or any(flag == "DELETE" for flag, _ in d_b.values()):
+                        info["merged_tables"].append(table)
                     if not d_u:
                         continue
                     keys = self._conflict_keys(d_u, d_b, rest)
@@ -926,7 +1134,7 @@ class MatrixOneToolSuite(DBToolSuite):
                     if on_conflict == "theirs":
                         continue  # the branch's version, already applied
                     # "ours": the upstream's version wins; a callable starts from it.
-                    self._restore_keys(_qt(tmp, table), upstream.expr(table), d_u, keys, pk, cols)
+                    self._restore_keys(_qt(new_db, table), upstream.expr(table), d_u, keys, pk, cols)
                     if want_rows:
                         conflicts.append({"table": table, "rows": self._conflict_dicts(
                             keys, d_u, d_b, up_base.expr(table), pk, cols)})
@@ -934,39 +1142,75 @@ class MatrixOneToolSuite(DBToolSuite):
                 self._fk_checks(True)
             if not upstream_moved and not self._upstream_moved(base_seq, upstream):
                 info["up_to_date"] = True
-                self._execute(f"DROP DATABASE {_quote(tmp)};")
+                self._execute_ddl(f"DROP DATABASE {_quote(new_db)};")
+                self._drop_snapshot(base_snap)
                 return info
             if conflicts:
                 info["resolved"] = "custom"
-                self._use(tmp)
+                self._use(new_db)
                 info["resolution"] = on_conflict(self._conflict_session(ref), conflicts)
                 self._use(branch_db)
             elif info["conflicts"]:
                 info["resolved"] = on_conflict
-            # Log: upstream history, then the rebase marker (the new base:
-            # the branch's own snapshot, taken after the swap, plus the
-            # upstream's), then the branch's own commits replayed on top.
-            now = time.time_ns()
-            rebase_snap = self._new_snapshot_name()
-            self._add_commit(tmp, "rebase", f"rebase onto {onto}", rebase_snap, branch_db,
-                             upstream.snap, upstream.db, seq=now)
+            # Log: upstream history (cloned), the rebase marker (the new
+            # base), then the branch's own commits replayed on top. Their
+            # snapshots were taken on the old generation, which stays
+            # readable by name after it is dropped.
             own = [r for r in reversed(self._log_rows(branch_db))
                    if r["kind"] in ("commit", "merge") and int(r["seq"]) > base_seq]
             for i, r in enumerate(own):
-                self._add_commit(tmp, r["kind"], r["message"], r["snap"], r["db"],
-                                 r["prev_snap"], r["prev_db"], commit_id=r["id"], seq=now + 1 + i)
+                self._add_commit(new_db, r["kind"], r["message"], r["snap"], r["db"],
+                                 r["prev_snap"], r["prev_db"], commit_id=r["id"], seq=now + 1 + i,
+                                 schema_json=r.get("schema_json"))
         except BaseException:
-            self._execute(f"DROP DATABASE IF EXISTS {_quote(tmp)};")
+            self._execute_ddl(f"DROP DATABASE IF EXISTS {_quote(new_db)};")
+            self._drop_snapshot(base_snap)
             raise
-        # Swap: the branch name now points at the re-forked database.
-        self._drop_branch_db(branch_db)
-        self._execute(f"DATA BRANCH CREATE DATABASE {_quote(branch_db)} FROM {_quote(tmp)};")
-        self._drop_branch_db(tmp)
+        # Swap: the branch name now points at the new generation; the old
+        # one goes once every worker can resolve the new.
+        self._register(ref.branch, new_db, gen)
         self._current_db = None
-        self._use(branch_db)
-        self._snapshot(branch_db, rebase_snap)
+        self._use(new_db)
+        self._drop_branch_db(branch_db)
+        # The rewrite has to come after the old generation is gone: until
+        # then the picked rows still read as the source's.
+        self._fk_checks(False)
+        try:
+            for table, pk, rest, keys in touches:
+                self._touch(_qt(new_db, table), pk, rest, keys)
+        finally:
+            self._fk_checks(True)
         info["schema_changes"] = schema
+        info["generation"] = gen
         return info
+
+    def _drop_snapshot(self, name: str) -> None:
+        try:
+            self._execute(f"DROP SNAPSHOT {_quote(name)};")
+        except pymysql.MySQLError:
+            pass
+
+    def _replayed_keys(self, delta: dict, src: _State, table: str, pk: list, new_cols: list) -> list:
+        """Keys the branch changed since its base: those the native delta
+        lists (minus deletions) plus every row with a value in a column
+        the branch added, which the native diff does not list."""
+        keys = {k for k, (flag, _) in delta.items() if flag != "DELETE"}
+        for col in new_cols:
+            rows = self._execute(f"SELECT {', '.join(map(_quote, pk))} FROM {src.expr(table)} "
+                                 f"WHERE {_quote(col)} IS NOT NULL") or []
+            keys.update(tuple(r) for r in rows)
+        return list(keys)
+
+    def _touch(self, dst: str, pk: list, rest: list, keys: list) -> int:
+        """Rewrite the rows (an UPDATE of a non-key column to itself, which
+        MatrixOne records as a write; a key column set to itself is not)
+        so they are writes of dst's own history."""
+        if not rest or not keys:
+            return 0
+        col = _quote(rest[0])
+        for chunk in self._chunks(keys):
+            self._execute(f"UPDATE {dst} SET {col} = {col} WHERE {self._in_keys(pk, chunk)}")
+        return len(keys)
 
     def _upstream_moved(self, base_seq: int, upstream: _State) -> bool:
         """Has the upstream any commit after the common base?"""
@@ -988,12 +1232,13 @@ class MatrixOneToolSuite(DBToolSuite):
             # already cut at the commit; make sure of it anyway.
             self._execute(f"DELETE FROM {_qt(db, COMMITS_TABLE)} WHERE seq > %s", (int(row["seq"]),))
             return
+        fp = json.loads(row["schema_json"]) if row.get("schema_json") else None
         if row["db"] == db:
-            self._undo_since(db, _State(db, row["snap"]))
+            self._undo_since(db, _State(db, row["snap"]), fp)
             self._execute(f"DELETE FROM {_qt(db, COMMITS_TABLE)} WHERE seq > %s", (int(row["seq"]),))
             return
         self._warn(("reset_sql", db), f"reset of {db} to a commit made on {row['db']}: rows restored with SQL")
-        self._restore_sql(db, _State(row["db"], row["snap"]))
+        self._restore_sql(db, _State(row["db"], row["snap"]), fp)
         self._execute(
             f"DELETE FROM {_qt(db, COMMITS_TABLE)} WHERE seq > %s "
             "AND kind NOT IN ('fork', 'rebase', 'root')", (int(row["seq"]),))
@@ -1003,27 +1248,85 @@ class MatrixOneToolSuite(DBToolSuite):
             cur.execute(f"SELECT * FROM {state.expr(table)} LIMIT 0")
             return [d[0] for d in cur.description if not str(d[0]).startswith("__mo_")]
 
-    def _undo_since(self, db: str, target: _State) -> None:
+    def _reconcile_to_fingerprint(self, db: str, fp: dict) -> list:
+        """Give db exactly the tables and columns of the fingerprint:
+        tables not in it dropped, missing ones created (empty), extra
+        columns dropped, missing or retyped columns (re)added with the
+        recorded type (the row restore that follows refills them).
+        Returns (tables (re)created, tables whose columns changed, retyped
+        columns as (table, column, type) to MODIFY once rows are back: a
+        MODIFY keeps the column's identity, so the lineage diff still
+        works and the snapshot's values are restored before the type is
+        narrowed back)."""
+        now = set(self._tables(db))
+        created, altered, retyped = [], [], []
+        for table in sorted(now - set(fp)):
+            self._execute_ddl(f"DROP TABLE {_qt(db, table)}")
+        for table in sorted(set(fp) - now):
+            spec = fp[table]
+            defs = [f"{_quote(c)} {t}" for c, t in spec["cols"].items()]
+            if spec.get("pk"):
+                defs.append(f"PRIMARY KEY ({', '.join(map(_quote, spec['pk']))})")
+            self._execute_ddl(f"CREATE TABLE {_qt(db, table)} ({', '.join(defs)})")
+            created.append(table)
+        for table in sorted(now & set(fp)):
+            spec = fp[table]
+            cols_now = {c: str(t).lower() for c, t, _, _ in self._columns(db, table)}
+            pk = set(spec.get("pk") or self._pk(db, table))
+            changed = False
+            for col in list(cols_now):
+                if col not in spec["cols"]:
+                    self._execute_ddl(f"ALTER TABLE {_qt(db, table)} DROP COLUMN {_quote(col)}")
+                    cols_now.pop(col)
+                    changed = True
+            for col, ctype in spec["cols"].items():
+                if col in cols_now and cols_now[col] != ctype and col not in pk:
+                    # MODIFY changed the column's identity, which the lineage
+                    # diff refuses: the table's rows are restored by SQL.
+                    retyped.append((table, col, ctype))
+                    changed = True
+                elif col not in cols_now:
+                    self._execute_ddl(f"ALTER TABLE {_qt(db, table)} ADD COLUMN {_quote(col)} {ctype}")
+                    changed = True
+            if changed:
+                altered.append(table)
+        return created, altered, retyped
+
+    def _undo_since(self, db: str, target: _State, fp: dict = None) -> None:
         """Make db's tables equal to its own earlier snapshot ``target``
-        by undoing what a native diff of head vs snapshot lists; tables
-        and columns created since are dropped, dropped tables recreated."""
-        here = set(self._tables(db))
-        there = {t for t in self._tables(db) if self._readable(target, t)}
-        # Tables dropped since the snapshot are not listed by _tables(db);
-        # find them through the snapshot's catalog of the commits table's
-        # siblings is not possible, so probe the known table names of the
-        # log's schema: every table readable at the snapshot but absent now.
+        by undoing what a native diff of head vs snapshot lists. The
+        schema comes first: from the commit's fingerprint when the log
+        row has one (tables and columns dropped, created, retyped), else
+        tables and columns created since are dropped."""
         self._fk_checks(False)
         try:
+            recreated, altered, retyped = [], [], []
+            if fp is not None:
+                recreated, altered, retyped = self._reconcile_to_fingerprint(db, fp)
+            here = set(self._tables(db))
+            there = {t for t in here if self._readable(target, t)}
             for table in sorted(here - there):
+                if table in recreated:
+                    continue  # its snapshot cannot be read; left empty
                 self._execute(f"DROP TABLE {_qt(db, table)}")
             for table in sorted(there):
                 cols_now = [c[0] for c in self._columns(db, table)]
                 cols_then = self._snapshot_columns(target, table)
-                for col in cols_now:
-                    if col not in cols_then:
-                        self._execute(f"ALTER TABLE {_qt(db, table)} DROP COLUMN {_quote(col)}")
+                if fp is None:
+                    for col in cols_now:
+                        if col not in cols_then:
+                            self._execute(f"ALTER TABLE {_qt(db, table)} DROP COLUMN {_quote(col)}")
                 cols = [c for c in cols_now if c in cols_then]
+                if table in recreated:
+                    # A table dropped since the commit: fill it from the snapshot.
+                    self._execute(f"INSERT INTO {_qt(db, table)} ({', '.join(map(_quote, cols))}) "
+                                  f"SELECT {self._cols('s', cols)} FROM {target.expr(table)} s")
+                    continue
+                if table in altered:
+                    # A re-added column has a new identity, which the lineage
+                    # diff refuses: restore the table's rows by SQL instead.
+                    self._restore_table_sql(db, table, target.expr(table), cols)
+                    continue
                 pk = [c for c in self._pk(db, table) if c in cols]
                 dst = _qt(db, table)
                 diff = self._diff_rows(dst, target.expr(table))
@@ -1044,12 +1347,41 @@ class MatrixOneToolSuite(DBToolSuite):
                         dst, cols, pk,
                         f"SELECT {self._cols('s', cols)} FROM {target.expr(table)} s "
                         f"WHERE {self._in_keys(pk, chunk)}"))
+            for table, col, ctype in retyped:
+                self._execute_ddl(f"ALTER TABLE {_qt(db, table)} MODIFY {_quote(col)} {ctype}")
         finally:
             self._fk_checks(True)
 
-    def _restore_sql(self, db: str, target: _State) -> None:
+    def _restore_table_sql(self, db: str, table: str, src: str, cols: list) -> None:
+        """Make one table equal to ``src`` (a time-travel expression) on
+        ``cols``: rows absent from src deleted, the rest upserted."""
+        pk = [c for c in self._pk(db, table) if c in cols]
+        dst = _qt(db, table)
+        if not pk:
+            self._execute(f"DELETE FROM {dst}")
+            self._execute(f"INSERT INTO {dst} ({', '.join(map(_quote, cols))}) "
+                          f"SELECT {self._cols('s', cols)} FROM {src} s")
+            return
+        # The source is the same table's time-travel view, which MatrixOne
+        # does not allow in a DELETE's subquery (error 1093): the keys to
+        # delete are computed here instead.
+        keys_now = {tuple(r) for r in self._execute(f"SELECT {', '.join(map(_quote, pk))} FROM {dst}") or []}
+        keys_then = {tuple(r) for r in self._execute(f"SELECT {', '.join(map(_quote, pk))} FROM {src}") or []}
+        for chunk in self._chunks(sorted(keys_now - keys_then)):
+            self._execute(f"DELETE FROM {dst} WHERE {self._in_keys(pk, chunk)}")
+        self._execute(self._upsert(dst, cols, pk, f"SELECT {self._cols('s', cols)} FROM {src} s"))
+
+    def _restore_sql(self, db: str, target: _State, fp: dict = None) -> None:
         """Make db's tables equal to target's (common columns; tables
-        missing on either side are created from / dropped)."""
+        missing on either side are created from / dropped); with a
+        fingerprint the schema is reconciled to it first."""
+        retyped = []
+        if fp is not None:
+            self._fk_checks(False)
+            try:
+                retyped = self._reconcile_to_fingerprint(db, fp)[2]
+            finally:
+                self._fk_checks(True)
         here = set(self._tables(db))
         there = {t for t in self._tables(target.db) if self._readable(target, t)}
         try:
@@ -1076,6 +1408,8 @@ class MatrixOneToolSuite(DBToolSuite):
                     f"DELETE FROM {dst} WHERE NOT EXISTS (SELECT 1 FROM {src} s "
                     f"WHERE {self._join('s', dst, pk)})")
                 self._execute(self._upsert(dst, cols, pk, f"SELECT {self._cols('s', cols)} FROM {src} s"))
+            for table, col, ctype in retyped:
+                self._execute_ddl(f"ALTER TABLE {_qt(db, table)} MODIFY {_quote(col)} {ctype}")
         finally:
             try:
                 self._execute("SET SESSION foreign_key_checks = 1")
@@ -1139,30 +1473,13 @@ class MatrixOneToolSuite(DBToolSuite):
 
     # -- delete ------------------------------------------------------------
 
-    # MatrixOne reports a catalog deadlock when several workers drop and
-    # create branch databases at once; the statement is safe to retry.
-    _ER_DEADLOCK = 20701
-    _DROP_RETRIES = 5
-
     def _drop_branch_db(self, db: str) -> None:
-        for attempt in range(self._DROP_RETRIES):
-            try:
-                self._execute(f"DATA BRANCH DELETE DATABASE {_quote(db)};")
-                return
-            except pymysql.MySQLError as e:
-                if e.args and e.args[0] == self._ER_DEADLOCK and attempt < self._DROP_RETRIES - 1:
-                    time.sleep(0.2 * (attempt + 1))
-                    continue
-                break
-        for attempt in range(self._DROP_RETRIES):
-            try:
-                self._execute(f"DROP DATABASE IF EXISTS {_quote(db)};")
-                return
-            except pymysql.MySQLError as e:
-                if e.args and e.args[0] == self._ER_DEADLOCK and attempt < self._DROP_RETRIES - 1:
-                    time.sleep(0.2 * (attempt + 1))
-                    continue
-                raise
+        try:
+            self._execute_ddl(f"DATA BRANCH DELETE DATABASE {_quote(db)};")
+            return
+        except pymysql.MySQLError:
+            pass
+        self._execute_ddl(f"DROP DATABASE IF EXISTS {_quote(db)};")
 
     def _delete_impl(self, ref: Ref) -> None:
         db = self._db_for(ref.branch)
@@ -1170,6 +1487,7 @@ class MatrixOneToolSuite(DBToolSuite):
             self._use(self._db_for(self.default_branch))
             self._current_ref = Ref(self.default_branch)
         self._drop_branch_db(db)
+        self._unregister(ref.branch)
 
     def _qualified_table(self, ref: Ref, table: str) -> str:
         if ref.commit:

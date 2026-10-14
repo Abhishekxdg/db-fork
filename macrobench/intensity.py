@@ -43,8 +43,8 @@ DATA_FIELDS = {
     "rl_env": ("step_budget",),
     "context_mgmt": ("compaction_interval",),
     "multi_agent": ("spine_updates_per_round",),
-    "dev_agent": ("dev_phase_steps", "review_phase_steps"),
-    "ops_agent": (),
+    "dev_agent": ("dev_phase_steps", "review_phase_steps", "spine_commit_every_txns"),
+    "ops_agent": ("commit_every_txns",),
     "data_agent": ("batch_rows", "steps_per_batch"),
 }
 

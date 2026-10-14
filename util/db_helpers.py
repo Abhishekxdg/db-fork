@@ -112,16 +112,7 @@ def _get_primary_key_columns(
         ORDER BY ordinal_position DESC;
     """
     pk_columns = _run_sql_query(conn, query, (table_name, table_name))
-    if not pk_columns and _is_mysql(conn):
-        escaped = table_name.replace("`", "``")
-        rows = _run_sql_query(conn, f"SHOW KEYS FROM `{escaped}`;")
-        pk = sorted(
-            ((int(r[3]), str(r[4])) for r in rows
-             if r[2] == "PRIMARY" and not str(r[4]).startswith("__mo_")),
-            reverse=True,
-        )
-        return [(name, seq) for seq, name in pk]
-    return [(col[0], col[1]) for col in pk_columns if not str(col[0]).startswith("__mo_")]
+    return [(col[0], col[1]) for col in pk_columns]
 
 
 def get_pk_column_names(
@@ -173,32 +164,19 @@ def get_pk_values(
     # dsn = conn.get_dsn_parameters()
     # uri = f"postgresql://{dsn['user']}@{dsn['host']}:{dsn['port']}/{dsn['dbname']}"
     # print(uri)
-    cols = ", ".join(pk_columns)
-    sql = f"SELECT {cols} FROM {table_name};"
+    sql = f"SELECT {', '.join(pk_columns)} FROM {table_name};"
     all_pks = _run_sql_query(conn, sql)
 
-    count_result = _run_sql_query(conn, f"SELECT COUNT(*) FROM {table_name};")
-    total_count = (
-        int(count_result[0][0])
-        if count_result and isinstance(count_result[0][0], int)
-        else len(all_pks)
-    )
-    if len(all_pks) < total_count:
-        # Doltgres sends a RowDescription per 128-row batch, causing libpq to
-        # retain only the final partial batch; paginate below 128 rows to fetch all.
-        all_pks = []
-        offset = 0
-        while offset < total_count:
-            batch = _run_sql_query(
-                conn,
-                f"SELECT {cols} FROM {table_name} ORDER BY {cols} LIMIT 100 OFFSET {offset};",
-            )
-            if not batch:
-                break
-            all_pks.extend(batch)
-            offset += len(batch)
-            if len(batch) < 100:
-                break
+    # count_sql = f"SELECT COUNT(*) FROM ({sql.rstrip(';')}) as sub;"
+    # count_result = _run_sql_query(conn, count_sql)
+    # total_count = count_result[0][0] if count_result else 0
+
+    # # The following count should be the same as the length of all_pks,
+    # # otherwise there is a bug with how the backend handles fetchall.
+    # print(
+    #     f"\t --> Total primary keys fetched: {total_count}, "
+    #     f"Loaded {len(all_pks)} primary keys."
+    # )
     return all_pks
 
 
@@ -280,7 +258,7 @@ def get_all_columns(
     if _is_mysql(conn):
         query += "AND table_schema = DATABASE()\n"
     columns = _run_sql_query(conn, query, (table_name,))
-    return [col[0] for col in columns if not str(col[0]).startswith("__mo_")]
+    return [col[0] for col in columns]
 
 def get_foreign_key_columns(
     conn: psycopg2.extensions.connection, table_name: str
@@ -326,13 +304,11 @@ def get_column_types(
         Mapping of column_name -> information_schema data_type
         (e.g. 'integer', 'character varying', 'timestamp without time zone')
     """
-    _set_search_path(conn)
+    _run_sql_query(conn, "SET search_path TO public")
     query = """
     SELECT column_name, data_type
     FROM information_schema.columns
     WHERE table_name = %s
     """
-    if _is_mysql(conn):
-        query += "AND table_schema = DATABASE()\n"
     rows = _run_sql_query(conn, query, (table_name,))
-    return {r[0]: r[1] for r in rows if not str(r[0]).startswith("__mo_")}
+    return {r[0]: r[1] for r in rows}
