@@ -352,7 +352,9 @@ code { font: .92em/1.5 var(--mono); }
 .heatmap-panel .scroll { flex: 1; }
 .heatmap { height: 100%; }
 .panel { min-width: 0; margin: 0; padding: 20px 22px; border-radius: var(--radius-card); }
+.panel h2 { margin: 0 0 8px; font-size: 21px; font-weight: 600; letter-spacing: -.5px; }
 .panel h3 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -.3px; }
+.arch-grid { display: grid; gap: 18px; margin-top: 24px; }
 .panel-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; }
 .panel-note { margin: 6px 0 12px; color: var(--muted); font-size: 12.5px; line-height: 1.55; }
 .heat-key { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }

@@ -513,7 +513,8 @@ assert.deepEqual(classNodes(macroEl('macro-breakdowns'), 'breakdown-title').map(
         for (const m of code.matchAll(literal)) report(src, code, m.index, m[0], '');
     }
     const wizard = fs.readFileSync(`${__dirname}/run.html`, 'utf8');
-    for (const [file, markup] of [['index.html', html], ['run.html', wizard]]) {
+    const arch = fs.readFileSync(`${__dirname}/architecture.html`, 'utf8');
+    for (const [file, markup] of [['index.html', html], ['run.html', wizard], ['architecture.html', arch]]) {
         assert.equal(markup.match(/<meta name="theme-color" content="([^"]+)">/)?.[1], computed('--canvas'), `${file}: theme-color is the --canvas token's value`);
         const rest = markup.replace(/<meta name="theme-color"[^>]*>|<link rel="icon"[^>]*>/g, m => m.replace(/[^\n]/g, ' '));
         for (const m of rest.matchAll(literal)) report(file, rest, m.index, m[0], '');
