@@ -1,7 +1,6 @@
 """Replay the real leaderboard workload without starting a database server."""
 
 import copy
-import itertools
 import json
 import random
 import tempfile
@@ -14,7 +13,6 @@ from dblib.result_collector import ResultCollector
 from leaderboard.run import BOARD, batch_total, build_chain, run_row, task_config
 from leaderboard.test_leaderboard import ITEM_DDL
 from microbench import task2_pb2 as tp
-from microbench.datagen import DynamicDataGenerator
 from microbench.runner2 import BackendInfo, SharedBranchManager, WorkerContext, register_all_operations
 
 
@@ -133,14 +131,8 @@ class Workload(unittest.TestCase):
         return next(i for i, row in enumerate(self.suite["rows"]) if row["op"] == operation)
 
     def test_full_suite_fills_every_cell_and_repeats_its_targets(self):
-        keys = itertools.count(1001)
-        generate = DynamicDataGenerator.generate_value
-        def collision_free(generator, column):
-            return next(keys) if column == "i_id" else generate(generator, column)
-
-        with mock.patch.object(DynamicDataGenerator, "generate_value", collision_free):
-            result, calls = self.replay()
-            _, repeated = self.replay()
+        result, calls = self.replay()
+        _, repeated = self.replay()
         self.assertEqual([len(row) for row in result], [3] * 8)
         self.assertTrue(all(cell is not None for row in result for cell in row), result)
         self.assertEqual(targets(calls), targets(repeated))

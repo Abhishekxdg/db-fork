@@ -173,19 +173,32 @@ def get_pk_values(
     # dsn = conn.get_dsn_parameters()
     # uri = f"postgresql://{dsn['user']}@{dsn['host']}:{dsn['port']}/{dsn['dbname']}"
     # print(uri)
-    sql = f"SELECT {', '.join(pk_columns)} FROM {table_name};"
+    cols = ", ".join(pk_columns)
+    sql = f"SELECT {cols} FROM {table_name};"
     all_pks = _run_sql_query(conn, sql)
 
-    # count_sql = f"SELECT COUNT(*) FROM ({sql.rstrip(';')}) as sub;"
-    # count_result = _run_sql_query(conn, count_sql)
-    # total_count = count_result[0][0] if count_result else 0
-
-    # # The following count should be the same as the length of all_pks,
-    # # otherwise there is a bug with how the backend handles fetchall.
-    # print(
-    #     f"\t --> Total primary keys fetched: {total_count}, "
-    #     f"Loaded {len(all_pks)} primary keys."
-    # )
+    count_result = _run_sql_query(conn, f"SELECT COUNT(*) FROM {table_name};")
+    total_count = (
+        int(count_result[0][0])
+        if count_result and isinstance(count_result[0][0], int)
+        else len(all_pks)
+    )
+    if len(all_pks) < total_count:
+        # Doltgres sends a RowDescription per 128-row batch, causing libpq to
+        # retain only the final partial batch; paginate below 128 rows to fetch all.
+        all_pks = []
+        offset = 0
+        while offset < total_count:
+            batch = _run_sql_query(
+                conn,
+                f"SELECT {cols} FROM {table_name} ORDER BY {cols} LIMIT 100 OFFSET {offset};",
+            )
+            if not batch:
+                break
+            all_pks.extend(batch)
+            offset += len(batch)
+            if len(batch) < 100:
+                break
     return all_pks
 
 

@@ -977,6 +977,7 @@ class WorkerContext:
         self._table_datagen: Optional[DynamicDataGenerator] = None
         self._pk_columns: List[str] = []
         self._existing_pks: List[Tuple] = []
+        self._known_pks: set[Tuple] = set()
         self._modified_keys: Dict[str, List[Tuple]] = {}
 
         # Index tracking for DDL operations
@@ -1101,6 +1102,7 @@ class WorkerContext:
         # Cache PKs
         if not self._existing_pks and existing_pks:
             self._existing_pks = existing_pks
+            self._known_pks.update(existing_pks)
 
         if not existing_pks:
             return None
@@ -1119,15 +1121,29 @@ class WorkerContext:
             self._table_datagen = DynamicDataGenerator(table_schema)
         return self._table_datagen.generate_row()
 
+    def is_known_pk(self, table_name: str, key: Tuple) -> bool:
+        """Check whether a primary key tuple is already known to exist on this branch."""
+        if not self._existing_pks:
+            pk_columns = self.get_pk_columns(table_name)
+            existing_pks = dbh.get_pk_values(
+                self.db_tools.get_current_connection(), table_name, pk_columns
+            )
+            if existing_pks:
+                self._existing_pks = existing_pks
+                self._known_pks.update(existing_pks)
+        return key in self._known_pks
+
     def track_modified_key(self, key: Tuple) -> None:
         """Track a modified primary key."""
         cur_branch_id = self.current_branch
+        self._known_pks.add(key)
         if key not in self._modified_keys.get(cur_branch_id, []):
             self._modified_keys.setdefault(cur_branch_id, []).append(key)
 
     def untrack_modified_key(self, key: Tuple) -> None:
         """Remove a key from modified tracking (e.g., after delete)."""
         cur_branch_id = self.current_branch
+        self._known_pks.discard(key)
         if cur_branch_id in self._modified_keys:
             if key in self._modified_keys[cur_branch_id]:
                 self._modified_keys[cur_branch_id].remove(key)
@@ -1164,6 +1180,7 @@ class WorkerContext:
     def clear_pk_cache(self) -> None:
         """Clear cached primary keys (e.g., after branch switch)."""
         self._existing_pks = []
+        self._known_pks = set()
 
     def get_existing_key_count(self, table_name: str) -> int:
         """Number of existing primary keys in the table.
@@ -1311,12 +1328,15 @@ class WorkerContext:
         insert_sql = f"INSERT INTO {table_name} ({', '.join(col_names)}) VALUES ({placeholders});"
 
         for _ in range(5):
-            row_data = self.generate_row(table_name)
-            pk_tuple = tuple(row_data[pk] for pk in pk_columns)
+            for _ in range(100):
+                row_data = self.generate_row(table_name)
+                pk_tuple = tuple(row_data[pk] for pk in pk_columns)
+                if not self.is_known_pk(table_name, pk_tuple):
+                    break
 
             try:
                 self.run_sql(insert_sql, row_data, timed=False)
-                self._modified_keys.setdefault(cur_branch_id, []).append(pk_tuple)
+                self.track_modified_key(pk_tuple)
                 return
             except Exception:
                 continue
