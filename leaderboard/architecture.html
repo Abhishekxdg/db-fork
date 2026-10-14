@@ -2,130 +2,153 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="theme-color" content="#f6f7f9">
-<title>BranchBench — Benchmark &amp; Submission Architecture</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#eceff1">
+<meta name="description" content="Technical architecture of BranchBench for local developer benchmarking and official cloud VM leaderboard runs.">
+<title>Technical architecture · BranchBench</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='10' fill='%23428c80'/%3E%3Cpath d='M13 10v20m0-10h7q7 0 7-7v-3' fill='none' stroke='white' stroke-width='3'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-<header class="site-header">
-    <div class="shell header-bar">
-        <a class="brand" href="index.html">
-            <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M5 3v14M5 8c4 0 5 3 10 3M5 13c4 0 5-5 10-5"/><circle cx="5" cy="3" r="2"/><circle cx="5" cy="17" r="2"/><circle cx="15" cy="8" r="2"/><circle cx="15" cy="11" r="2"/></svg></span>
-            <span class="brand-name">BranchBench</span>
-        </a>
-        <nav class="site-nav" aria-label="Page sections">
-            <a href="index.html#agent-workflows">Leaderboard</a>
-            <a href="#what-we-test">What we test</a>
-            <a href="#submission-flow">DB submission (1 DB = 1 VM)</a>
-            <a href="#prod-vs-local">Official vs. Local Dev</a>
-        </nav>
-        <div class="header-actions"><a class="button" href="index.html">Back to leaderboard</a><a class="button button-primary" href="run.html">Run a benchmark</a></div>
-    </div>
+<a class="skip-link" href="#main-content">Skip to content</a>
+<header class="site-header shell">
+    <a class="brand" href="index.html" aria-label="BranchBench home">
+        <svg class="brand-mark" width="38" height="38" viewBox="0 0 38 38" aria-hidden="true"><rect width="38" height="38" rx="10" fill="currentColor"/><path d="M12 9v20m0-10h7q7 0 7-7V9"/><g><circle cx="12" cy="9" r="3"/><circle cx="12" cy="29" r="3"/><circle cx="26" cy="9" r="3"/></g></svg>
+        <span class="brand-name">BranchBench<span class="brand-period">.</span></span>
+    </a>
+    <nav class="header-nav" aria-label="Main navigation">
+        <a class="nav-link" href="index.html#agent-workflows">Leaderboard</a>
+        <a class="nav-link" href="#what-we-test">Suites</a>
+        <a class="nav-link" href="#local-architecture">Local setup</a>
+        <a class="nav-link" href="#submission-flow">Cloud VM setup</a>
+        <a class="nav-link" href="README.md">DB developer guide <span aria-hidden="true">↗</span></a>
+    </nav>
+    <div class="header-actions"><a class="button" href="index.html">Back to leaderboard</a><a class="button button-primary" href="run.html">Run a benchmark</a></div>
 </header>
 
-<main class="shell">
-    <section class="board-section">
-        <div class="page-header">
-            <div class="board-title">
-                <h1>Benchmark &amp; Submission Architecture</h1>
-                <p class="page-subtitle">How BranchBench ranks branching databases fairly across self-hosted engines and managed cloud services.</p>
-            </div>
+<main class="shell" id="main-content">
+    <section aria-labelledby="arch-title">
+        <h1 class="page-title" id="arch-title" tabindex="-1">Technical Architecture: Local &amp; Cloud Setup</h1>
+        <p class="section-description">How BranchBench isolates benchmark execution, validates reproducibility, and assembles both local developer previews (<code>local</code> phase) and official cloud VM rankings (<code>prod</code> phase).</p>
+
+        <div class="arch-grid">
+            <section class="panel" id="what-we-test">
+                <h2>1. Architectural Boundary &amp; Benchmark Suites</h2>
+                <p class="panel-note">The <code>leaderboard/</code> package is a self-contained harness and static site builder layered over <code>dblib/</code>, <code>microbench/</code>, and <code>macrobench/</code> without modifying upstream files.</p>
+                <dl class="rule-list">
+                    <div>
+                        <dt>Open-Closed Boundary</dt>
+                        <dd>All runner orchestration, system lifecycle hooks, connector shims, and UI assets live strictly inside <code>leaderboard/</code>. Automated boundary tests verify that zero files outside <code>leaderboard/</code> differ from <code>origin/main</code>.</dd>
+                    </div>
+                    <div>
+                        <dt>Macrobench (<code>Agent workflows</code>)</dt>
+                        <dd>Six end-to-end stateful AI agent scenarios (<code>rl_env</code>, <code>context_mgmt</code>, <code>multi_agent</code>, <code>dev_agent</code>, <code>ops_agent</code>, <code>data_agent</code>) exercising nine Git-like branching verbs (<code>branch</code>, <code>commit</code>, <code>diff</code>, <code>log</code>, <code>merge</code>, <code>rebase</code>, <code>revert</code>, <code>reset</code>, <code>delete</code>) alongside concurrent SQL reads and writes. Ranked by one workflow's completion time at a time among <code>verified</code> attempts.</dd>
+                    </div>
+                    <div>
+                        <dt>Microbench (<code>Operations</code>)</dt>
+                        <dd>Eight isolated operations (<code>time_to_first_query</code>, <code>branch_create</code>, <code>branch_connect</code>, <code>read</code>, <code>range_read</code>, <code>insert</code>, <code>update</code>, <code>range_update</code>) plus initial <code>load_time</code> and <code>provision_time</code> on a deterministic CH-benCHmark seed (<code>leaderboard/suite.json</code>). Ranked by shifted geometric mean of ratios against the fastest comparable system.</dd>
+                    </div>
+                </dl>
+            </section>
+
+            <section class="panel" id="local-architecture">
+                <h2>2. Local Developer Setup (<code>LEADERBOARD_PHASE=local</code>)</h2>
+                <p class="panel-note">Designed for database developers building and verifying a connector on their own workstation before opening a pull request.</p>
+                <dl class="rule-list">
+                    <div>
+                        <dt>CLI &amp; HTTP Runner</dt>
+                        <dd><code>python -m leaderboard.run &lt;system&gt; --machine &lt;id&gt;</code> runs the microbench suite; <code>python -m leaderboard.run_macro &lt;system&gt; --preset {mini|full} --machine &lt;id&gt;</code> runs all six agent workflows in isolated subprocesses. <code>python -m leaderboard.serve --phase local</code> serves the site on port 8000 and exposes <code>POST /api/run</code> on loopback (<code>127.0.0.1</code> / <code>::1</code>), rejecting non-loopback or cross-origin requests with HTTP <code>403</code>.</dd>
+                    </div>
+                    <div>
+                        <dt>Single-Run Lock (<code>run.lock</code>)</dt>
+                        <dd>Both runners acquire an exclusive non-blocking file lock at <code>leaderboard/.runs/run.lock</code>. Only one database benchmark can execute at a time on a machine so engines never contend for CPU cores, memory bandwidth, disk I/O, or local ports.</dd>
+                    </div>
+                    <div>
+                        <dt>Crash Recovery (<code>active.json</code>)</dt>
+                        <dd>Before starting a self-hosted server, the runner records the active system in <code>leaderboard/.runs/active.json</code>. If a process is killed (such as <code>SIGKILL</code> or power loss), the next invocation reads <code>active.json</code> and executes that system's <code>stop</code> script before starting a new run.</dd>
+                    </div>
+                    <div>
+                        <dt>Local Site Assembly</dt>
+                        <dd><code>python -m leaderboard.site --phase local</code> scans <code>leaderboard/*/results/</code> and <code>leaderboard/*/macro/</code>, validates every record against <code>leaderboard/suite.json</code>, pairs local runs with <code>leaderboard.mock</code> reference rows, and atomically swaps a staging directory into <code>leaderboard/.site/local/</code>.</dd>
+                    </div>
+                </dl>
+            </section>
+
+            <section class="panel" id="submission-flow">
+                <h2>3. Cloud Official Setup (<code>LEADERBOARD_PHASE=prod</code> &amp; <code>1 DB = 1 VM</code>)</h2>
+                <p class="panel-note">Official rankings never ingest timing JSON files from developer laptops. Contributors submit a self-contained adapter directory and CI executes the benchmark on dedicated cloud hardware.</p>
+                <dl class="rule-list">
+                    <div>
+                        <dt>Plugin Submission (<code>leaderboard/&lt;system&gt;/</code>)</dt>
+                        <dd>A database developer submits a pull request adding <code>leaderboard/&lt;system&gt;/</code> with <code>system.json</code>, executable lifecycle hooks (<code>install</code>, <code>start</code>, <code>check</code>, <code>stop</code>), and <code>connector.py</code> exporting <code>CONNECTOR</code>. See the <a class="text-link" href="README.md">Database Developer Guide</a> for the full contract.</dd>
+                    </div>
+                    <div>
+                        <dt>Dedicated Ephemeral VM per System</dt>
+                        <dd>For self-hosted engines (<code>"hosted": "no"</code>), CI provisions one dedicated ephemeral cloud VM per database system in parallel (standard reference tier, such as 16 vCPUs, 32 GiB RAM, NVMe SSD). Each engine receives 100% of its VM's CPU, memory, and disk I/O with zero noisy-neighbor interference or leftover page cache.</dd>
+                    </div>
+                    <div>
+                        <dt>Managed Cloud Services</dt>
+                        <dd>For hosted services (<code>"hosted": "yes"</code>), the runner executes from a cloud client VM pinned to the same region, requires a client location flag, and records the measured SQL round-trip latency (<code>rtt_ms</code>) alongside the service region.</dd>
+                    </div>
+                    <div>
+                        <dt>Unified Board &amp; Hardware Badges</dt>
+                        <dd>All systems render in one unified ranking table per suite. Every row displays a <strong>Hosting badge</strong> (<code>Self-hosted</code> vs. <code>Managed service</code>) and a <strong>Hardware / Spec badge</strong> (such as <code>16 CPUs · 32 GiB</code> or cloud region), paired with top-bar <strong>Hosting</strong> and <strong>Machine</strong> filters.</dd>
+                    </div>
+                    <div>
+                        <dt>Publication Manifest (<code>publish.json</code>)</dt>
+                        <dd><code>python -m leaderboard.site</code> (default <code>prod</code> phase) publishes only records explicitly listed in <code>leaderboard/publish.json</code> that pass full validation (clean git commit, matching suite/dataset SHA-256, <code>full</code> macro preset, and verified database cleanup). The production output in <code>leaderboard/.site/prod/</code> omits <code>run.html</code>, <code>README.md</code>, <code>architecture.html</code>, and all mock or quick runs.</dd>
+                    </div>
+                </dl>
+            </section>
+
+            <section class="panel" id="prod-vs-local">
+                <h2>4. Official Cloud (<code>prod</code>) vs. Local Dev (<code>local</code>)</h2>
+                <p class="panel-note">Both phases execute the exact same runner, validator, and UI scripts; the build phase controls only record selection and developer affordances.</p>
+                <div class="scroll">
+                    <table class="detail-table" aria-label="Comparison between Official Cloud Architecture and Local Dev Architecture">
+                        <thead>
+                            <tr>
+                                <th scope="col">Dimension</th>
+                                <th scope="col">Official Cloud Leaderboard (<code>prod</code>)</th>
+                                <th scope="col">Local Developer Mode (<code>local</code>)</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <th scope="row">Build Command</th>
+                                <td><code>python -m leaderboard.site</code> (default is <code>prod</code>)</td>
+                                <td><code>python -m leaderboard.site --phase local</code></td>
+                            </tr>
+                            <tr>
+                                <th scope="row">Output Directory</th>
+                                <td><code>leaderboard/.site/prod/</code></td>
+                                <td><code>leaderboard/.site/local/</code></td>
+                            </tr>
+                            <tr>
+                                <th scope="row">Execution Hardware</th>
+                                <td><strong>1 Self-Hosted DB = 1 Dedicated Cloud VM</strong> in CI.</td>
+                                <td>Developer workstation running 1 database at a time under <code>run.lock</code>.</td>
+                            </tr>
+                            <tr>
+                                <th scope="row">Server Lifecycle</th>
+                                <td>Fresh VM executes <code>leaderboard/&lt;system&gt;/{install,start,check,stop}</code> and terminates.</td>
+                                <td>Local runner executes <code>leaderboard/&lt;system&gt;/{install,start,check,stop}</code> with <code>active.json</code> crash recovery.</td>
+                            </tr>
+                            <tr>
+                                <th scope="row">Record Selection</th>
+                                <td>Allowlisted in <code>leaderboard/publish.json</code>; requires clean git tree and <code>full</code> macro preset.</td>
+                                <td>All validated local runs in <code>results/</code> and <code>macro/</code> (including <code>mini</code> preset) plus <code>leaderboard.mock</code> rows.</td>
+                            </tr>
+                            <tr>
+                                <th scope="row">Developer Tools</th>
+                                <td>Read-only static bundle (no wizard, no <code>/api/run</code>, no developer docs).</td>
+                                <td>Includes <code>run.html</code> wizard, <code>architecture.html</code>, <code>README.md</code>, and loopback <code>POST /api/run</code>.</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
         </div>
-
-        <section class="panel" id="what-we-test">
-            <h2>1. What We Measure</h2>
-            <p class="panel-note">BranchBench evaluates databases that support Git-like branching, copy-on-write forks, and point-in-time recovery for AI agent workloads.</p>
-            <dl class="rule-list">
-                <div>
-                    <dt>Macrobench (<code>Agent workflows</code>)</dt>
-                    <dd>Six end-to-end agent scenarios (<code>S1 RL environment</code>, <code>S2 Context management</code>, <code>S3 Multi-agent</code>, <code>S4 Dev agent</code>, <code>S5 Ops agent</code>, <code>S6 Data agent</code>) exercising nine branching verbs (<code>branch</code>, <code>commit</code>, <code>diff</code>, <code>log</code>, <code>merge</code>, <code>rebase</code>, <code>revert</code>, <code>reset</code>, <code>delete</code>) alongside concurrent SQL reads and writes.</dd>
-                </div>
-                <div>
-                    <dt>Microbench (<code>Operations</code>)</dt>
-                    <dd>Isolated primitive latencies on a seeded CH-benCHmark dataset: <strong>Time to first query</strong> on a new branch, branch creation &amp; connection chains, point/range reads &amp; writes, and initial data load.</dd>
-                </div>
-            </dl>
-        </section>
-
-        <section class="panel" id="fairness">
-            <h2>2. Hardware Fairness &amp; Isolation</h2>
-            <p class="panel-note">Databases range from single-binary engines (Dolt, Postgres) to distributed clusters (TiDB, MatrixOne, SeekDB) and cloud serverless services (Neon). BranchBench uses a unified table with explicit hardware attribution:</p>
-            <dl class="rule-list">
-                <div>
-                    <dt>Unified Table + Row Badges</dt>
-                    <dd>All systems appear in one unified table per suite. Every row displays a <strong>Hosting badge</strong> (<code>Self-hosted</code> vs. <code>Managed service</code>) and a <strong>Hardware / Spec badge</strong> (e.g. <code>16 CPUs · 32 GiB</code> or cloud region <code>aws-us-east-1</code>).</dd>
-                </div>
-                <div>
-                    <dt>Standard Reference VM Default</dt>
-                    <dd>Official self-hosted runs default to one standard cloud VM tier (e.g. AWS <code>c6i.4xlarge</code>: 16 vCPUs, 32 GiB RAM, NVMe SSD). If a distributed engine requires a larger VM tier to boot, its badge and the top-bar <strong>Machine</strong> filter make the hardware difference visible immediately.</dd>
-                </div>
-            </dl>
-        </section>
-
-        <section class="panel" id="submission-flow">
-            <h2>3. How Database Developers Submit a System (<code>1 Self-Hosted DB = 1 VM</code>)</h2>
-            <p class="panel-note">Contributors submit code and lifecycle hooks — never timing JSON files from their own laptops.</p>
-            <dl class="rule-list">
-                <div>
-                    <dt>Step 1 — Self-Contained Plugin Folder (<code>leaderboard/&lt;system&gt;/</code>)</dt>
-                    <dd>Add a self-contained directory inside <code>leaderboard/&lt;system&gt;/</code> without modifying core files outside <code>leaderboard/</code>:
-                        <code>system.json</code> (metadata, hosting mode, capability tags),
-                        <code>connector.py</code> (exporting <code>CONNECTOR</code> subclassing <code>leaderboard.connector.Connector</code>), and executable lifecycle scripts (<code>install</code>, <code>start</code>, <code>check</code>, <code>stop</code>) for self-hosted servers.</dd>
-                </div>
-                <div>
-                    <dt>Step 2 — Ephemeral VM per System</dt>
-                    <dd>CI launches <strong>1 dedicated ephemeral cloud VM per self-hosted system</strong> in parallel. Each database gets 100% of its VM's CPU, RAM, and disk I/O with zero noisy-neighbor interference or leftover OS page cache from other engines.</dd>
-                </div>
-                <div>
-                    <dt>Step 3 — Validate &amp; Publish</dt>
-                    <dd>Each VM executes the system's lifecycle hooks via <code>python -m leaderboard.run &lt;system&gt; --machine &lt;vm&gt;</code> and <code>python -m leaderboard.run_macro &lt;system&gt; --preset full --machine &lt;vm&gt;</code>, verifies all correctness invariants and cleanup checks, and records the validated result path in <code>leaderboard/publish.json</code>.</dd>
-                </div>
-            </dl>
-        </section>
-
-        <section class="panel" id="prod-vs-local">
-            <h2>4. Official Leaderboard (<code>prod</code>) vs. Local Dev Architecture (<code>local</code>)</h2>
-            <p class="panel-note">The same codebase powers both the public leaderboard and local developer benchmarking, separated by build phase:</p>
-            <div class="table-scroll">
-                <table class="detail-table" aria-label="Comparison between Official Prod Architecture and Local Dev Architecture">
-                    <thead>
-                        <tr>
-                            <th scope="col">Dimension</th>
-                            <th scope="col">Official Public Leaderboard (<code>--phase prod</code>)</th>
-                            <th scope="col">Local Developer Mode (<code>--phase local</code>)</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <tr>
-                            <th scope="row">Primary Goal</th>
-                            <td>Universal, apples-to-apples public comparison across database systems.</td>
-                            <td>Fast connector development, local hardware testing, and debugging via <code>run.html</code>.</td>
-                        </tr>
-                        <tr>
-                            <th scope="row">Execution Environment</th>
-                            <td><strong>1 System = 1 Ephemeral Cloud VM</strong> (dedicated CPU/RAM/NVMe per database in CI).</td>
-                            <td>Developer's own workstation/laptop (e.g. <code>apple-m5-32gb</code>) running 1 database at a time.</td>
-                        </tr>
-                        <tr>
-                            <th scope="row">Database Lifecycle</th>
-                            <td>Fresh VM runs <code>leaderboard/&lt;system&gt;/{install,start,check,stop}</code> from scratch, then destroys the VM.</td>
-                            <td><code>leaderboard.run</code> invokes <code>leaderboard/&lt;system&gt;/{install,start,check,stop}</code> locally around the benchmark run.</td>
-                        </tr>
-                        <tr>
-                            <th scope="row">Data Source Gate</th>
-                            <td>Strictly allowlisted by <code>leaderboard/publish.json</code>; requires clean git commit &amp; <code>full</code> preset.</td>
-                            <td>Auto-discovers all validated local runs in <code>leaderboard/*/results/</code> and <code>leaderboard/*/macro/</code>.</td>
-                        </tr>
-                        <tr>
-                            <th scope="row">Interactive Runner UI</th>
-                            <td>Static read-only site (<code>run.html</code> and <code>/api/run</code> omitted).</td>
-                            <td>Includes <code>run.html</code> wizard + live <code>leaderboard.serve</code> HTTP runner (<code>/api/run</code>, live logs).</td>
-                        </tr>
-                    </tbody>
-                </table>
-            </div>
-        </section>
     </section>
 </main>
 <footer class="site-footer shell"><span>BranchBench <span aria-hidden="true">·</span> Open benchmarks, every attempt published.</span><a href="index.html">Back to leaderboard</a></footer>

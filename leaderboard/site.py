@@ -41,7 +41,7 @@ PHASES = ("prod", "local")
 SITE = BOARD / ".site"
 # The page script, in load order: plain scripts share one global scope and, unlike ES modules, still run from a file:// preview.
 SCRIPTS = tuple(f"js/{name}.js" for name in ("dom", "details", "scenes", "micro", "macro", "app"))
-PAGES = {"prod": ("index.html", "styles.css", *SCRIPTS), "local": ("index.html", "run.html", "styles.css", "README.md", *SCRIPTS)}
+PAGES = {"prod": ("index.html", "styles.css", *SCRIPTS), "local": ("index.html", "run.html", "architecture.html", "styles.css", "README.md", *SCRIPTS)}
 # The six agent-workflow process maps, rendered from workflow-diagrams/source.html, which itself is a build input and is never published.
 WORKFLOW_DIAGRAMS = tuple(f"workflow-diagrams/{key}.png" for key in ("rl_env", "context_mgmt", "multi_agent", "dev_agent", "ops_agent", "data_agent"))
 MICRO_RE = re.compile(r"[a-z0-9_]+/results/\d{8}/" + MACHINE_RE.pattern + r"\.json")
