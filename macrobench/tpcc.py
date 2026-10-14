@@ -351,7 +351,9 @@ class SpineLoad:
         self._threads = []
         self.counts = {}
         self.failures = 0
+        self.total = 0                      # transactions completed (ok or not)
         self._lock = threading.Lock()
+        self._total_cond = threading.Condition(self._lock)
 
     def start(self):
         for i in range(self.clients):
@@ -375,6 +377,19 @@ class SpineLoad:
         """Context manager: no spine transaction runs inside the block."""
         return self.quiescer.pause()
 
+    def wait_for_total(self, target: int, stop=None, poll: float = 0.5) -> bool:
+        """Block until ``total`` transactions have completed. Returns False
+        if the load stopped (all clients exited, ``stop()`` called, or
+        ``stop`` event set) before reaching ``target``."""
+        with self._total_cond:
+            while self.total < target:
+                if self._stop.is_set() or (stop is not None and stop.is_set()):
+                    return False
+                if not self.running:
+                    return False
+                self._total_cond.wait(poll)
+            return True
+
     def _run(self, index: int):
         import dblib.result_collector as rc
         rc.set_current_thread_id(1000 + index)
@@ -395,6 +410,8 @@ class SpineLoad:
                 done += 1
                 with self._lock:
                     self.counts[name] = self.counts.get(name, 0) + 1
+                    self.total += 1
+                    self._total_cond.notify_all()
                     if not res.ok:
                         self.failures += 1
                         if self.on_error and self.failures <= 3:

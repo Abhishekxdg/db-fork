@@ -869,15 +869,15 @@ class BauplanToolSuite(DBToolSuite):
     SUPPORTS_MULTI_REF_EXEC = False
     IMPLEMENTATION = {
         "branch": "native",
-        "commit": "composed",
-        "log": "composed",
+        "commit": "native",
+        "log": "native",
         "diff": "simulated",
         "merge": "native",
-        "rebase": "composed",
+        "rebase": "native",
         "revert": "simulated",
-        "reset": "composed",
+        "reset": "native",
         "delete": "native",
-        "commit_refs": "composed",
+        "commit_refs": "native",
     }
     IMPLEMENTATION_NOTES = {
         "branch": "create_branch",

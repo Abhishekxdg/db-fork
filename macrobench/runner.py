@@ -36,6 +36,7 @@ from macrobench.scenarios import (  # noqa: F401 (registers the scenarios)
     create_scenario,
 )
 from macrobench.tpcc import SpineLoad
+from dblib.db_api import native_only
 from microbench.runner2 import (
     BackendManager,
     BackendSetup,
@@ -168,7 +169,7 @@ def _capabilities_for(backend) -> dict:
 
 
 def _implementation_for(backend) -> dict:
-    """How the backend realises each verb (native/composed/simulated)."""
+    """How the backend realises each verb (native/simulated; unsupported in native-only mode)."""
     from dblib.dolt import DoltToolSuite
     from dblib.dolt_mysql import DoltMySQLToolSuite
     from dblib.seekdb import SeekDBToolSuite
@@ -478,6 +479,7 @@ def main(argv=None):
             "setup": seed_stats,
             "capabilities": _capabilities_for(config.backend),
             "implementation": _implementation_for(config.backend),
+            "native_only": native_only(),
             "invariants": inv,
             "metrics": ctx.metrics,
         }

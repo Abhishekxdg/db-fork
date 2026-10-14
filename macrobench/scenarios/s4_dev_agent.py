@@ -1,8 +1,8 @@
 """S4: Development agent.
 
-The spine is production: TPC-C traffic from the spine load, periodic
-checkpoints, and a schema migration from the catalog every
-``spine_migration_interval`` dev steps. Dev branches are created from the
+The spine is production: TPC-C traffic from the spine load, a checkpoint
+commit every ``spine_commit_every_txns`` spine transactions, and a schema
+migration from the catalog every ``spine_migration_interval`` dev steps. Dev branches are created from the
 spine (``concurrent_branches`` alive at once, ``dev_branches`` in total).
 Each implements the loyalty feature: loyalty_tier and loyalty_event tables,
 customer.c_tier, and a chunked backfill of customer rows (a share
@@ -46,7 +46,8 @@ from macrobench.datagen.ch import DISTRICTS_PER_WAREHOUSE
 
 SPINE_SENTINEL_BASE = 100_000
 REVIEW_IDLE_SEC = 0.05
-SPINE_COMMIT_PERIOD_SEC = 2.0
+DEFAULT_SPINE_COMMIT_EVERY_TXNS = 200
+SPINE_COMMIT_PERIOD_SEC = 2.0     # checkpoint period without a spine load
 
 # Spine migration catalog M1-M5: (name, target table, ddl(k)).
 MIGRATIONS = [
@@ -115,6 +116,12 @@ class DevAgentScenario(Scenario):
         rng = ctx.worker_rng(800)
         last_commit = time.time()
         next_migration_at = p.spine_migration_interval or 0
+        every = p.spine_commit_every_txns or DEFAULT_SPINE_COMMIT_EVERY_TXNS
+        load = self.spine_load
+
+        def txns():
+            return load.total if load is not None else 0
+        next_commit_at = txns() + every
         try:
             while not done.is_set():
                 with self._counter_lock:
@@ -123,9 +130,12 @@ class DevAgentScenario(Scenario):
                     self._migrate(suite, rng)
                     next_migration_at += p.spine_migration_interval
                     last_commit = time.time()
-                elif time.time() - last_commit >= SPINE_COMMIT_PERIOD_SEC:
+                    next_commit_at = txns() + every
+                elif (txns() >= next_commit_at if load is not None
+                      else time.time() - last_commit >= SPINE_COMMIT_PERIOD_SEC):
                     self._spine_commit(suite, "production checkpoint")
                     last_commit = time.time()
+                    next_commit_at = txns() + every
                 done.wait(0.2)
         finally:
             ctx.close_suite(suite)

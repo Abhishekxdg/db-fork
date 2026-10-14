@@ -153,6 +153,44 @@ def test_exec_multi_unsupported(suite):
     assert not suite.result_collector.workflow_supported
 
 
+def test_native_only_mode_marks_simulated_verbs_unsupported(suite, monkeypatch):
+    import dblib.db_api as api
+    FakeSuite.IMPLEMENTATION = {"diff": "simulated", "commit_refs": "simulated"}
+    try:
+        assert FakeSuite.implementation()["diff"] == "simulated"
+        monkeypatch.setattr(api, "NATIVE_ONLY", True)
+        impl = FakeSuite.implementation()
+        assert impl["diff"] == "unsupported" and impl["commit_refs"] == "unsupported"
+        assert impl["commit"] == "native"
+        suite.commit("main", "c1")
+        r = suite.diff("main", "main")
+        assert r.unsupported and "native-only" in r.error
+        assert rows(suite, rslt.OpType.DIFF)[0].status == rslt.OpStatus.UNSUPPORTED
+        assert suite.commit("main", "c2").ok          # native verbs still run
+        # A simulated commit ref falls back to the branch head, flagged.
+        res = suite.exec(["SELECT 1"], refs=["main@deadbeef"])[0]
+        assert res.ok and rows(suite, rslt.OpType.EXEC)[0].commit_ref_fallback
+    finally:
+        FakeSuite.IMPLEMENTATION = {}
+
+
+def test_schema_diff_compare_and_fake_catalog(suite):
+    a = {"t": {"id": "int", "v": "text"}, "gone": {"id": "int"}}
+    b = {"t": {"id": "int", "v": "varchar(8)", "w": "int"}, "new": {"id": "int"}}
+    d = FakeSuite._compare_schemas(a, b)
+    assert d["tables_added"] == ["new"] and d["tables_dropped"] == ["gone"]
+    assert d["columns_added"] == {"t": ["w"]} and d["columns_dropped"] == {}
+    assert d["columns_changed"] == {"t": [["v", "text", "varchar(8)"]]} and d["changed"]
+    assert not FakeSuite._compare_schemas(a, a)["changed"]
+    assert FakeSuite.supports("schema_diff")          # the fake reads sqlite's catalog
+    suite.branch("other", "main")
+    suite.exec(["CREATE TABLE extra (id INT PRIMARY KEY, v TEXT)", "ALTER TABLE t ADD COLUMN w INT"], refs=["other"])
+    r = suite.schema_diff("main", "other")
+    assert r.ok and r.value["tables_added"] == ["extra"] and r.value["columns_added"] == {"t": ["w"]}
+    assert rows(suite, rslt.OpType.SCHEMA_DIFF)[0].status == rslt.OpStatus.OK
+    assert not suite.schema_diff("other", "other").value["changed"]
+
+
 def test_commit_ref_fallback(suite, capsys):
     FakeSuite.SUPPORTS_COMMIT_REFS = False
     try:

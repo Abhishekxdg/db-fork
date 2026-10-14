@@ -35,6 +35,7 @@ VERB_OP_TYPES = frozenset(
         rslt.OpType.REVERT,
         rslt.OpType.RESET,
         rslt.OpType.DELETE,
+        rslt.OpType.SCHEMA_DIFF,
         rslt.OpType.EXEC,
     }
 )

@@ -1,6 +1,10 @@
 """S5: Operations agent.
 
-The spine is production under TPC-C load with dense commits. A bad
+The spine is production under TPC-C load with dense commits: one commit
+every ``commit_every_txns`` spine transactions, so each commit captures the
+same amount of production change on every backend and phase 1 runs at the
+backend's own transaction rate (without a spine load the scenario thread
+runs those transactions itself). A bad
 deployment ``fault_commit_offset`` commits before the end injects a fault
 from the catalog and writes the deploy_log row that is the head sentinel.
 Investigation branches are created at ``investigation_branches`` commit
@@ -12,6 +16,17 @@ investigation branches are deleted.
 
 Sentinels: the bad deploy's deploy_log row is present at the head, absent
 on a branch created from an earlier commit, and absent after the reset.
+
+Schema fault (``schema_fault``): the bad deploy also creates a table
+(feature_flag), adds a column (deploy_log.rollout_pct), widens a column
+type (deploy_log.note) and drops a column holding data
+(deploy_log.approved_by, 'ops' on every routine deploy); each DDL runs
+on its own so a dialect that rejects one still applies the others.
+S5.3: after the reset the schema diff from the target commit to the
+spine reports no change. S5.4: the dropped column is back with its
+values (one 'ops' per routine deploy up to the target commit). A backend
+that cannot restore a state older than a dropped column reports the
+reset (and a branch from such a commit) as unsupported.
 """
 
 import time
@@ -20,7 +35,7 @@ from datetime import datetime
 from macrobench import faults, tpcc
 from macrobench.scenarios.base import Scenario, Worker, register
 
-COMMIT_PERIOD_SEC = 0.1
+DEFAULT_COMMIT_EVERY_TXNS = 20
 BAD_VERSION = "v-bad-deploy"
 
 
@@ -49,20 +64,27 @@ class OpsAgentScenario(Scenario):
         commits = []   # (k, hash or None, iso timestamp)
         fault, fw, fd = faults.pick_fault(rng, ctx.scale.warehouses)
         fault_k = p.spine_commits - p.fault_commit_offset
+        every = p.commit_every_txns or DEFAULT_COMMIT_EVERY_TXNS
+        next_commit_at = every
         try:
-            # 1. Production with dense commits; the bad deploy lands at fault_k.
+            # 1. Production with dense commits, one per ``every`` spine
+            # transactions; the bad deploy lands at fault_k.
             for k in range(p.spine_commits):
                 ctx.check_stop()
                 if self.spine_load is None:
-                    suite.exec(lambda db: tpcc.run_transaction(
-                        tpcc.pick_transaction(rng), db, rng, ctx.scale),
-                        refs=[ctx.spine], label="spine")
-                else:
-                    time.sleep(COMMIT_PERIOD_SEC)
+                    for _ in range(every):
+                        suite.exec(lambda db: tpcc.run_transaction(
+                            tpcc.pick_transaction(rng), db, rng, ctx.scale),
+                            refs=[ctx.spine], label="spine")
+                elif not self.spine_load.wait_for_total(next_commit_at, stop=ctx.stop_event):
+                    ctx.note(f"spine load stopped before commit {k}; committing without waiting")
+                next_commit_at += every
                 with self.quiesced():
                     if k == fault_k:
                         suite.exec(self._deploy_script(k, fault, fw, fd, bad=True),
                                    refs=[ctx.spine], label="bad_deploy")
+                        if p.schema_fault:
+                            self._schema_fault(suite)
                     elif k % 5 == 0:
                         suite.exec(self._deploy_script(k, None, fw, fd, bad=False),
                                    refs=[ctx.spine], label="deploy")
@@ -112,6 +134,8 @@ class OpsAgentScenario(Scenario):
                     else:
                         inv.not_applicable("S5.2 head sentinel gone after reset",
                                            f"selected commit {target['k']} is after the bad deploy {fault_k}")
+                    if p.schema_fault:
+                        self._check_schema_reset(suite, target, fault_k, reset)
             ctx.add_metric("time_to_recovery_sec", round(time.time() - t_start, 3))
             ctx.tick()
 
@@ -125,6 +149,69 @@ class OpsAgentScenario(Scenario):
 
     # ------------------------------------------------------------------
 
+    def _schema_fault(self, suite) -> None:
+        """The bad deploy's schema changes, one exec each (a failure of one,
+        e.g. a dialect without the retype form, leaves the others applied)."""
+        dialect = getattr(type(suite), "SCHEMA_DIALECT", None)
+        retype = ("ALTER TABLE deploy_log MODIFY note VARCHAR(400)" if dialect == "mysql"
+                  else "ALTER TABLE deploy_log ALTER COLUMN note TYPE VARCHAR(400)")
+        applied = []
+        for name, stmts in (("table", ["CREATE TABLE feature_flag (flag_id INT NOT NULL, name VARCHAR(40), "
+                                       "enabled INT, PRIMARY KEY (flag_id))",
+                                       "INSERT INTO feature_flag (flag_id, name, enabled) VALUES (1, 'new_checkout', 1)"]),
+                            ("column", ["ALTER TABLE deploy_log ADD COLUMN rollout_pct INT"]),
+                            ("retype", [retype]),
+                            ("drop", ["ALTER TABLE deploy_log DROP COLUMN approved_by"])):
+            r = suite.exec(stmts, refs=[self.ctx.spine], label="bad_deploy_ddl")[0]
+            if r.ok:
+                applied.append(name)
+            else:
+                self.ctx.note(f"bad deploy schema change '{name}': {r.status_name} {r.error[:100]}")
+        self._schema_fault_applied = applied
+        self.ctx.add_metric("schema_fault_applied", ",".join(applied))
+
+    def _check_schema_reset(self, suite, target: dict, fault_k: int, reset) -> None:
+        """S5.3: the schema at the spine after the reset equals the schema
+        at the target commit (schema_diff reports no change). S5.4: the
+        dropped column's values are back (one 'ops' per routine deploy up
+        to the target commit)."""
+        inv, ctx = self.ctx.invariants, self.ctx
+        names = ("S5.3 schema restored by the reset", "S5.4 dropped column's values restored by the reset")
+        applied = ",".join(getattr(self, "_schema_fault_applied", []))
+        if target["k"] >= fault_k:
+            for n in names:
+                inv.not_applicable(n, f"selected commit {target['k']} is after the bad deploy {fault_k}")
+            return
+        if not target["hash"]:
+            for n in names:
+                inv.not_applicable(n, "backend has no commits")
+            return
+        if reset.unsupported:
+            for n in names:
+                inv.not_applicable(n, f"reset unsupported: {reset.error[:80]}")
+            return
+        sd = ctx.retry(lambda: suite.schema_diff(f"{ctx.spine}@{target['hash']}", ctx.spine, label="schema_diff"))
+        if sd.unsupported:
+            inv.not_applicable(names[0], f"schema diff unsupported: {sd.error[:80]}")
+        elif not sd.ok or not isinstance(sd.value, dict):
+            inv.check(names[0], False, f"schema diff failed: {sd.error[:100]}")
+        else:
+            v = sd.value
+            inv.check(names[0], not v.get("changed"),
+                      f"tables_added={v.get('tables_added')} tables_dropped={v.get('tables_dropped')} "
+                      f"columns_added={v.get('columns_added')} columns_dropped={v.get('columns_dropped')} "
+                      f"columns_changed={v.get('columns_changed')} (bad deploy applied: {applied})")
+        if "drop" not in applied:
+            inv.not_applicable(names[1], "the bad deploy's DROP COLUMN was not applied")
+            return
+        want = len([k for k in range(target["k"] + 1) if k % 5 == 0 and k != fault_k])
+        r = suite.exec([("SELECT COUNT(*) FROM deploy_log WHERE approved_by = %s", ("ops",))],
+                       refs=[ctx.spine], label="invariant")[0]
+        got = int(r.rows[0][0]) if r.ok and r.rows else None
+        inv.check(names[1], got == want,
+                  f"rows with approved_by='ops' = {got} (want {want}: routine deploys up to commit {target['k']})"
+                  + ("" if r.ok else f"; read failed: {r.error[:80]}"))
+
     def _deploy_script(self, k, fault, fw, fd, bad):
         def script(db):
             if bad:
@@ -133,8 +220,8 @@ class OpsAgentScenario(Scenario):
                        "VALUES (%s, %s, CURRENT_TIMESTAMP, %s)",
                        (k, BAD_VERSION, f"sentinel: {fault.name} in w{fw} d{fd}"))
             else:
-                db.sql("INSERT INTO deploy_log (deploy_id, version, deployed_at, note) "
-                       "VALUES (%s, %s, CURRENT_TIMESTAMP, 'routine')", (k, f"v{k}"))
+                db.sql("INSERT INTO deploy_log (deploy_id, version, deployed_at, note, approved_by) "
+                       "VALUES (%s, %s, CURRENT_TIMESTAMP, 'routine', 'ops')", (k, f"v{k}"))
         return script
 
     def _investigate(self, w: Worker, commit, fault_k) -> dict:

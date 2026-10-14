@@ -17,7 +17,7 @@ import dblib.util as dbutil
 
 DOLT_MYSQL_USER = os.environ.get("DOLT_MYSQL_USER", "root")
 DOLT_MYSQL_PASSWORD = os.environ.get("DOLT_MYSQL_PASSWORD", "")
-DOLT_MYSQL_HOST = os.environ.get("DOLT_MYSQL_HOST", "127.0.0.1")
+DOLT_MYSQL_HOST = os.environ.get("DOLT_MYSQL_HOST") or os.environ.get("DBFORK_SERVER_HOST", "127.0.0.1")
 DOLT_MYSQL_PORT = int(os.environ.get("DOLT_MYSQL_PORT", "3306"))
 DOLT_MYSQL_DATA_DIR = os.path.expanduser(
     os.environ.get("DOLT_MYSQL_DATA_DIR", "~/dolt/databases")
@@ -101,6 +101,7 @@ def drop_database(db_name: str) -> None:
 class DoltMySQLToolSuite(DBToolSuite):
     BACKEND_NAME = "dolt_mysql"
     SUPPORTS_COMMIT_REFS = True
+    SCHEMA_DIALECT = "mysql"
     SUPPORTS_MULTI_REF_EXEC = True
 
     @classmethod
@@ -175,7 +176,8 @@ class DoltMySQLToolSuite(DBToolSuite):
         if not self.db_name:
             return 0
         return dbutil.get_directory_size_bytes(
-            os.path.join(DOLT_MYSQL_DATA_DIR, self.db_name)
+            os.path.join(DOLT_MYSQL_DATA_DIR, self.db_name),
+            ssh=dbutil.ssh_target("DOLT_MYSQL_SSH"),
         )
 
     def _gc_impl(self) -> None:
@@ -222,6 +224,27 @@ class DoltMySQLToolSuite(DBToolSuite):
             "rows_deleted": sum(t.get("rows_deleted") or 0 for t in tables),
             "rows_modified": sum(t.get("rows_modified") or 0 for t in tables),
         }
+
+    def _schema_diff_impl(self, ref_a: Ref, ref_b: Ref) -> dict:
+        """dolt_schema_diff names the tables whose schema differs (added,
+        dropped or changed); the column detail of changed tables comes from
+        the catalog at each ref."""
+        rows = self._rows_as_dicts("SELECT from_table_name, to_table_name FROM dolt_schema_diff(%s, %s);",
+                                   (self._spec(ref_a), self._spec(ref_b)))
+        # Doltgres qualifies the names with the schema ("public.t").
+        bare = lambda n: str(n).split(".")[-1] if n else n
+        added = sorted(bare(r["to_table_name"]) for r in rows if not r["from_table_name"])
+        dropped = sorted(bare(r["from_table_name"]) for r in rows if not r["to_table_name"])
+        changed = sorted(bare(r["from_table_name"]) for r in rows if r["from_table_name"] and r["to_table_name"])
+        out = {"tables_added": added, "tables_dropped": dropped,
+               "columns_added": {}, "columns_dropped": {}, "columns_changed": {}}
+        if changed:
+            a, b = self._schema_at(ref_a), self._schema_at(ref_b)
+            cmp = self._compare_schemas({t: a.get(t, {}) for t in changed}, {t: b.get(t, {}) for t in changed})
+            for k in ("columns_added", "columns_dropped", "columns_changed"):
+                out[k] = cmp[k]
+        out["changed"] = bool(rows)
+        return out
 
     def _log_impl(self, ref: Ref, limit: int) -> list:
         return self._rows_as_dicts(
@@ -285,16 +308,54 @@ class DoltMySQLToolSuite(DBToolSuite):
         return info
 
     def _resolve_table(self, table: str, flag: str, info: dict) -> None:
-        """dolt_conflicts_resolve, falling back to keeping the working
-        set's rows (ours) when Dolt cannot apply the flag because the
-        table's schema differs between the sides."""
+        """dolt_conflicts_resolve. Dolt refuses it when the table's columns
+        differ between the sides (e.g. the target added a column since the
+        fork); then --ours keeps the working set's rows and --theirs is
+        applied by hand from the conflict table."""
         try:
             self._execute("CALL DOLT_CONFLICTS_RESOLVE(%s, %s);", (flag, table))
         except Exception as e:
             if "schema" not in str(e).lower():
                 raise
+            if flag == "--theirs":
+                self._resolve_theirs_by_hand(table)
+                info.setdefault("theirs_by_hand", []).append(table)
+            else:
+                info.setdefault("fallback_ours", []).append(table)
             self._execute(f"DELETE FROM dolt_conflicts_{table}")
-            info.setdefault("fallback_ours", []).append(table)
+
+    def _resolve_theirs_by_hand(self, table: str) -> None:
+        """What --theirs does, for a table whose columns differ between the
+        sides: each conflicting row becomes theirs (removed, or every column
+        both sides have set to their value); columns only the working set
+        has keep their working value."""
+        key = [r[0] for r in self._execute(
+            "SELECT column_name FROM information_schema.key_column_usage "
+            "WHERE table_name = %s AND table_schema = DATABASE() "
+            "AND constraint_name = 'PRIMARY' ORDER BY ordinal_position;", (table,))]
+        current = {r[0] for r in self._execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = %s AND table_schema = DATABASE();", (table,))}
+        if not key:
+            raise RuntimeError(f"cannot resolve {table} by hand: no primary key")
+        for row in self._rows_as_dicts(f"SELECT * FROM dolt_conflicts_{table};"):
+            theirs = {c[len("their_"):]: v for c, v in row.items()
+                      if c.startswith("their_") and c != "their_diff_type"
+                      and c[len("their_"):] in current}
+            if row["their_diff_type"] == "removed":
+                where = " AND ".join(f"`{k}` = %s" for k in key)
+                self._execute(f"DELETE FROM `{table}` WHERE {where};",
+                              [row[f"base_{k}"] for k in key])
+            elif row["our_diff_type"] != "removed" and row.get(f"our_{key[0]}") is not None:
+                sets = ", ".join(f"`{c}` = %s" for c in theirs)
+                where = " AND ".join(f"`{k}` = %s" for k in key)
+                self._execute(f"UPDATE `{table}` SET {sets} WHERE {where};",
+                              list(theirs.values()) + [row[f"our_{k}"] for k in key])
+            else:
+                cols = ", ".join(f"`{c}`" for c in theirs)
+                marks = ", ".join(["%s"] * len(theirs))
+                self._execute(f"INSERT INTO `{table}` ({cols}) VALUES ({marks});",
+                              list(theirs.values()))
 
     def _merge_impl(self, into: Ref, source: Ref, message: str,
                     on_conflict="ours") -> dict:

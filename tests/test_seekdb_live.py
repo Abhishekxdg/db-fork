@@ -207,3 +207,23 @@ def test_rebase_carries_column_default(suite):
     suite.exec(["INSERT INTO t (id, v, n) VALUES (60,'sixty',60)"], refs=["feat"])
     got = dict(rows(suite, "feat", "SELECT id, cat FROM t WHERE id IN (40, 50, 60)"))
     assert got[40] == "general" and got[60] == "general"
+
+
+def test_schema_diff_reports_tables_and_columns(suite):
+    main = "main"
+    c = suite.commit(main, "base")
+    base = f"{main}@{c.value}"
+    assert suite.branch("sd", main).ok
+    r = suite.exec(["ALTER TABLE t ADD COLUMN w INT", "CREATE TABLE extra (id INT PRIMARY KEY, z VARCHAR(4))"],
+                   refs=["sd"])[0]
+    assert r.ok, r.error
+    d = suite.schema_diff(base, "sd")
+    assert d.ok, d.error
+    assert d.value["tables_added"] == ["extra"] and d.value["tables_dropped"] == []
+    assert d.value["columns_added"] == {"t": ["w"]} and d.value["changed"]
+    assert not d.value["columns_dropped"] and not d.value["columns_changed"]
+    back = suite.schema_diff("sd", base)
+    assert back.ok and back.value["tables_dropped"] == ["extra"] and back.value["columns_dropped"] == {"t": ["w"]}
+    same = suite.schema_diff("sd", "sd")
+    assert same.ok and not same.value["changed"]
+    assert suite.delete("sd").ok
