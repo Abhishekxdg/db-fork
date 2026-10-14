@@ -59,6 +59,8 @@ from dblib.file_copy import FileCopyToolSuite
 from dblib.chronos import ChronosToolSuite
 from dblib import chronos as chronos_mod
 from dblib.xata import XataToolSuite
+from dblib import terminusdb
+from dblib.terminusdb import TerminusDBToolSuite
 from dblib.db_api import DBToolSuite, Ref
 from dblib import result_collector as rc
 
@@ -74,6 +76,13 @@ from microbench.operations import (
     BranchCreateOperation,
     BranchConnectOperation,
     BranchDeleteOperation,
+    BranchCommitOperation,
+    BranchDiffOperation,
+    BranchLogOperation,
+    BranchMergeOperation,
+    BranchRebaseOperation,
+    BranchRevertOperation,
+    BranchResetOperation,
     AddIndexOperation,
     RemoveIndexOperation,
     VacuumOperation,
@@ -90,6 +99,17 @@ from microbench.operations import (
     SetNotNullOperation,
     ExpandContractOperation,
 )
+
+# Git-like verbs measured on a state the operation prepares itself
+VERB_OPERATIONS = frozenset({
+    tp.OperationType.BRANCH_COMMIT,
+    tp.OperationType.BRANCH_DIFF,
+    tp.OperationType.BRANCH_LOG,
+    tp.OperationType.BRANCH_MERGE,
+    tp.OperationType.BRANCH_REBASE,
+    tp.OperationType.BRANCH_REVERT,
+    tp.OperationType.BRANCH_RESET,
+})
 
 # Utility imports
 from microbench.datagen import DynamicDataGenerator
@@ -272,6 +292,10 @@ class BenchmarkConfig:
     def ddl_config(self) -> tp.DdlConfig:
         return self._proto.operation_benchmark.ddl_config
 
+    @property
+    def branch_op_config(self) -> tp.BranchOpConfig:
+        return self._proto.operation_benchmark.branch_op_config
+
     def __str__(self) -> str:
         return (
             f"BenchmarkConfig(run_id={self.run_id}, "
@@ -350,6 +374,10 @@ def create_db_tools(
         )
     if backend == tp.Backend.CHRONOS:
         return ChronosToolSuite.init_for_bench(
+            result_collector, db_name, default_branch, measure_storage
+        )
+    if backend == tp.Backend.TERMINUSDB:
+        return TerminusDBToolSuite.init_for_bench(
             result_collector, db_name, default_branch, measure_storage
         )
     if backend == tp.Backend.NEON:
@@ -473,6 +501,11 @@ class BackendManager:
             info.root_branch_name = chronos_mod.MAIN_BRANCH
             print(f"Default CHRONOS connection URI: {info.default_uri}")
 
+        elif backend == tp.Backend.TERMINUSDB:
+            info.default_uri = TerminusDBToolSuite.get_default_connection_uri()
+            info.default_branch_name = terminusdb.MAIN_BRANCH
+            print(f"Default TerminusDB server: {info.default_uri}")
+
         elif backend == tp.Backend.NEON:
             if require_db_setup:
                 # Leftovers of interrupted runs keep billing: drop them first.
@@ -527,6 +560,9 @@ class BackendManager:
             seekdb.setup_database(db_name, sql_dump_path)
         elif require_db_setup and backend == tp.Backend.MATRIXONE:
             matrixone.setup_database(db_name, sql_dump_path)
+        elif require_db_setup and backend == tp.Backend.TERMINUSDB:
+            # No SQL: the dump is converted to a schema and documents.
+            terminusdb.setup_database(db_name, sql_dump_path)
         elif require_db_setup and backend == tp.Backend.BAUPLAN:
             bauplan.setup_database(db_name, sql_dump_path)
         elif require_db_setup:
@@ -568,6 +604,11 @@ class BackendManager:
             try:
                 # Also drops every branch database forked from db_name.
                 seekdb.drop_database(db_name)
+            except Exception as e:
+                print(f"Error deleting database: {e}")
+        elif self.config.backend == tp.Backend.TERMINUSDB and db_name:
+            try:
+                terminusdb.drop_database(db_name)
             except Exception as e:
                 print(f"Error deleting database: {e}")
         elif self.config.backend == tp.Backend.MATRIXONE and db_name:
@@ -632,6 +673,8 @@ class BackendManager:
             return DoltMySQLToolSuite.get_initial_connection_uri(db_name)
         elif backend == tp.Backend.SEEKDB:
             return SeekDBToolSuite.get_initial_connection_uri(db_name)
+        elif backend == tp.Backend.TERMINUSDB:
+            return info.default_uri
         elif backend == tp.Backend.MATRIXONE:
             return MatrixOneToolSuite.get_initial_connection_uri(db_name)
         elif backend == tp.Backend.BAUPLAN:
@@ -1523,6 +1566,19 @@ class OperationRunner:
             tp.OperationType.DELETE,
         ]:
             return OperationRegistry.create(op_type, table_name=table_name)
+        elif op_type == tp.OperationType.BRANCH_LOG:
+            cfg = self.config.branch_op_config
+            return OperationRegistry.create(
+                op_type, table_name=table_name,
+                changes_per_op=cfg.changes_per_op or 1,
+                history_commits=cfg.history_commits or 10,
+                log_limit=cfg.log_limit or 10,
+            )
+        elif op_type in VERB_OPERATIONS:
+            return OperationRegistry.create(
+                op_type, table_name=table_name,
+                changes_per_op=self.config.branch_op_config.changes_per_op or 1,
+            )
         else:
             # Branch operations and others without parameters
             return OperationRegistry.create(op_type)
@@ -1742,6 +1798,19 @@ class AsyncOperationRunner:
             tp.OperationType.DELETE,
         ]:
             return OperationRegistry.create(op_type, table_name=table_name)
+        elif op_type == tp.OperationType.BRANCH_LOG:
+            cfg = self.config.branch_op_config
+            return OperationRegistry.create(
+                op_type, table_name=table_name,
+                changes_per_op=cfg.changes_per_op or 1,
+                history_commits=cfg.history_commits or 10,
+                log_limit=cfg.log_limit or 10,
+            )
+        elif op_type in VERB_OPERATIONS:
+            return OperationRegistry.create(
+                op_type, table_name=table_name,
+                changes_per_op=self.config.branch_op_config.changes_per_op or 1,
+            )
         else:
             # Branch operations and others without parameters
             return OperationRegistry.create(op_type)
@@ -2384,6 +2453,14 @@ class ResultManager:
             "data_throughput": self.metrics["data_throughput"],
             "support": self.metrics.get("support", {}),
         }
+        # Server behaviour the backend worked around (retries and the like)
+        suite_class = {
+            tp.Backend.CHRONOS: ChronosToolSuite,
+            tp.Backend.TERMINUSDB: TerminusDBToolSuite,
+        }.get(self.config.backend)
+        observed = getattr(suite_class, "OBSERVED", None)
+        if observed:
+            summary["backend_observations"] = dict(observed)
 
         # Build filename
         filename_parts = [
@@ -2443,6 +2520,13 @@ def register_all_operations() -> None:
     OperationRegistry.register(tp.OperationType.BRANCH_CREATE, BranchCreateOperation)
     OperationRegistry.register(tp.OperationType.BRANCH_CONNECT, BranchConnectOperation)
     OperationRegistry.register(tp.OperationType.BRANCH_DELETE, BranchDeleteOperation)
+    OperationRegistry.register(tp.OperationType.BRANCH_COMMIT, BranchCommitOperation)
+    OperationRegistry.register(tp.OperationType.BRANCH_DIFF, BranchDiffOperation)
+    OperationRegistry.register(tp.OperationType.BRANCH_LOG, BranchLogOperation)
+    OperationRegistry.register(tp.OperationType.BRANCH_MERGE, BranchMergeOperation)
+    OperationRegistry.register(tp.OperationType.BRANCH_REBASE, BranchRebaseOperation)
+    OperationRegistry.register(tp.OperationType.BRANCH_REVERT, BranchRevertOperation)
+    OperationRegistry.register(tp.OperationType.BRANCH_RESET, BranchResetOperation)
 
     # DDL operations
     OperationRegistry.register(tp.OperationType.DDL_ADD_INDEX, AddIndexOperation)
