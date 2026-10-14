@@ -30,7 +30,12 @@ function token(name) {
     return tokenCache.get(name);
 }
 
-const ICON = {check: ['M3.5 8.4l3 3 6-6.6'], chevron: ['M6 3.5L10.5 8 6 12.5'], sortable: ['M5 6.5L8 3.5l3 3', 'M5 9.5l3 3 3-3'], up: ['M8 12.5v-9', 'M4.5 7L8 3.5 11.5 7'], down: ['M8 3.5v9', 'M4.5 9L8 12.5 11.5 9']};
+const ICON = {
+    check: ['M3.5 8.4l3 3 6-6.6'], chevron: ['M6 3.5L10.5 8 6 12.5'],
+    sortable: ['M5 6.5L8 3.5l3 3', 'M5 9.5l3 3 3-3'], up: ['M8 12.5v-9', 'M4.5 7L8 3.5 11.5 7'], down: ['M8 3.5v9', 'M4.5 9L8 12.5 11.5 9'],
+    macro: ['M4.5 5v6', 'M4.5 8h4a2.5 2.5 0 0 0 2.5-2.5V5', 'M4.5 3.5a1.75 1.75 0 1 0 0 3.5a1.75 1.75 0 1 0 0-3.5', 'M4.5 9a1.75 1.75 0 1 0 0 3.5a1.75 1.75 0 1 0 0-3.5', 'M11 3.5a1.75 1.75 0 1 0 0 3.5a1.75 1.75 0 1 0 0-3.5'],
+    micro: ['M8.8 2L3.8 8.8h3.9l-.5 5.2l5-6.8H8.3L8.8 2Z'],
+};
 function icon(paths, className = 'icon') {
     const svg = svgNode('svg', {class: className, viewBox: '0 0 16 16', 'aria-hidden': 'true', focusable: 'false'});
     for (const d of paths) svg.append(svgNode('path', {d}));
@@ -145,15 +150,30 @@ function systemIcon(e) {
     mark.setAttribute('data-system', systemSlug(e)); mark.setAttribute('aria-hidden', 'true');
     return mark;
 }
-// The row header of every board: rank, mark, name and one line of context. A board that never ranks passes rank false.
+const HOSTING = {no: 'Self-hosted', yes: 'Managed service'};
+function hostingBadge(e) {
+    const hosted = e && e.hosted === 'yes' ? 'yes' : 'no';
+    const badge = node('span', 'hosting-badge', HOSTING[hosted]);
+    badge.setAttribute('data-hosted', hosted);
+    return badge;
+}
+function specBadge(e) {
+    const env = e && e.environment || {};
+    const spec = e && e.hosted === 'yes' ? e.region || e.machine
+        : [typeof env.cpus === 'number' ? `${env.cpus} CPUs` : null, gib(env.memory_bytes, 0)].filter(Boolean).join(' · ') || (e && e.machine);
+    return spec ? node('span', 'spec-badge', spec) : null;
+}
+// The row header of every board: rank, mark, name, hosting & hardware badges, and one line of context. A board that never ranks passes rank false.
 // The rank badge is drawn for the eye; a screen reader hears "Rank 2" or "Not ranked" before the name instead.
 function systemHeader(rank, e, name, meta) {
-    const text = node('span', 'system-text'), identity = node('span', 'system-identity');
+    const text = node('span', 'system-text'), title = node('span', 'system-title'), identity = node('span', 'system-identity');
     if (rank !== false) {
         const badge = node('span', 'rank-number' + (rank === 1 ? ' rank-leader' : ''), rank ? String(rank) : '—'); badge.setAttribute('aria-hidden', 'true');
         identity.append(badge); text.append(node('span', 'sr-only', rank ? `Rank ${rank}, ` : 'Not ranked, '));
     }
-    text.append(node('span', 'system-name', name), parts(meta, 'system-meta'));
+    const spec = specBadge(e);
+    title.append(node('span', 'system-name', name), hostingBadge(e), ...spec ? [spec] : []);
+    text.append(title, parts(meta, 'system-meta'));
     identity.append(systemIcon(e), text);
     return rowHead(identity, 'system-cell');
 }

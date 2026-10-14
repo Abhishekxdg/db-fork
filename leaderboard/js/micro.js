@@ -29,14 +29,13 @@ const SORTS = {branch: 'First query', data: 'Reads & writes', load: 'Load'};
 // A score's name as the board shows it: the reads & writes score names its subset whenever it counts fewer than all workloads.
 const countedData = () => VIEWS.data.ranked(VIEWS.data.rows);
 const sortName = key => key === 'data' && countedData().length < VIEWS.data.rows.length ? `${SORTS.data} (${countedData().length} of ${VIEWS.data.rows.length})` : SORTS[key];
-const HOSTING = {no: 'Self-hosted', yes: 'Managed service'};
 const tryLabel = (capital = false) => (state.mode === 'first' ? ['first try', 'First try'] : ['best repeat', 'Best repeat'])[+capital];
 const FILTERS = {
     hosting: e => state.hosted[e.hosted], system: e => state.system[e.system], machine: e => state.machine[e.machine],
     tags: e => Object.values(state.tag).every(Boolean) || e.tags.some(t => state.tag[t]),
 };
 const label = e => `${e.system} (${e.machine})`;
-const nameOf = e => data.filter(x => x.system === e.system && x.hosted === e.hosted).length > 1 ? label(e) : e.system;
+const nameOf = e => data.filter(x => x.system === e.system).length > 1 ? label(e) : e.system;
 
 // Filter chips: one checklist per dimension inside a native disclosure, part of the board's filter bar.
 // One opens at a time, a click outside or Escape closes it, and a dimension with a single value has no chip.
@@ -103,7 +102,7 @@ function summaryTable(title, ctx) {
     const {measured, scores, ranks} = ctx, rank = ranks[state.sort], by = scores[state.sort];
     const order = sortedRows(by.scored.map(s => s.e), measured.filter(e => !rank.has(e)), state.sortDesc);
     const {table, body} = dataTable('board summary', `${title}: systems ranked by ${sortName(state.sort)} score, lower is better`, [colHead('System', 'system-col'),
-        ...Object.keys(SORTS).map(key => sortHeader(sortName(key), key === state.sort, state.sortDesc, descending => { state.sort = key; state.sortDesc = descending; writeHash(boardHash()); }, `sort-${key}-${measured[0].hosted}`)), colHead(node('span', 'sr-only', 'Details'), 'action-col')]);
+        ...Object.keys(SORTS).map(key => sortHeader(sortName(key), key === state.sort, state.sortDesc, descending => { state.sort = key; state.sortDesc = descending; writeHash(boardHash()); }, `sort-${key}-no`)), colHead(node('span', 'sr-only', 'Details'), 'action-col')]);
     for (const e of order) {
         const tr = body.insertRow();
         const th = systemHeader(rank.get(e), e, nameOf(e), [e.machine, e.date]); tr.append(th);
@@ -126,7 +125,7 @@ function summaryTable(title, ctx) {
 }
 function heatmap(ctx) {
     const {measured, best} = ctx, ranked = Object.values(VIEWS).flatMap(view => view.ranked(view.rows));
-    const {table, body} = dataTable('heatmap', `${HOSTING[measured[0].hosted]} measured workload timings`, ['Workload', ...measured.map(e => {
+    const {table, body} = dataTable('heatmap', 'Operations measured workload timings', ['Workload', ...measured.map(e => {
         const identity = node('span', 'system-identity'); identity.append(systemIcon(e), node('span', 'system-name', measured.filter(x => x.system === e.system).length > 1 ? label(e) : e.system));
         const th = colHead(identity); th.title = `${e.machine} · ${e.date}`;
         return th;
@@ -136,7 +135,7 @@ function heatmap(ctx) {
         if (row === suiteRows[3] || row === loadRow) tr.className = 'workload-divider';
         const link = node('a', 'workload-link', row.label); link.href = `#dataset?operation=${row.op}`;  // a workload's name leads to its definition
         if (VIEWS.data.rows.includes(row)) {
-            const box = node('input'); box.type = 'checkbox'; box.checked = state.ticked.has(row); box.id = `row-${suiteRows.indexOf(row)}-${measured[0].hosted}`;
+            const box = node('input'); box.type = 'checkbox'; box.checked = state.ticked.has(row); box.id = `row-${suiteRows.indexOf(row)}-no`;
             box.setAttribute('aria-label', `Count ${row.label} in the reads & writes score`);
             if (box.checked && countedData().length === 1) { box.disabled = true; box.title = 'The score counts at least one workload'; }
             box.addEventListener('change', () => { box.checked ? state.ticked.add(row) : state.ticked.delete(row); writeHash(boardHash()); render(); el(box.id).focus(); });
@@ -367,10 +366,9 @@ function renderMicro() {
     el('empty-title').textContent = data.length ? 'No matches' : 'No published results yet';
     el('empty-description').textContent = data.length ? 'Adjust or reset the filters.' : `Microbenchmark results appear here once they are published.${excluded.length ? ` ${plural(excluded.length, 'run')} without a result ${excluded.length === 1 ? 'is' : 'are'} listed below.` : ''}`;
     el('clear-empty-filters').hidden = !filtered;
-    const groups = Object.entries(HOSTING).filter(([hosted]) => shown.some(e => e.hosted === hosted))
-        .map(([hosted, title]) => ({title, ctx: microContext(shown.filter(e => e.hosted === hosted))}));
+    const groups = shown.length ? [{title: 'Operations', ctx: microContext(shown)}] : [];
     el('groups').replaceChildren(...groups.map(g => boardGroup(g.title, g.ctx)));
-    el('breakdowns').replaceChildren(...groups.map(g => breakdown(g.title, g.ctx, groups.length > 1)));
+    el('breakdowns').replaceChildren(...groups.map(g => breakdown(g.title, g.ctx, false)));
     el('excluded').replaceChildren(...excluded.length ? [excludedPanel('excluded-panel', PROD ? 'Runs without a result' : 'Excluded results',
         excluded.map(x => ({label: `${x.system} / ${x.machine}`, href: x.source, reason: x.reason})), !data.length)] : []);  // with no result at all, the reasons are the news
     renderOperations(groups);

@@ -21,10 +21,21 @@
 </header>
 <main class="shell" id="main-content">
 <section id="leaderboard" aria-labelledby="leaderboard-title">
-    <h1 class="page-title" id="leaderboard-title" tabindex="-1">Leaderboard</h1>
-    <div class="board-card">
+    <div class="page-header">
+        <h1 class="page-title" id="leaderboard-title" tabindex="-1">Leaderboard</h1>
+        <p class="page-subtitle">Agent workflows end to end, and branch, read, write and load operations across self-hosted and managed systems.</p>
         <div class="suite-tabs" id="selectors-suite" role="tablist" aria-label="Benchmark suite"></div>
+    </div>
+    <div class="board-card">
         <div class="suite-view" id="macro-view" role="tabpanel" aria-labelledby="tab-macro">
+            <div class="filter-bar">
+                <details class="chip" id="macro-chip-hosted"><summary><span class="chip-label">Hosting</span> <span class="chip-value" id="macro-value-hosted"></span></summary><div class="chip-menu" id="macro-selectors-hosted" role="group" aria-label="Hosting"></div></details>
+                <details class="chip" id="macro-chip-system"><summary><span class="chip-label">Systems</span> <span class="chip-value" id="macro-value-system"></span></summary><div class="chip-menu" id="macro-selectors-system" role="group" aria-label="Systems"></div></details>
+                <details class="chip" id="macro-chip-machine"><summary><span class="chip-label">Machine</span> <span class="chip-value" id="macro-value-machine"></span></summary><div class="chip-menu" id="macro-selectors-machine" role="group" aria-label="Machine"></div></details>
+                <details class="chip" id="macro-chip-tag"><summary><span class="chip-label">Capabilities</span> <span class="chip-value" id="macro-value-tag"></span></summary><div class="chip-menu" id="macro-selectors-tag" role="group" aria-label="Capabilities"></div></details>
+                <button class="chip-reset" id="macro-reset-filters" type="button" hidden>Reset filters</button>
+                <p class="filter-meta"><span id="macro-shown" aria-live="polite"></span> · <span id="macro-updated"></span></p>
+            </div>
             <div id="macro-groups"></div>
         </div>
         <div class="suite-view" id="micro-view" role="tabpanel" aria-labelledby="tab-micro" hidden>

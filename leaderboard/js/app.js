@@ -5,6 +5,8 @@ const allOn = values => Object.fromEntries(values.map(v => [v, true]));
 // The page opens on the agent workflows whenever their data is built. Each suite keeps its own selections.
 const state = {
     suite: PROD || MACRO.built ? 'macro' : 'micro', rank: Object.keys(SCENARIOS)[0], rankDesc: false, workflow: Object.keys(SCENARIOS)[0], campaign: new Set(),
+    macroHosted: allOn(Object.keys(HOSTING)), macroSystem: allOn(uniq(MACRO.campaigns.map(c => c.system))),
+    macroMachine: allOn(uniq(MACRO.campaigns.map(c => c.machine))), macroTag: allOn(uniq(MACRO.campaigns.flatMap(c => c.tags || []))),
     mode: 'first', sort: 'branch', sortDesc: false, ticked: new Set(suiteRows), op: allRows[0].op, hosted: allOn(Object.keys(HOSTING)),
     system: allOn(uniq(data.map(e => e.system))), machine: allOn(uniq(data.map(e => e.machine))), tag: allOn(uniq(data.flatMap(e => e.tags))),
 };
@@ -73,9 +75,11 @@ const SUITES = {macro: ['Macrobench', () => plural(Object.keys(SCENARIOS).length
 function selectSuite(k) { state.suite = k; writeHash(boardHash()); render(); el(`tab-${k}`).focus(); }
 function renderTabs() {
     el('selectors-suite').replaceChildren(...Object.entries(SUITES).map(([k, [name, sub]]) => {
-        const tab = node('button', 'suite-tab'); tab.type = 'button'; tab.id = `tab-${k}`; tab.setAttribute('role', 'tab');
+        const tab = node('button', 'suite-tab'), copy = node('span', 'suite-copy');
+        tab.type = 'button'; tab.id = `tab-${k}`; tab.setAttribute('role', 'tab');
         tab.setAttribute('aria-selected', String(state.suite === k)); tab.setAttribute('aria-controls', `${k}-view`); tab.tabIndex = state.suite === k ? 0 : -1;
-        tab.append(node('span', 'suite-name', name), node('span', 'suite-desc', sub()));
+        copy.append(node('span', 'suite-name', name), node('span', 'suite-desc', sub()));
+        tab.append(icon(ICON[k], 'icon suite-icon'), copy);
         tab.addEventListener('click', () => selectSuite(k));
         tab.addEventListener('keydown', event => { const to = {ArrowLeft: 'macro', ArrowRight: 'micro', Home: 'macro', End: 'micro'}[event.key]; if (to) { event.preventDefault(); selectSuite(to); } });
         return tab;
@@ -93,7 +97,7 @@ function render() {
 
 for (const id of ['doc-nav', 'doc-scoring', 'doc-macro', 'doc-footer']) el(id).href = el(id).getAttribute('href').replace(/^README\.md/, DOCS);
 if (PROD) el('nav-run').remove();  // production has no run wizard
-wireDetails(); wireMicro();
+wireDetails(); wireMicro(); wireMacro();
 // A header link to the section already in the URL fires no hashchange, so it reveals and focuses the section itself.
 for (const id of ['nav-board', 'nav-workflows', 'nav-operations']) el(id).addEventListener('click', event => {
     const href = el(id).href; if (href.slice(href.indexOf('#')) !== window.location.hash) return;

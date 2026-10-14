@@ -166,15 +166,47 @@ function macroTable(g, keys, empty = null) {
     if (!g.rows.length && empty) { const tr = body.insertRow(); tr.className = 'empty-row'; const td = tr.insertCell(); td.setAttribute('colspan', String(keys.length + 2)); td.append(empty); }
     return scrolling(table, 'Scroll sideways to see every workflow.');
 }
-// A comparison group is headed by the machine it ran on and how many systems it compares, on one line.
+const MACRO_CHIPS = {
+    macroHosted: ['macro-chip-hosted', 'macro-value-hosted', 'macro-selectors-hosted', k => HOSTING[k] || k],
+    macroSystem: ['macro-chip-system', 'macro-value-system', 'macro-selectors-system', k => k],
+    macroMachine: ['macro-chip-machine', 'macro-value-machine', 'macro-selectors-machine', k => k],
+    macroTag: ['macro-chip-tag', 'macro-value-tag', 'macro-selectors-tag', k => k],
+};
+const MACRO_FILTERS = {
+    hosting: c => state.macroHosted[c.hosted || 'no'] !== false,
+    system: c => state.macroSystem[c.system] !== false,
+    machine: c => state.macroMachine[c.machine] !== false,
+    tags: c => Object.values(state.macroTag).every(Boolean) || (c.tags || []).some(t => state.macroTag[t]),
+};
+function resetMacroFilters() {
+    for (const key in MACRO_CHIPS) for (const value in state[key]) state[key][value] = true;
+    writeHash(boardHash()); render();
+}
+function renderMacroChips() {
+    for (const [key, [chipId, valId, selId, name]] of Object.entries(MACRO_CHIPS)) {
+        const map = state[key], values = Object.keys(map), on = values.filter(v => map[v]), all = on.length === values.length;
+        el(chipId).hidden = key !== 'macroHosted' && values.length < 2;
+        el(chipId).classList.toggle('chip-active', !all);
+        el(valId).textContent = all ? 'All' : on.length === 1 ? name(on[0]) : on.length ? `${on.length} of ${values.length}` : 'None';
+        el(selId).replaceChildren(filterOption(`${key}-all`, 'All', all, () => { for (const v of values) map[v] = !all; }),
+            ...values.map((v, i) => filterOption(`${key}-${i}`, name(v), map[v], () => { map[v] = !map[v]; })));
+    }
+}
+function wireMacro() {
+    el('macro-reset-filters').addEventListener('click', resetMacroFilters);
+    const chips = Object.values(MACRO_CHIPS).map(([chipId]) => el(chipId));
+    for (const chip of chips) chip.addEventListener('toggle', () => { if (chip.open) for (const other of chips) if (other !== chip) other.open = false; });
+    document.addEventListener('click', event => { for (const chip of chips) if (chip.open && !chip.contains(event.target)) chip.open = false; });
+    document.addEventListener('keydown', event => { if (event.key === 'Escape') for (const chip of chips) if (chip.open) { chip.open = false; chip.querySelector('summary').focus(); } });
+}
 function machineParts(c) {
     const env = c.environment || {};
     return [typeof env.cpus === 'number' ? plural(env.cpus, 'CPU') : null, gib(env.memory_bytes, 0), c.platform, c.machine];
 }
-function macroGroup(g, keys, total) {
-    const box = node('section', 'board-group'), heading = node('div', 'group-heading'), c = g.rows[0];
-    heading.append(node('h2', '', (c.environment || {}).cpu || c.machine),
-        parts([plural(g.rows.length, 'system'), ...machineParts(c), total > 1 ? `revision ${c.commit.slice(0, 7)}` : null], 'group-count'));
+function macroGroup(g, keys) {
+    const box = node('section', 'board-group'), heading = node('div', 'group-heading');
+    heading.append(node('h2', '', 'Agent workflows'),
+        node('span', 'group-count', `${plural(g.rows.length, 'system')} · ranked by ${workflow(state.rank).name} · lower is better`));
     if (keys.some(k => groupStats(g, k).timed.length >= 2)) heading.append(heatKey('Shading: darker mint is closer to the fastest completion time in its column'));
     box.append(heading, macroTable(g, keys));
     return box;
@@ -188,16 +220,23 @@ function provenance(c) {
 }
 let macroGroupsShown = [];
 function renderMacro() {
+    renderMacroChips();
     const keys = Object.keys(SCENARIOS);
     if (!keys.includes(state.rank)) state.rank = keys[0];
     const slots = campaignSlots(), campaigns = [...slots.values()].flat();
     state.campaign = new Set([...state.campaign].filter(id => campaigns.some(c => c.campaign_id === id)));  // an id from another build never lingers in the URL
     const chosen = [...slots.values()].map(list => list.find(c => state.campaign.has(c.campaign_id)) || list[0]);
-    macroGroupsShown = groupsOf(chosen);
+    const shown = chosen.filter(c => Object.values(MACRO_FILTERS).every(f => f(c)));
+    const filtered = Object.keys(MACRO_CHIPS).some(k => Object.values(state[k]).some(v => !v));
+    el('macro-reset-filters').hidden = !filtered;
+    el('macro-shown').textContent = `${plural(shown.length, 'system')}${filtered ? ' · filtered' : ''}`;
+    const latest = chosen.map(c => c.started.slice(0, 10)).sort().at(-1);
+    el('macro-updated').textContent = latest ? `Last run ${latest}` : 'No published runs yet';
+    macroGroupsShown = shown.length ? [{group: shown[0].group, rows: shown}] : [];
     // Without any campaign the table shell stays, with one honest row: no fabricated result.
-    el('macro-groups').replaceChildren(...macroGroupsShown.length ? macroGroupsShown.map(g => macroGroup(g, keys, macroGroupsShown.length))
-        : [macroTable({group: '', rows: []}, keys, node('span', 'empty-cell', 'No published results yet. Results appear here once a validated run is published.'))]);
-    el('macro-breakdowns').replaceChildren(...macroGroupsShown.map(g => macroBreakdown(g, macroGroupsShown.length > 1)));
+    el('macro-groups').replaceChildren(...macroGroupsShown.length ? macroGroupsShown.map(g => macroGroup(g, keys))
+        : [macroTable({group: '', rows: []}, keys, node('span', 'empty-cell', chosen.length ? 'No matches. Adjust or reset the filters.' : 'No published results yet. Results appear here once a validated run is published.'))]);
+    el('macro-breakdowns').replaceChildren(...macroGroupsShown.map(g => macroBreakdown(g, false)));
     el('macro-excluded').replaceChildren(...MACRO.excluded.length ? [excludedPanel('macro-excluded-panel', 'Runs not on the board',
         MACRO.excluded.map(x => ({label: `${x.system} / ${x.source.split('/').at(-1)}`, href: PROD ? null : x.source, reason: x.reason})))] : []);  // production never links a file it does not serve
     renderExplainer(keys);

@@ -98,8 +98,11 @@ def build(board: Path = BOARD, sources: set[str] | None = None) -> tuple[list[di
             collided.add((path.parts[-4], data["id"]))
             excluded.append({"system": path.parts[-4], "source": source, "reason": f"campaign {data['id']} is also selected at {campaigns[path.parts[-4], data['id']]['source']}; a campaign is selected once"})
             continue
+        meta_path = board / path.parts[-4] / "system.json"
+        meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
         campaigns[(path.parts[-4], data["id"])] = {
             "campaign_id": data["id"], "system": data["system"], "folder": path.parts[-4], "machine": data["machine"],
+            "hosted": meta.get("hosted", "no"),
             "preset": data["preset"], "scenarios": data["scenarios"], "started": data["started"], "finished": data["finished"],
             "aborted": data["aborted"], "server": data["server"], "source": source, "expected": data["attempts"],
             "version": data["version"], "dirty": data["source"]["dirty"], "changed_during_run": data["source"]["changed_during_run"],
