@@ -6,9 +6,10 @@ sentinel), loads ``batch_rows`` historical orders dated within the last
 ``days_back`` days in ``steps_per_batch`` steps, maintains the derived
 tables (daily_revenue, customer_summary, nation_sales), validates each
 step by recomputing the affected days from the base tables, and commits
-at a steady pace. With probability ``reset_prob`` a step "fails" and the
-batch resets to an earlier commit (or continues on a branch from that
-commit when the backend has no reset) and redoes the work. A finished
+at a steady pace. ``resets_per_batch`` times per batch a step "fails"
+(at a random non-final step after a commit) and the batch resets to one
+of its earlier commits (or continues on a branch from that commit when the
+backend has no reset) and redoes the work from there. A finished
 batch rebases onto the spine and merges; conflicts on the derived tables
 are resolved additively (ours + theirs - base). Merged branches are
 deleted.
@@ -81,6 +82,10 @@ class DataAgentScenario(Scenario):
         p = self.params
         if p.batches <= 0 or p.batch_rows <= 0 or p.steps_per_batch <= 0 or p.days_back <= 0:
             raise ValueError("data_agent needs batches, batch_rows, steps_per_batch and days_back > 0")
+        if p.resets_per_batch < 0:
+            raise ValueError("data_agent resets_per_batch must be >= 0")
+        if p.resets_per_batch and p.steps_per_batch < 2:
+            raise ValueError("data_agent resets need steps_per_batch >= 2")
 
     def total_units(self) -> int:
         return self.params.batches * self.params.steps_per_batch
@@ -186,9 +191,19 @@ class DataAgentScenario(Scenario):
                 c = w.commit(branch, f"batch {b} step {step}", label="batch_commit")
                 if c.ok and c.value:
                     committed.append((step, c.value))
-            if (not last and committed and rng.random() < p.reset_prob):
+            # Pipeline stage failures: exactly resets_per_batch per batch,
+            # placed at random among the non-final steps that follow a
+            # commit, and forced onto the last eligible steps when needed.
+            # A redone step is a fresh decision point.
+            left = (p.steps_per_batch - 1) - step
+            need = p.resets_per_batch - resets
+            if (not last and committed and need > 0
+                    and (need >= left or rng.random() < need / left)):
                 # Pipeline stage failed: go back to an earlier commit.
-                back_step, back_hash = rng.choice(committed)
+                # Prefer a commit that leaves room for the remaining resets
+                # (a non-final step after it per reset still owed).
+                room = [c for c in committed if (p.steps_per_batch - 2) - c[0] >= need - 1] or committed
+                back_step, back_hash = rng.choice(room)
                 if suite.supports("reset"):
                     rs = ctx.retry(lambda: suite.reset(branch, back_hash, label="batch_reset"))
                     ok = rs.ok

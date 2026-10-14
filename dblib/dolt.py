@@ -8,6 +8,7 @@ connection closes. Multi-ref scripts address other branches as
 "<db>/<branch>".public.<table>.
 """
 
+import csv
 import os
 
 import psycopg2
@@ -57,22 +58,24 @@ def commit_dolt_schema(db_uri: str, message: str = "Load SQL schema") -> None:
             conn.close()
 
 
-def _first(value):
-    """First element of a Dolt function result cell, which psycopg2 may
-    hand back as a list or as the text form of an array ("{a,b}")."""
-    if isinstance(value, (list, tuple)):
-        return value[0] if value else None
-    if isinstance(value, str) and value.startswith("{"):
-        return value.strip("{}").split(",")[0].strip('"')
-    return value
-
-
 def _cells(value) -> list:
+    """Fields of a Dolt procedure result (dolt_merge, dolt_commit, ...).
+    psycopg may hand the cell back as a list, as the text of an array
+    (Doltgres up to 0.57: ``{hash,1,0,"merge successful"}``) or as the text
+    of a record (Doltgres 1.x: ``(hash,1,0,"merge successful")``). Quoted
+    fields may contain commas and doubled quotes."""
     if isinstance(value, (list, tuple)):
         return list(value)
-    if isinstance(value, str) and value.startswith("{"):
-        return [c.strip('"') for c in value.strip("{}").split(",")]
+    if isinstance(value, str) and value[:1] in ("{", "(") and value[-1:] in ("}", ")"):
+        return next(csv.reader([value[1:-1]], delimiter=",", quotechar='"',
+                               doublequote=True, skipinitialspace=False))
     return [value]
+
+
+def _first(value):
+    """First field of a Dolt procedure result cell (see _cells)."""
+    cells = _cells(value)
+    return cells[0] if cells else None
 
 
 class DoltToolSuite(DBToolSuite):
@@ -261,10 +264,10 @@ class DoltToolSuite(DBToolSuite):
         )
         return [{"table": r[0], "description": r[1]} for r in rows or []]
 
-    def _conflict_rows(self, table: str, limit: int = 1000) -> list:
-        return self._rows_as_dicts(
-            f"SELECT * FROM dolt_conflicts_{table} LIMIT {int(limit)};"
-        )
+    def _conflict_rows(self, table: str) -> list:
+        """Every conflict row: a resolve callable must see them all, or the
+        rows it never saw keep the working set's stale version."""
+        return self._rows_as_dicts(f"SELECT * FROM dolt_conflicts_{table};")
 
     def _resolve_conflicts(self, ref: Ref, on_conflict) -> dict:
         """Resolve the data conflicts in the working set per on_conflict.

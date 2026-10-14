@@ -41,7 +41,7 @@ CONFIGS = {
     "data_agent": MINI_SCHEMA + """
         workload { branch_ops { commit_interval: 1 }
                    data_ops { statements_per_step: 2 rows_per_write: 2 write_fraction: 0.8 }
-                   data_agent { batches: 2 concurrent_batches: 1 batch_rows: 4 days_back: 2 steps_per_batch: 2 reset_prob: 1.0 } }""",
+                   data_agent { batches: 2 concurrent_batches: 1 batch_rows: 4 days_back: 2 steps_per_batch: 2 resets_per_batch: 1 } }""",
 }
 
 NEEDS_MERGE = {"context_mgmt", "multi_agent", "dev_agent", "data_agent"}

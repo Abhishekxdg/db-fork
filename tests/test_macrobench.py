@@ -267,3 +267,15 @@ def test_run_transaction_retries_then_raises(suite):
     finally:
         del tpcc.TRANSACTIONS["flaky"]
     assert not res.ok and calls["n"] == 3
+
+
+def test_intensity_caps_rl_env_group_size():
+    from google.protobuf import text_format
+    cfg = tp.MacroBenchConfig()
+    text_format.Parse(open("macrobench/configs/rl_env.textproto").read(), cfg)
+    cfg.workload.branch_intensity = 5.0
+    apply_intensity(cfg.workload)
+    p = cfg.workload.rl_env
+    assert p.tasks == 80                 # tasks keep scaling
+    assert p.group_size == 32            # a GRPO group is capped
+    assert p.rollouts_per_round == 4     # concurrency is not an intensity knob

@@ -155,8 +155,6 @@ CREATE TABLE IF NOT EXISTS `{KEYS_TABLE}` (
 )
 """
 
-# Conflict rows handed to a resolve callable, per table.
-_CONFLICT_ROW_LIMIT = 1000
 
 # How long to retry a flashback read that fails with 1412 for a table the
 # commit recorded, in case an index build is still in progress.
@@ -286,10 +284,18 @@ class _State:
         return table in self.schema
 
     def src(self, table: str) -> str:
-        """Table expression, with the flashback clause for a snapshot."""
+        """Table expression for a FROM clause: the table itself for a branch
+        head, or a flashback read for a snapshot. The flashback read is
+        wrapped in a derived table that pins the primary key as the access
+        path: SeekDB plans a flashback read like any other query and may
+        pick a secondary index, and an index built after the snapshot makes
+        the read fail with 1412 ("table definition has changed") although
+        the rows are still readable through the primary (found 2026-10-14,
+        S1.5 on historical forks). Callers add their own alias after it."""
         expr = _qt(self.db, table)
         if self.scn:
-            expr += f" AS OF SNAPSHOT {int(self.scn)}"
+            return (f"(SELECT /*+ INDEX(fb PRIMARY) */ * FROM {expr} "
+                    f"AS OF SNAPSHOT {int(self.scn)} fb)")
         return expr
 
 
@@ -593,9 +599,10 @@ class SeekDBToolSuite(DBToolSuite):
     def _snapshot_exists(self, state: _State, table: str):
         """True when the table can be read at the snapshot, False when it
         did not exist there, None when it existed (per the commit's
-        fingerprint) but its history is no longer readable: SeekDB raises
-        1412 for SCNs before an index build that followed row updates, and
-        that does not clear. Callers degrade for None."""
+        fingerprint) but its history cannot be read: SeekDB raises 1412 for
+        a flashback read planned through an index built after the snapshot
+        (``_State.src`` pins the primary key, so this is now only expected
+        while an index build is in progress). Callers degrade for None."""
         if not state.scn:
             return True
         expected = state.had_table(table)
@@ -604,7 +611,7 @@ class SeekDBToolSuite(DBToolSuite):
         deadline = time.monotonic() + (_UNREADABLE_WAIT_SEC if expected else 0)
         while True:
             try:
-                self._execute(f"SELECT 1 FROM {state.src(table)} LIMIT 1")
+                self._execute(f"SELECT 1 FROM {state.src(table)} s LIMIT 1")
                 return True
             except pymysql.MySQLError as e:
                 if not (e.args and e.args[0] == _ER_SNAPSHOT_BEFORE_TABLE):
@@ -756,12 +763,12 @@ class SeekDBToolSuite(DBToolSuite):
                             "rows_modified": 0, "unreadable": True})
                 continue
             if in_a and not in_b:
-                n = self._execute(f"SELECT COUNT(*) FROM {a.src(table)}")[0][0]
+                n = self._execute(f"SELECT COUNT(*) FROM {a.src(table)} s")[0][0]
                 out.append({"table_name": table, "rows_added": 0, "rows_deleted": int(n),
                             "rows_modified": 0})
                 continue
             if in_b and not in_a:
-                n = self._execute(f"SELECT COUNT(*) FROM {b.src(table)}")[0][0]
+                n = self._execute(f"SELECT COUNT(*) FROM {b.src(table)} s")[0][0]
                 out.append({"table_name": table, "rows_added": int(n), "rows_deleted": 0,
                             "rows_modified": 0})
                 continue
@@ -1105,7 +1112,7 @@ class SeekDBToolSuite(DBToolSuite):
             return base.src(table), "exact"
         if readable is None and base.alt is not None and self._snapshot_exists(base.alt, table):
             return base.alt.src(table), "fallback"
-        return f"(SELECT * FROM {theirs_expr} WHERE 1 = 0)", ("none" if readable is None else "absent")
+        return f"(SELECT * FROM {theirs_expr} z WHERE 1 = 0)", ("none" if readable is None else "absent")
 
     def _apply_theirs(self, ours_db, table, theirs, cols, pk, tag_t, tag_c):
         keys_t = _qt(ours_db, KEYS_TABLE)
@@ -1139,7 +1146,7 @@ class SeekDBToolSuite(DBToolSuite):
             f"LEFT JOIN {B} b ON {self._key('b', pk)} = c.k "
             f"LEFT JOIN {O} o ON {self._key('o', pk)} = c.k "
             f"LEFT JOIN {T} t ON {self._key('t', pk)} = c.k "
-            f"WHERE c.tag = %s AND c.tbl = %s LIMIT {_CONFLICT_ROW_LIMIT}", (tag_c, table))
+            f"WHERE c.tag = %s AND c.tbl = %s", (tag_c, table))
         names = [f"base_{c}" for c in cols] + [f"our_{c}" for c in cols] + [f"their_{c}" for c in cols]
         out = []
         for r in rows or []:

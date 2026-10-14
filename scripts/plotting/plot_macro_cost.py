@@ -1,0 +1,314 @@
+"""Cost figures of a macrobench sweep, all from one pass over the run
+directory: per run, the summed latency of every agent-side operation by
+category, the operation counts, the peak worker concurrency, the elapsed
+time and the invariant failures; per backend, the pooled median
+branch-creation latency that orders the systems in every figure.
+
+    python scripts/plotting/plot_macro_cost.py --run-dir run_stats/macro_20261014_curated \
+        --outdir figures/macro_20261014 [--figures rank bars panels] [--log]
+
+Figures (all by default):
+
+* ``rank``   rank_inversion.png: (a) rank by branch-creation latency against
+             rank by end-to-end elapsed per scenario, (b) share of operation
+             time per category.
+* ``bars``   cost_bars.png (S1, S3, S4, S6) and cost_bars_all.png (S1 to S6):
+             per scenario, worker-seconds in branch operations, in data
+             operations and the elapsed, as bars with the operation counts.
+* ``panels`` cost_panels.png: the same three quantities as one marker per
+             scenario on a shared row axis.
+
+Spine load and invariant probes are excluded everywhere; EXEC rows are
+excluded because their statements are rows of their own.
+"""
+
+import argparse
+import glob
+import json
+import os
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+
+SCENARIOS = [("rl_env", "S1\nRL env"), ("context_mgmt", "S2\ncontext"), ("multi_agent", "S3\nmulti-agent"),
+             ("dev_agent", "S4\ndev agent"), ("ops_agent", "S5\nops agent"), ("data_agent", "S6\ndata agent")]
+TITLES = {"rl_env": "S1 RL env (data-heavy)", "context_mgmt": "S2 context management",
+          "multi_agent": "S3 multi-agent (branch churn)", "dev_agent": "S4 dev agent (reconciliation)",
+          "ops_agent": "S5 ops agent", "data_agent": "S6 data agent (bulk data)"}
+MARKERS = {"rl_env": ("o", "#4c72b0"), "context_mgmt": ("v", "#937860"), "multi_agent": ("s", "#dd8452"),
+           "dev_agent": ("D", "#55a868"), "ops_agent": ("P", "#da8bc3"), "data_agent": ("^", "#8172b3")}
+FOUR = ["rl_env", "multi_agent", "dev_agent", "data_agent"]
+NAMES = {"CHRONOS": "Chronos", "DOLT": "Doltgres", "DOLT_MYSQL": "Dolt", "FILE_COPY": "file_copy",
+         "MATRIXONE": "MatrixOne", "NEON": "Neon", "SEEKDB": "SeekDB"}
+COLORS = {"Chronos": "#8c6d31", "Doltgres": "#1f77b4", "Dolt": "#6baed6", "file_copy": "#7f7f7f",
+          "MatrixOne": "#d62728", "Neon": "#2ca02c", "SeekDB": "#9467bd"}
+CATS = [("create", "branch create"), ("delete", "branch delete"), ("commit", "commit"),
+        ("reconcile", "diff / merge / rebase"), ("history", "reset / revert"), ("data", "ordinary data ops")]
+CAT_COLORS = {"create": "#f4a261", "delete": "#e76f51", "commit": "#e9c46a",
+              "reconcile": "#264653", "history": "#2a9d8f", "data": "#d9d9d9"}
+# Branch create includes the connection switch that reaches a branch
+# (CONNECT), which on Neon is a new connection per branch.
+OP_CAT = {"BRANCH": "create", "CONNECT": "create", "DELETE": "delete", "COMMIT": "commit",
+          "DIFF": "reconcile", "SCHEMA_DIFF": "reconcile", "MERGE": "reconcile", "REBASE": "reconcile",
+          "RESET": "history", "REVERT": "history", "LOG": "history"}
+BRANCH_CATS = frozenset(c for c, _ in CATS if c != "data")
+RED = "#b00020"
+
+
+def load(run_dir):
+    """One row per run: scenario, backend, elapsed, fails, the summed
+    latency per category (columns named as in CATS), branch_s / data_s and
+    branch_n / data_n (branch categories against the rest), and threads
+    (98th percentile of distinct threads per second). Second value: the
+    pooled median branch-creation latency per backend in ms."""
+    rows, create = [], {}
+    for f in sorted(glob.glob(os.path.join(run_dir, "*", "*_e2e_stats.json"))):
+        d = json.load(open(f))
+        be = NAMES.get(d["backend"], d["backend"])
+        fails = sum(1 for c in d["invariants"]["results"] if c["passed"] is False)
+        df = pd.read_parquet(f.replace("_e2e_stats.json", ".parquet"),
+                             columns=["op_name", "label", "latency", "thread_id", "start_time"])
+        df = df[~df.label.isin(["spine", "spine_update", "invariant"]) & (df.op_name != "EXEC")]
+        cat = df.op_name.map(lambda o: OP_CAT.get(o, "data"))
+        secs = df.latency.groupby(cat).sum().to_dict()
+        is_branch = cat.isin(BRANCH_CATS)
+        sec = ((df.start_time - df.start_time.min()) // 1).astype(int)
+        peak = int(df.assign(sec=sec).groupby("sec").thread_id.nunique().quantile(0.98))
+        create.setdefault(be, []).extend(df.latency[df.op_name == "BRANCH"].tolist())
+        row = {"scenario": d["scenario"], "backend": be, "elapsed": d["elapsed_sec"], "fails": fails,
+               "branch_s": float(df.latency[is_branch].sum()), "data_s": float(df.latency[~is_branch].sum()),
+               "branch_n": int(is_branch.sum()), "data_n": int((~is_branch).sum()), "threads": peak}
+        for c, _ in CATS:
+            row[c] = float(secs.get(c, 0.0))
+        rows.append(row)
+    return pd.DataFrame(rows), {b: 1000 * pd.Series(v).median() for b, v in create.items()}
+
+
+def _systems(create_ms):
+    return sorted(create_ms, key=create_ms.get)
+
+
+def _tidy(ax):
+    ax.grid(axis="x", color="#eee"); ax.set_axisbelow(True)
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+
+
+def _row_labels(ax, systems, create_ms, size=8.5, bold=False):
+    ax.set_yticks(range(len(systems)))
+    ax.set_yticklabels([f"{b}  {create_ms[b]:,.0f} ms" for b in systems], fontsize=size)
+    for lab, b in zip(ax.get_yticklabels(), systems):
+        lab.set_color(COLORS[b])
+        if bold:
+            lab.set_fontweight("bold")
+    ax.tick_params(axis="y", length=0)
+
+
+# --- rank_inversion.png -----------------------------------------------------
+
+def panel_rank(ax, t, create_ms):
+    """Rank by branch-creation latency (left) against rank by end-to-end
+    elapsed in every scenario (one column per scenario)."""
+    systems = _systems(create_ms)
+    cols = [s for s, _ in SCENARIOS if (t.scenario == s).any()]
+    for b in systems:
+        xs, ys = [0], [systems.index(b)]
+        for i, s in enumerate(cols):
+            d = t[t.scenario == s].sort_values("elapsed").backend.tolist()
+            if b in d:
+                xs.append(i + 1); ys.append(d.index(b))
+        ax.plot(xs, ys, "-o", color=COLORS[b], lw=1.6, ms=5, alpha=0.9)
+        ax.annotate(f"{b}  {create_ms[b]:,.0f} ms", (0, systems.index(b)), xytext=(-6, 0), textcoords="offset points",
+                    ha="right", va="center", fontsize=8, color=COLORS[b])
+    for i, s in enumerate(cols):
+        d = t[t.scenario == s].sort_values("elapsed")
+        for k, (b, e, f) in enumerate(zip(d.backend, d.elapsed, d.fails)):
+            lab = f"{e:,.0f}s" + (f" ✗{int(f)}" if f else "")
+            ax.text(i + 1, k + 0.32, lab, ha="center", va="top", fontsize=6.5, color=RED if f else "#444")
+    ax.set_xticks(range(len(cols) + 1))
+    ax.set_xticklabels(["branch\ncreate"] + [dict(SCENARIOS)[s] for s in cols], fontsize=7)
+    ax.set_yticks([])
+    ax.set_ylabel("rank (fastest at top)", fontsize=8)
+    ax.set_ylim(len(systems) - 0.4, -0.6)
+    ax.set_xlim(-0.6, len(cols) + 0.5)
+    ax.set_title("(a) Rank by branch-creation latency vs. rank by end-to-end elapsed", fontsize=9.5, loc="left")
+    for sp in ("top", "right", "left"):
+        ax.spines[sp].set_visible(False)
+    ax.grid(axis="x", color="#eee")
+
+
+def panel_breakdown(ax, t):
+    """Stacked share of agent-side operation time per category, one bar per
+    (scenario, system); elapsed and invariant failures printed at right."""
+    systems = list(COLORS)
+    labels, y = [], 0
+    for s, title in SCENARIOS:
+        d = t[t.scenario == s].set_index("backend")
+        if d.empty:
+            continue
+        present = [x for x in systems if x in d.index]
+        for b in present:
+            r = d.loc[b]
+            total = sum(r[c] for c, _ in CATS) or 1.0
+            left = 0.0
+            for c, _ in CATS:
+                w = r[c] / total
+                ax.barh(y, w, left=left, color=CAT_COLORS[c], edgecolor="white", lw=0.4, height=0.8)
+                left += w
+            lab = f"{r.elapsed:,.0f} s" + (f"  ✗{int(r.fails)}" if r.fails else "")
+            ax.text(1.01, y, lab, va="center", fontsize=7, color=RED if r.fails else "#444")
+            labels.append((y, b))
+            y += 1
+        ax.text(-0.16, y - 0.5 - (len(present) - 1) / 2, title.replace("\n", " "),
+                ha="right", va="center", fontsize=8, fontweight="bold", transform=ax.get_yaxis_transform())
+        y += 0.8
+    ax.set_yticks([p for p, _ in labels])
+    ax.set_yticklabels([b for _, b in labels], fontsize=7)
+    for lab, (_, b) in zip(ax.get_yticklabels(), labels):
+        lab.set_color(COLORS[b])
+    ax.tick_params(axis="y", length=0, pad=2)
+    ax.set_ylim(y - 0.6, -0.6)
+    ax.set_xlim(0, 1)
+    ax.set_xticks([0, 0.25, 0.5, 0.75, 1])
+    ax.set_xticklabels(["0", "25", "50", "75", "100 %"], fontsize=7)
+    ax.set_title("(b) Share of agent-side operation time; elapsed and invariant failures (✗) at right", fontsize=9.5, loc="left")
+    for sp in ("top", "right", "left"):
+        ax.spines[sp].set_visible(False)
+    handles = [plt.Rectangle((0, 0), 1, 1, color=CAT_COLORS[c]) for c, _ in CATS]
+    ax.legend(handles, [n for _, n in CATS], ncol=3, fontsize=7, loc="lower center", bbox_to_anchor=(0.5, 1.02), frameon=False)
+
+
+def fig_rank(t, create_ms, out):
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 7.5), gridspec_kw={"width_ratios": [1, 1.15], "wspace": 0.55})
+    panel_rank(ax1, t, create_ms)
+    panel_breakdown(ax2, t)
+    fig.suptitle("Branch creation predicts neither the cost nor the correctness of an agent workflow", fontsize=12, x=0.02, ha="left")
+    fig.text(0.02, 0.01, "Shares are of summed operation latency (workers run concurrently), spine load excluded; one run per cell.",
+             fontsize=7.5, color="#555")
+    fig.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
+    print("wrote", out)
+
+
+# --- cost_bars.png ----------------------------------------------------------
+
+BAR_PANELS = [("branch_s", "branch ops: worker-seconds (ops)", "#e8853a"),
+              ("data_s", "data ops: worker-seconds (ops)", "#9a9a9a"),
+              ("elapsed", "end-to-end elapsed: wall-clock s", "#3b5b7a")]
+
+
+def _k(n):
+    return f"{n/1000:.0f}k" if n >= 10000 else f"{n:,}"
+
+
+def fig_bars(t, create_ms, scenarios, out, log=False):
+    systems = _systems(create_ms)
+    n, m = len(systems), len(scenarios)
+    fig, axes = plt.subplots(m, 3, figsize=(13.5, 2.05 * m + 0.8), sharey=True,
+                             gridspec_kw={"wspace": 0.08, "hspace": 0.55}, squeeze=False)
+    for i, sc in enumerate(scenarios):
+        d = t[t.scenario == sc].set_index("backend").reindex(systems)
+        fails = d.fails.fillna(0).values
+        for j, (col, title, color) in enumerate(BAR_PANELS):
+            ax = axes[i, j]
+            raw = d[col].values.astype(float)
+            vals, missing = np.nan_to_num(raw, nan=0.0), np.isnan(raw)
+            bad = [col == "elapsed" and f > 0 for f in fails]
+            ax.barh(range(n), vals, color=[RED if b else color for b in bad], height=0.68)
+            xmax = vals.max() if vals.max() > 0 else 1.0
+            counts = d["branch_n"].values if col == "branch_s" else d["data_n"].values if col == "data_s" else None
+            for k, v in enumerate(vals):
+                if missing[k]:
+                    ax.text(xmax * 0.015, k, "no valid run", va="center", fontsize=7.5, color="#999", style="italic")
+                    continue
+                lab = f"{v:,.0f}" + (f"  ✗{int(fails[k])}" if bad[k] else "")
+                if counts is not None:
+                    lab += f"  ({_k(counts[k])} ops)"
+                ax.text(v * 1.06 if log else v + xmax * 0.015, k, lab, va="center", fontsize=7.5,
+                        color=RED if bad[k] else "#333", fontweight="bold" if bad[k] else "normal")
+            if log:
+                ax.set_xscale("log"); ax.set_xlim(max(1, vals.min() / 3), xmax * 6)
+            else:
+                ax.set_xlim(0, xmax * (1.5 if col != "elapsed" else 1.32))
+            ax.tick_params(axis="x", labelsize=7); _tidy(ax)
+            if i == 0:
+                ax.set_title(title, fontsize=10, loc="left")
+            if j == 0:
+                th = int(d.threads.median())
+                ax.set_ylabel(f"{TITLES.get(sc, sc)}\n{th} worker{'s' if th != 1 else ''} at peak", fontsize=9.5,
+                              rotation=0, ha="right", va="center", labelpad=8, fontweight="bold")
+        axes[i, 0].set_ylim(n - 0.5, -0.5)
+    for ax_row in axes:
+        _row_labels(ax_row[0], systems, create_ms)
+    fig.text(0.01, 0.005, "Systems ordered by branch-creation latency (pooled median beside the name). Worker-seconds = sum of every agent-side operation's "
+             "latency across the scenario's concurrent workers, so a column can exceed the wall-clock elapsed; the spine's background load is excluded. "
+             "Red = run with invariant failures (count). One run per cell; 'no valid run' = cell to rerun.", fontsize=7.5, color="#555")
+    fig.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
+    print("wrote", out)
+
+
+# --- cost_panels.png --------------------------------------------------------
+
+def fig_panels(t, create_ms, scenarios, out):
+    systems = _systems(create_ms)
+    n = len(systems)
+    panels = [("branch_s", "time in branch operations (s, summed)"),
+              ("data_s", "time in ordinary data operations (s, summed)"),
+              ("elapsed", "end-to-end elapsed (s)")]
+    fig, axes = plt.subplots(1, 3, figsize=(13, 0.55 * n + 2.2), sharey=True, gridspec_kw={"wspace": 0.08})
+    for ax, (col, title) in zip(axes, panels):
+        for k in range(n):
+            ax.axhline(k, color="#eee", lw=0.8, zorder=0)
+        for sc in scenarios:
+            marker, color = MARKERS[sc]
+            for k, b in enumerate(systems):
+                r = t[(t.scenario == sc) & (t.backend == b)]
+                if r.empty:
+                    continue
+                v, f = float(r.iloc[0][col]), int(r.iloc[0].fails)
+                bad = col == "elapsed" and f > 0
+                ax.plot(max(v, 1e-3), k, marker=marker, ms=7, color=color, markerfacecolor="white" if bad else color,
+                        markeredgewidth=1.6, markeredgecolor=RED if bad else color, ls="none", zorder=3)
+                if bad:
+                    ax.text(v * 1.25, k, f"✗{f}", va="center", fontsize=7, color=RED, fontweight="bold")
+        ax.set_xscale("log"); _tidy(ax)
+        ax.set_title(title, fontsize=9.5, loc="left")
+        ax.tick_params(axis="x", labelsize=7.5)
+    axes[0].set_ylim(n - 0.5, -0.5)
+    _row_labels(axes[0], systems, create_ms, bold=True)
+    handles = [plt.Line2D([], [], marker=MARKERS[sc][0], color=MARKERS[sc][1], ls="none", ms=7) for sc in scenarios]
+    labels = [TITLES[sc].split(" (")[0] for sc in scenarios]
+    handles.append(plt.Line2D([], [], marker="o", color=RED, markerfacecolor="white", markeredgewidth=1.6, ls="none", ms=7))
+    labels.append("run with invariant failures")
+    fig.legend(handles, labels, ncol=len(labels), fontsize=8, frameon=False, loc="lower center", bbox_to_anchor=(0.5, -0.02))
+    fig.text(0.01, -0.08, "Rows ordered by branch-creation latency (pooled median). Summed times add every agent-side operation's latency "
+             "over all workers (workers run concurrently, so they exceed wall time); spine load excluded. One run per cell.",
+             fontsize=7.5, color="#555")
+    fig.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
+    print("wrote", out)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--run-dir", required=True)
+    ap.add_argument("--outdir", required=True)
+    ap.add_argument("--figures", nargs="*", default=["rank", "bars", "panels"], choices=["rank", "bars", "panels"])
+    ap.add_argument("--log", action="store_true", help="log x axis on the bars")
+    a = ap.parse_args()
+    os.makedirs(a.outdir, exist_ok=True)
+    t, create_ms = load(a.run_dir)
+    present = [s for s, _ in SCENARIOS if (t.scenario == s).any()]
+    four = [s for s in FOUR if s in present]
+    if "rank" in a.figures:
+        fig_rank(t, create_ms, os.path.join(a.outdir, "rank_inversion.png"))
+    if "bars" in a.figures:
+        fig_bars(t, create_ms, four, os.path.join(a.outdir, "cost_bars.png"), a.log)
+        fig_bars(t, create_ms, present, os.path.join(a.outdir, "cost_bars_all.png"), a.log)
+    if "panels" in a.figures:
+        fig_panels(t, create_ms, four, os.path.join(a.outdir, "cost_panels.png"))
+
+
+if __name__ == "__main__":
+    main()

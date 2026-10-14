@@ -5,6 +5,6 @@ database_setup { db_name: "macro_context_mgmt" cleanup: true generated {} }
 schema { base: NO_BASE }
 workload {
   branch_ops { commit_interval: 2 retention_steps: 20 }
-  data_ops { statements_per_step: 6 rows_per_write: 50 write_fraction: 0.6 }
-  context_mgmt { compaction_interval: 25 fanout: 3 compaction_cycles: 8 rejected_cycle: 3 }
+  data_ops { statements_per_step: 6 rows_per_write: 50 write_fraction: 0.6 worker_threads: 3 }
+  context_mgmt { compaction_interval: 25 fanout: 3 compaction_cycles: 8 rejected_cycle: 3 cycles_per_rejection: 8 }
 }

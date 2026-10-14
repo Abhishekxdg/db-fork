@@ -15,8 +15,11 @@ for b in $(grep -oE "START [a-z_]+ [a-z_]+" "$D" | awk '{print $3}' | sort -u); 
     done_list=""
     for s in rl_env context_mgmt multi_agent dev_agent ops_agent data_agent; do
         L="$OUT/logs/${s}_${b}.log"; [[ -f "$L" ]] || continue
-        if grep -q "END $s $b rc=" "$D"; then
-            rc=$(grep "END $s $b rc=" "$D" | tail -1 | grep -oE 'rc=[0-9]+' | cut -d= -f2)
+        # The last START/END line for this cell decides whether it is
+        # finished (a rerun after a failure shows as running, not failed).
+        last=$(grep -E "(START|END) $s $b( |$)" "$D" | tail -1)
+        if [[ "$last" == *" END $s $b rc="* ]]; then
+            rc=$(grep -oE 'rc=[0-9]+' <<< "$last" | cut -d= -f2)
             inv=$(grep -oE "Invariants: [0-9]+ passed, [0-9]+ failed, [0-9]+ not applicable" "$L" | tail -1 | sed -E 's/Invariants: ([0-9]+) passed, ([0-9]+) failed, ([0-9]+) not applicable/\1p\/\2f\/\3na/')
             el=$(grep -oE "elapsed[_ ]sec[\"': ]+[0-9.]+" "$L" | tail -1 | grep -oE '[0-9.]+$' | cut -d. -f1)
             [[ "$rc" == 0 ]] && mark="" || mark="!rc=$rc"

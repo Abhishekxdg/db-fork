@@ -278,7 +278,12 @@ class CHGenerator:
 
 def insert_rows(db, table: str, columns: list, rows, batch_rows: int = 500) -> int:
     """Insert ``rows`` into ``table`` through a Session in multi-row
-    INSERTs with parameters. Returns the number of rows inserted."""
+    INSERTs with parameters. Returns the number of rows inserted. A backend
+    with a ``seed_bulk_insert`` method (MatrixOne: LOAD DATA INLINE) loads
+    them through that instead; this is only ever called for untimed seeds."""
+    bulk = getattr(getattr(db, "suite", None), "seed_bulk_insert", None)
+    if bulk is not None:
+        return bulk(db, table, columns, rows, batch_rows)
     placeholders = "(" + ", ".join(["%s"] * len(columns)) + ")"
     head = f"INSERT INTO {table} ({', '.join(columns)}) VALUES "
     total = 0

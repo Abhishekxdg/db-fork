@@ -6,5 +6,5 @@ schema { base: CH_BENCH scale_factor: 1 items: 1000 customers_per_district: 100 
 workload {
   branch_ops { commit_interval: 1 }
   data_ops { statements_per_step: 4 rows_per_write: 10 spine_clients: 1 analytical_fraction: 0.1 worker_threads: 2 }
-  ops_agent { spine_commits: 12 fault_commit_offset: 4 investigation_branches: 3 history_offset: 8 load_during_investigation: false commit_every_txns: 5 schema_fault: true }
+  ops_agent { spine_commits: 12 fault_commit_offset: 4 investigation_branches: 3 history_offset: 8 load_during_investigation: false commit_every_txns: 5 schema_fault: true commits_per_incident: 12 }
 }

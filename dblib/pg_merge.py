@@ -20,7 +20,6 @@ Bookkeeping tables (prefix ``_bb_``) are never merged.
 from dblib.db_api import Ref  # noqa: F401 (type annotation)
 
 META_PREFIX = "_bb_"
-_CONFLICT_ROW_LIMIT = 1000
 
 
 def _q(ident: str) -> str:
@@ -417,7 +416,7 @@ class PgMergeMixin:
         rows = self._exec(ours, f'SELECT {select}, b.{_q(pk[0])} IS NULL, o.{_q(pk[0])} IS NULL, t.{_q(pk[0])} IS NULL '
                                 f'FROM {CK} c LEFT JOIN {B} b ON {self._key("b", pk)} = c.k '
                                 f'LEFT JOIN {O} o ON {self._key("o", pk)} = c.k LEFT JOIN {T} t ON {self._key("t", pk)} = c.k '
-                                f'LIMIT {_CONFLICT_ROW_LIMIT}') or []
+                                ) or []
         names = [f"base_{c}" for c in cols] + [f"our_{c}" for c in cols] + [f"their_{c}" for c in cols]
         out = []
         for r in rows:

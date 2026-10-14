@@ -11,6 +11,8 @@ SSH=(ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o C
 RSYNC=(rsync -az --info=progress2 -e "ssh -i $SSH_KEY -o BatchMode=yes -o StrictHostKeyChecking=accept-new")
 echo "== $b on $host"
 "${SSH[@]}" "bash -s -- '$(cat ~/.ssh/id_ed25519.pub)'" < scripts/remote/common.sh
+# Never let unattended-upgrades restart a database service mid-sweep.
+"${SSH[@]}" bash -s < scripts/remote/disable_auto_upgrades.sh
 case "$b" in
     dolt)       "${SSH[@]}" bash -s < scripts/remote/setup_doltgres.sh ;;
     dolt_mysql) "${SSH[@]}" bash -s < scripts/remote/setup_dolt.sh ;;

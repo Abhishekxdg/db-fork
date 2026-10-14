@@ -102,7 +102,6 @@ _MESSAGE_BYTES = 120
 # Commit property listing the commit ids a merge carried over
 # (merge_branch keeps commit properties but drops the commit body).
 _CARRIED = "bb_commits"
-_CONFLICT_ROW_LIMIT = 1000
 _PUBLISH_THREADS = 8
 
 _TXN_KEYWORDS = ("BEGIN", "START", "COMMIT", "END", "ROLLBACK", "ABORT")
@@ -525,7 +524,7 @@ def _conflict_rows(db, cols, pk) -> list:
         f"b.{p0} IS NULL, o.{p0} IS NULL, t.{p0} IS NULL FROM __bb_ck c "
         f"LEFT JOIN __bb_b b ON {_join('c', 'b', pk)} "
         f"LEFT JOIN __bb_o o ON {_join('c', 'o', pk)} "
-        f"LEFT JOIN __bb_t t ON {_join('c', 't', pk)} LIMIT {_CONFLICT_ROW_LIMIT}").fetchall()
+        f"LEFT JOIN __bb_t t ON {_join('c', 't', pk)}").fetchall()
     lower = [c.lower() for c in cols]
     names = [f"base_{c}" for c in lower] + [f"our_{c}" for c in lower] + [f"their_{c}" for c in lower]
     out = []

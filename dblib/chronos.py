@@ -94,7 +94,6 @@ ROWID_COL = "_bb_rowid"
 TEMP_PREFIX = "bbtmp_"
 _SESSION_CACHE = 16
 _CHUNK = 500
-_CONFLICT_ROW_LIMIT = 2000
 
 _LOG_DDL = f"""
 CREATE TABLE IF NOT EXISTS {LOG_TABLE} (
@@ -1593,7 +1592,7 @@ class ChronosToolSuite(DBToolSuite):
             rows_out = []
             for table, pairs in conflicts.items():
                 rows = []
-                for o, t in pairs[:_CONFLICT_ROW_LIMIT]:
+                for o, t in pairs:
                     base_row = o.before or t.before or {}
                     our, their = (t.after, o.after) if swap else (o.after, t.after)
                     our_type, their_type = (_dtype(t), _dtype(o)) if swap else (_dtype(o), _dtype(t))

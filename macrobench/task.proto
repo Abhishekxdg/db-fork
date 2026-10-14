@@ -169,7 +169,12 @@ message ContextMgmtParams {
     int32 compaction_cycles = 3;    // how many compaction points
     // 1-based compaction cycle whose selected strategy is later rejected
     // (reverted, then rebased onto a retained alternative); 0 = never.
+    // With cycles_per_rejection > 0 the cycles form blocks of that many,
+    // rejected_cycle is relative to each block, and a rejection runs at
+    // the end of every block (so a run of k blocks has k rejections);
+    // 0 = one rejection at the end of the run.
     int32 rejected_cycle = 4;
+    int32 cycles_per_rejection = 5;
 }
 
 enum ResolutionPolicy {
@@ -235,6 +240,12 @@ message OpsAgentParams {
     // The bad deployment also changes the schema (a new table, a new
     // column, a widened column type); the reset must undo it (S5.3).
     bool schema_fault = 7;
+    // Commits per incident: the spine_commits form incidents of this many
+    // commits, each with its own bad deploy (fault_commit_offset before
+    // the incident's last commit), investigation branches (an equal share
+    // of investigation_branches) and reset, so branch intensity k gives k
+    // incidents. 0 = one incident over all spine_commits.
+    int32 commits_per_incident = 8;
 }
 
 // S6 Data agent: ingest batches on branches, derived tables, reset on
@@ -245,7 +256,8 @@ message DataAgentParams {
     int32 batch_rows = 3;              // order rows per batch
     int32 days_back = 4;               // D: how far back a batch reaches
     int32 steps_per_batch = 5;         // exec steps a batch is split into
-    float reset_prob = 6;              // p: reset to an earlier commit
+    reserved 6;                        // was reset_prob (a probability per step)
+    int32 resets_per_batch = 7;        // resets to an earlier commit per batch (x branch intensity)
 }
 
 message Workload {
@@ -298,4 +310,10 @@ message MacroBenchConfig {
     // --storage-sample-interval overrides it, and a negative value or
     // --storage-sample-interval 0 turns the sampler off).
     float storage_sample_interval_sec = 9;
+    // Spine-only baseline (0 = off): set the data up as usual, run the
+    // scenario's spine load alone for this many seconds and skip the
+    // workflow (no branches, no agent work, no spine commits). Needs a
+    // scenario with a spine load (dev_agent, ops_agent, data_agent) and
+    // data_ops.spine_clients > 0.
+    int32 spine_only_sec = 10;
 }

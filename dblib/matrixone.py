@@ -84,6 +84,8 @@ Known limitations (MatrixOne v4.2.5):
   tarLCASnapshot/baseLCASnapshot in pkg/frontend/data_branch_types.go).
 """
 
+import csv
+import io
 import json
 import os
 import re
@@ -156,7 +158,6 @@ CREATE TABLE IF NOT EXISTS {table} (
 )
 """
 
-_CONFLICT_ROW_LIMIT = 1000
 
 
 def connect(db_name: str = None, autocommit: bool = True, **kwargs):
@@ -210,6 +211,9 @@ def branch_of_db(db_name: str, db: str) -> str:
     return m.group(1) if m else name
 
 
+# MatrixOne stores database names in lowercase (SHOW DATABASES and
+# information_schema report them so) while accepting any case in
+# statements, so catalog lookups compare case-insensitively.
 def meta_db_name(db_name: str) -> str:
     return f"{db_name}{_BRANCH_SEP}{_META_NAME}"
 
@@ -343,7 +347,10 @@ class MatrixOneToolSuite(DBToolSuite):
     def init_for_bench(cls, collector: rc.ResultCollector, db_name: str,
                        default_branch_name: str = MAIN_BRANCH,
                        measure_storage: bool = False):
-        return cls(connect(db_name), collector, db_name, default_branch_name,
+        # No default database: main's own database is replaced by its next
+        # generation when main is rebased, so a connection must not depend
+        # on it; every statement names its database or follows a USE.
+        return cls(connect(None), collector, db_name, default_branch_name,
                    measure_storage)
 
     def __init__(self, connection, collector: rc.ResultCollector, db_name: str,
@@ -471,7 +478,7 @@ class MatrixOneToolSuite(DBToolSuite):
             "SELECT c.table_name, c.column_name, c.column_type, c.column_key "
             "FROM information_schema.columns c JOIN information_schema.tables t "
             "ON t.table_schema = c.table_schema AND t.table_name = c.table_name "
-            "WHERE c.table_schema = %s AND t.table_type = 'BASE TABLE' AND c.table_name NOT LIKE %s "
+            "WHERE LOWER(c.table_schema) = LOWER(%s) AND t.table_type = 'BASE TABLE' AND c.table_name NOT LIKE %s "
             "ORDER BY c.table_name, c.ordinal_position",
             (db, META_PREFIX.replace("_", r"\_") + "%")) or []
         out: dict = {}
@@ -591,7 +598,7 @@ class MatrixOneToolSuite(DBToolSuite):
     def _tables(self, db: str) -> list:
         rows = self._execute(
             "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema = %s AND table_type = 'BASE TABLE' "
+            "WHERE LOWER(table_schema) = LOWER(%s) AND table_type = 'BASE TABLE' "
             "AND table_name NOT LIKE %s ORDER BY table_name",
             (db, META_PREFIX.replace("_", r"\_") + "%"))
         return [r[0] for r in rows or []]
@@ -600,7 +607,7 @@ class MatrixOneToolSuite(DBToolSuite):
         """[(name, column_type, is_nullable, column_default)]"""
         rows = self._execute(
             "SELECT column_name, column_type, is_nullable, column_default "
-            "FROM information_schema.columns WHERE table_schema = %s AND table_name = %s "
+            "FROM information_schema.columns WHERE LOWER(table_schema) = LOWER(%s) AND table_name = %s "
             "ORDER BY ordinal_position", (db, table))
         return [(r[0], r[1], r[2], r[3]) for r in rows or [] if not str(r[0]).startswith("__mo_")]
 
@@ -676,6 +683,49 @@ class MatrixOneToolSuite(DBToolSuite):
     # ------------------------------------------------------------------
     # Hooks
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Seed bulk load (untimed setup only)
+    # ------------------------------------------------------------------
+
+    SEED_LOAD_CHUNK_ROWS = 20000
+
+    def seed_bulk_insert(self, db, table: str, columns: list, rows, batch_rows: int = 500) -> int:
+        """Load seed rows with ``LOAD DATA INLINE`` instead of multi-row
+        INSERTs. MatrixOne's INSERT path costs about 1.4 ms per row even in
+        500-row batches (the CH seed took 14 min); its bulk loader takes CSV
+        text in the statement. Used by ``macrobench.datagen.ch.insert_rows``
+        for the untimed seed only, never for measured operations. NULL is
+        backslash-N, strings are quoted with doubled quotes, and ``batch_rows``
+        is ignored in favour of SEED_LOAD_CHUNK_ROWS."""
+        cols = ", ".join(f"`{c}`" for c in columns)
+        stmt = (f"LOAD DATA INLINE FORMAT='csv', DATA=%s INTO TABLE `{table}` "
+                f"FIELDS TERMINATED BY ',' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' ({cols})")
+
+        def cell(v):
+            if v is None:
+                return "\\N"
+            if isinstance(v, bool):
+                return "1" if v else "0"
+            return v
+
+        total = 0
+        buf = io.StringIO()
+        writer = csv.writer(buf, lineterminator="\n", quoting=csv.QUOTE_MINIMAL, doublequote=True)
+        n = 0
+        for row in rows:
+            writer.writerow([cell(v) for v in row])
+            n += 1
+            if n >= self.SEED_LOAD_CHUNK_ROWS:
+                db.sql(stmt, (buf.getvalue(),))
+                total += n
+                buf = io.StringIO()
+                writer = csv.writer(buf, lineterminator="\n", quoting=csv.QUOTE_MINIMAL, doublequote=True)
+                n = 0
+        if n:
+            db.sql(stmt, (buf.getvalue(),))
+            total += n
+        return total
 
     def _storage_bytes(self) -> int:
         """Size of the server's data directory (object store plus log
@@ -842,7 +892,6 @@ class MatrixOneToolSuite(DBToolSuite):
                         pk: list, cols: list) -> list:
         """Rows in Dolt's dolt_conflicts_<table> shape: base_*, our_*,
         their_* columns plus our_diff_type / their_diff_type."""
-        keys = keys[:_CONFLICT_ROW_LIMIT]
         base_rows = {}
         kpos = [cols.index(c) for c in pk]
         for chunk in self._chunks(keys):
@@ -1509,7 +1558,7 @@ class MatrixOneToolSuite(DBToolSuite):
     # ------------------------------------------------------------------
 
     async def open_async_pool(self, size: int) -> None:
-        self.async_pool = await create_pool_async(self.db_name, size)
+        self.async_pool = await create_pool_async(None, size)
 
     def _pool_connection(self):
         return mysql_common.aiomysql_pool_connection(self.async_pool)

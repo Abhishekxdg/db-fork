@@ -277,10 +277,10 @@ class DoltMySQLToolSuite(DBToolSuite):
         )
         return [{"table": r[0], "description": r[1]} for r in rows or []]
 
-    def _conflict_rows(self, table: str, limit: int = 1000) -> list:
-        return self._rows_as_dicts(
-            f"SELECT * FROM dolt_conflicts_{table} LIMIT {int(limit)};"
-        )
+    def _conflict_rows(self, table: str) -> list:
+        """Every conflict row: a resolve callable must see them all, or the
+        rows it never saw keep the working set's stale version."""
+        return self._rows_as_dicts(f"SELECT * FROM dolt_conflicts_{table};")
 
     def _resolve_conflicts(self, ref: Ref, on_conflict) -> dict:
         """Resolve the data conflicts in the working set per on_conflict.
