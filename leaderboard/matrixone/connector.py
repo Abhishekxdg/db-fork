@@ -31,6 +31,8 @@ class MatrixOne(Connector):
 
     def delete(self, db: str) -> None:
         matrixone.drop_database(db)
+        if self.exists(db):
+            raise RuntimeError(f"MatrixOne database or snapshot for '{db}' still exists after deletion")
 
     def exists(self, db: str) -> bool:
         with closing(matrixone.connect()) as conn, conn.cursor() as cur:

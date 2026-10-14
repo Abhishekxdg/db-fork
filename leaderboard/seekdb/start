@@ -8,8 +8,10 @@ if [ -n "${SEEKDB_DATA_DIR:-}" ]; then
     data_dir="$SEEKDB_DATA_DIR"
 elif [ -d "$HOME/seekdb/store" ]; then
     data_dir="$HOME/seekdb/store"
-else
+elif [ -d "/opt/homebrew/var/seekdb/data" ] || [ -d "/opt/homebrew/var/seekdb" ]; then
     data_dir="/opt/homebrew/var/seekdb/data"
+else
+    data_dir="$HOME/seekdb/store"
 fi
 mkdir -p "$runs" "$data_dir"
 

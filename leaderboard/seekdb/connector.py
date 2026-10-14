@@ -31,6 +31,8 @@ class SeekDB(Connector):
 
     def delete(self, db: str) -> None:
         seekdb.drop_database(db)
+        if self.exists(db):
+            raise RuntimeError(f"SeekDB database '{db}' still exists after deletion")
 
     def exists(self, db: str) -> bool:
         with closing(seekdb.connect()) as conn, conn.cursor() as cur:

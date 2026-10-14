@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import closing
+import hashlib
 import os
 from pathlib import Path
 
@@ -34,7 +35,9 @@ class Neon(Connector):
         neon.API_KEY = os.environ.get("NEON_API_KEY_ORG", neon.API_KEY)
 
     def scope(self) -> dict:
-        return {"provider": "neon", "region": self.region, "pg_version": int(neon.NEON_PG_VERSION)}
+        key = os.environ.get("NEON_API_KEY_ORG", neon.API_KEY or "")
+        account = hashlib.sha256(key.encode()).hexdigest()[:12] if key else ""
+        return {"provider": "neon", "account": account, "region": self.region, "pg_version": int(neon.NEON_PG_VERSION)}
 
     def preflight(self) -> None:
         self._sync_env()
@@ -70,7 +73,9 @@ class Neon(Connector):
         target = f"project_{db}"
         for proj in neon.list_projects():
             if proj.get("name") == target:
-                NeonToolSuite.delete_project(proj["id"])
+                neon.api_request("DELETE", f"projects/{proj['id']}")
+        if self.exists(db):
+            raise RuntimeError(f"Neon project '{target}' still exists after deletion")
 
     def exists(self, db: str) -> bool:
         self._sync_env()

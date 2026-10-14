@@ -132,6 +132,7 @@ class FileCopyToolSuite(DBToolSuite):
         self._shared_branches_lock = shared_branches_lock
         self._create_db_lock = create_db_lock
         self._on_neutral = False
+        self._conn_lock = threading.RLock()
         with self._shared_branches_lock:
             shared_branches.add(default_branch_name or db_name)
         self._current_ref = Ref(default_branch_name)
@@ -139,26 +140,26 @@ class FileCopyToolSuite(DBToolSuite):
             self._SUITES.add(self)
 
     def _db_for_branch(self, branch_name: str) -> str:
-        if branch_name == self.default_branch:
-            return self.db_name
         return branch_db_name(self.db_name, branch_name)
 
     def _connect_to(self, uri: str) -> None:
-        if self.conn:
-            try:
-                self.conn.close()
-            except Exception:
-                pass
-        self.conn = psycopg2.connect(uri)
-        self.conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
-        self._on_neutral = False
+        with self._conn_lock:
+            if self.conn:
+                try:
+                    self.conn.close()
+                except Exception:
+                    pass
+            self.conn = psycopg2.connect(uri)
+            self.conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+            self._on_neutral = False
 
     def _go_neutral(self, clear_ref: bool = False) -> None:
         """Move the connection off any branch database."""
-        self._connect_to(self.get_default_connection_uri())
-        self._on_neutral = True
-        if clear_ref:
-            self._current_ref = None
+        with self._conn_lock:
+            self._connect_to(self.get_default_connection_uri())
+            self._on_neutral = True
+            if clear_ref:
+                self._current_ref = None
 
     @classmethod
     def _detach_suites_on(cls, target_db: str, clear_ref: bool = False) -> None:
@@ -166,20 +167,30 @@ class FileCopyToolSuite(DBToolSuite):
             suites = list(cls._SUITES)
         for s in suites:
             try:
-                if (
-                    s._current_ref is not None
-                    and s._db_for_branch(s._current_ref.branch) == target_db
-                    and (clear_ref or not getattr(s, "_on_neutral", False))
-                ):
-                    s._go_neutral(clear_ref=clear_ref)
+                with s._conn_lock:
+                    if (
+                        s._current_ref is not None
+                        and s._db_for_branch(s._current_ref.branch) == target_db
+                        and (clear_ref or not getattr(s, "_on_neutral", False))
+                    ):
+                        s._go_neutral(clear_ref=clear_ref)
             except Exception:
                 pass
 
     def _connect(self, ref: Ref, exec_id: int, timed: bool, label: str, fallback: bool):
-        if getattr(self, "_on_neutral", False) and self._current_ref == ref:
-            self._connect_impl(ref)
-            return None
-        return super()._connect(ref, exec_id, timed, label, fallback)
+        with self._conn_lock:
+            if getattr(self, "_on_neutral", False) and self._current_ref == ref:
+                self._connect_impl(ref)
+                return None
+            return super()._connect(ref, exec_id, timed, label, fallback)
+
+    def _exec_one(self, *args, **kwargs):
+        with self._conn_lock:
+            return super()._exec_one(*args, **kwargs)
+
+    def close_connection(self) -> None:
+        with self._conn_lock:
+            super().close_connection()
 
     def list_branches(self) -> list:
         with self._shared_branches_lock:
@@ -201,13 +212,14 @@ class FileCopyToolSuite(DBToolSuite):
             return dbutil.get_volume_usage_bytes(PGSQL_DATA_DIR)
         with self._shared_branches_lock:
             branch_names = [self._db_for_branch(b) for b in self.shared_branches]
-        if not branch_names or not self.conn:
-            return 0
-        with self.conn.cursor() as cur:
-            cur.execute("SHOW data_directory;")
-            pg_data_dir = cur.fetchone()[0]
-            cur.execute("SELECT oid FROM pg_database WHERE datname = ANY(%s);", (branch_names,))
-            oids = [str(row[0]) for row in cur.fetchall()]
+        with self._conn_lock:
+            if not branch_names or not self.conn:
+                return 0
+            with self.conn.cursor() as cur:
+                cur.execute("SHOW data_directory;")
+                pg_data_dir = cur.fetchone()[0]
+                cur.execute("SELECT oid FROM pg_database WHERE datname = ANY(%s);", (branch_names,))
+                oids = [str(row[0]) for row in cur.fetchall()]
         base_dir = os.path.join(pg_data_dir, "base")
         return sum(dbutil.get_directory_size_bytes(os.path.join(base_dir, oid)) for oid in oids)
 
@@ -287,7 +299,7 @@ class FileCopyToolSuite(DBToolSuite):
     @classmethod
     def cleanup(cls, info):
         try:
-            info.change_file_copy_method(info.prev_method)
+            info.change_file_copy_method(info.prev_method or "copy")
             drop_database(info.db_name)
         except Exception as e:
             print(f"Error deleting database: {e}")
@@ -298,7 +310,7 @@ class FileCopyToolSuite(DBToolSuite):
         def __init__(self, db_name: str):
             self.branches = set()
             self.db_name = db_name
-            self.prev_method = ""
+            self.prev_method = "copy"
             self.branches_lock = threading.Lock()
             self.create_db_lock = threading.Lock()
             self.change_file_copy_method("clone")
@@ -312,7 +324,9 @@ class FileCopyToolSuite(DBToolSuite):
                 conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
                 cur = conn.cursor()
                 cur.execute("SHOW file_copy_method;")
-                self.prev_method = cur.fetchone()[0]
+                current = cur.fetchone()[0]
+                if method == "clone" and current != "clone":
+                    self.prev_method = current
                 cur.execute(f"ALTER SYSTEM SET file_copy_method = '{method}';")
                 cur.execute("SELECT pg_reload_conf();")
                 print(f"Changed file copy method to {method}")

@@ -1040,11 +1040,17 @@ class WorkerContext:
     def connect(self, branch: str, timed: bool = True) -> None:
         """Switch to ``branch`` (an exec with an empty script, so the
         CONNECT row carries the switch cost)."""
+        prev = self.current_branch
         self.db_tools.exec([], refs=[branch], timed=timed).pop().raise_for_status()
+        if self.current_branch != prev:
+            self.clear_pk_cache()
 
     async def connect_async(self, branch: str, timed: bool = True) -> None:
+        prev = self.current_branch
         res = await self.db_tools.exec_async([], refs=[branch], timed=timed)
         res[0].raise_for_status()
+        if self.current_branch != prev:
+            self.clear_pk_cache()
 
     def run_sql(self, sql: str, params=None, timed: bool = True):
         """Run one statement on the current branch through exec() and
@@ -1193,6 +1199,7 @@ class WorkerContext:
         )
         if not self._existing_pks and existing_pks:
             self._existing_pks = existing_pks
+            self._known_pks.update(existing_pks)
         return len(existing_pks) if existing_pks else 0
 
     def prepare_range_query(
@@ -1212,6 +1219,7 @@ class WorkerContext:
 
         if not self._existing_pks and existing_pks:
             self._existing_pks = existing_pks
+            self._known_pks.update(existing_pks)
 
         if not existing_pks:
             raise ValueError(f"No existing keys for {operation_name}")

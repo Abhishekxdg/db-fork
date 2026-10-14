@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import closing
+import hashlib
 import os
 from pathlib import Path
 
@@ -37,8 +38,10 @@ class Xata(Connector):
         xata.XATA_API_BASE_URL = f"https://api.xata.tech/organizations/{xata.XATA_ORGANIZATION_ID}/"
 
     def scope(self) -> dict:
-        org = os.environ.get("XATA_ORGANIZATION_ID", xata.XATA_ORGANIZATION_ID)
-        return {"provider": "xata", "organization_id": org, "region": self.region}
+        org = os.environ.get("XATA_ORGANIZATION_ID", xata.XATA_ORGANIZATION_ID or "")
+        key = os.environ.get("XATA_API_KEY", xata.API_KEY or "")
+        account = hashlib.sha256(key.encode()).hexdigest()[:12] if key else ""
+        return {"provider": "xata", "organization_id": org, "account": account, "region": self.region}
 
     def preflight(self) -> None:
         self._sync_env()
@@ -71,7 +74,9 @@ class Xata(Connector):
         resp = XataToolSuite._request("GET", "projects")
         for proj in resp.get("projects", []):
             if proj.get("name") == target:
-                XataToolSuite.delete_project(proj["id"])
+                XataToolSuite._request("DELETE", f"projects/{proj['id']}")
+        if self.exists(db):
+            raise RuntimeError(f"Xata project '{target}' still exists after deletion")
 
     def exists(self, db: str) -> bool:
         self._sync_env()

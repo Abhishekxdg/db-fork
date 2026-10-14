@@ -24,6 +24,10 @@ if [ ! -f "$data_dir/PG_VERSION" ]; then
     "$pg_bin_dir/initdb" -D "$data_dir" --auth=trust --no-locale --encoding=UTF8 > "$runs/file_copy.init.log" 2>&1
 fi
 
+if "$pg_bin_dir/pg_ctl" -D "$data_dir" status >/dev/null 2>&1; then
+    echo "PostgreSQL (file_copy) already running on $data_dir"
+    exit 0
+fi
 rm -f "$data_dir/postmaster.pid"
 "$pg_bin_dir/postgres" -D "$data_dir" -p "$port" -k /tmp -c max_connections=200 > "$runs/file_copy.log" 2>&1 &
 echo $! > "$runs/file_copy.pid"

@@ -47,6 +47,11 @@ class FileCopy(Connector):
 
     def delete(self, db: str) -> None:
         file_copy.drop_database(db)
+        with closing(self._admin()) as conn, conn.cursor() as cur:
+            cur.execute("ALTER SYSTEM RESET file_copy_method;")
+            cur.execute("SELECT pg_reload_conf();")
+        if self.exists(db):
+            raise RuntimeError(f"FileCopy database '{db}' still exists after deletion")
 
     def exists(self, db: str) -> bool:
         with closing(self._admin()) as conn, conn.cursor() as cur:

@@ -139,6 +139,7 @@ class InsertOperation(Operation):
         inserted = False
         for attempt in range(5):
             row_data, pk_tuple = self._next_unique_row(context, pk_columns)
+            context._known_pks.add(pk_tuple)
 
             try:
                 await context.run_sql_async(insert_sql, row_data)
@@ -147,6 +148,7 @@ class InsertOperation(Operation):
 
                 break
             except Exception as e:
+                context._known_pks.discard(pk_tuple)
                 if attempt == 4:  # Last attempt
                     raise
                 continue  # Retry with new data

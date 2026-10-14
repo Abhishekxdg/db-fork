@@ -60,6 +60,37 @@ class Recovery(unittest.TestCase):
             with mock.patch.object(server, "data_dir", Path("/tmp/other-data")):
                 self.assertNotEqual(server.scope(), original)
 
+        neon_srv = load_connector("neon")
+        with mock.patch.dict(os.environ, {"NEON_API_KEY_ORG": "key-a"}):
+            scope_a = neon_srv.scope()
+        with mock.patch.dict(os.environ, {"NEON_API_KEY_ORG": "key-b"}):
+            scope_b = neon_srv.scope()
+        self.assertNotEqual(scope_a, scope_b)
+        self.assertNotIn("key-a", json.dumps(scope_a))
+
+        xata_srv = load_connector("xata")
+        with mock.patch.dict(os.environ, {"XATA_API_KEY": "key-a", "XATA_ORGANIZATION_ID": "org-a"}):
+            x_scope_a = xata_srv.scope()
+        with mock.patch.dict(os.environ, {"XATA_API_KEY": "key-b", "XATA_ORGANIZATION_ID": "org-a"}):
+            x_scope_b = xata_srv.scope()
+        self.assertNotEqual(x_scope_a, x_scope_b)
+        self.assertNotIn("key-a", json.dumps(x_scope_a))
+
+    def test_file_copy_db_for_branch_respects_setup_branches(self):
+        import threading
+        suite = file_copy.FileCopyToolSuite(
+            connection=mock.Mock(),
+            collector=mock.Mock(),
+            db_name="bb_root",
+            default_branch_name="setup_branch_10",
+            shared_branches=set(),
+            shared_branches_lock=threading.Lock(),
+            create_db_lock=threading.Lock(),
+        )
+        self.assertEqual(suite._db_for_branch("main"), "bb_root")
+        self.assertEqual(suite._db_for_branch("bb_root"), "bb_root")
+        self.assertEqual(suite._db_for_branch("setup_branch_10"), "bb_root__setup_branch_10")
+
 
 class RunLifecycle(unittest.TestCase):
     def setUp(self):

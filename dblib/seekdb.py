@@ -84,6 +84,8 @@ def _default_data_dir() -> str:
         path = os.path.expanduser(cand)
         if os.path.isdir(path):
             return path
+    if os.path.isdir("/opt/homebrew/var/seekdb"):
+        return "/opt/homebrew/var/seekdb/data"
     return os.path.expanduser("~/seekdb/store")
 
 
