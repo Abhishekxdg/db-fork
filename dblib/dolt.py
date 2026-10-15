@@ -212,6 +212,8 @@ class DoltToolSuite(DBToolSuite):
             "rows_modified": sum(t.get("rows_modified") or 0 for t in tables),
         }
 
+    SCHEMA_DIFF_HALF = "native"   # dolt_schema_diff
+
     def _schema_diff_impl(self, ref_a: Ref, ref_b: Ref) -> dict:
         """dolt_schema_diff names the tables whose schema differs (added,
         dropped or changed); the column detail of changed tables comes from

@@ -217,13 +217,14 @@ def test_schema_diff_reports_tables_and_columns(suite):
     r = suite.exec(["ALTER TABLE t ADD COLUMN w INT", "CREATE TABLE extra (id INT PRIMARY KEY, z VARCHAR(4))"],
                    refs=["sd"])[0]
     assert r.ok, r.error
-    d = suite.schema_diff(base, "sd")
+    d = suite.diff(base, "sd")
     assert d.ok, d.error
+    d.value = d.value["schema"]
     assert d.value["tables_added"] == ["extra"] and d.value["tables_dropped"] == []
     assert d.value["columns_added"] == {"t": ["w"]} and d.value["changed"]
     assert not d.value["columns_dropped"] and not d.value["columns_changed"]
-    back = suite.schema_diff("sd", base)
-    assert back.ok and back.value["tables_dropped"] == ["extra"] and back.value["columns_dropped"] == {"t": ["w"]}
-    same = suite.schema_diff("sd", "sd")
-    assert same.ok and not same.value["changed"]
+    back = suite.diff("sd", base)
+    assert back.ok and back.value["schema"]["tables_dropped"] == ["extra"] and back.value["schema"]["columns_dropped"] == {"t": ["w"]}
+    same = suite.diff("sd", "sd")
+    assert same.ok and not same.value["schema"]["changed"]
     assert suite.delete("sd").ok

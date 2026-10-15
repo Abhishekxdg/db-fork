@@ -123,6 +123,11 @@ MO_COUNT_CONFLICTS = os.environ.get("MO_COUNT_CONFLICTS", "1").lower() not in ("
 # (DATA BRANCH PICK, see the limitations), so it is simulated in every
 # mode and unsupported in native-only mode.
 MO_NATIVE_RESET = native_only()
+# Native-only mode: merge skips the adapter's schema reconciliation (added
+# tables/columns replayed on the target before the per-table engine merge).
+MO_NATIVE_MERGE_AS_IS = native_only()
+# Native-only mode: a diff the engine refuses stays refused (no SQL fallback).
+MO_NATIVE_DIFF_ONLY = native_only()
 
 MAIN_BRANCH = "main"
 _BRANCH_SEP = "__"
@@ -310,7 +315,6 @@ class MatrixOneToolSuite(DBToolSuite):
         "reset": "native" if MO_NATIVE_RESET else "simulated",
         "delete": "native",
         "commit_refs": "native",
-        "schema_diff": "simulated",
         "multi_ref_exec": "native",
     }
     IMPLEMENTATION_NOTES = {
@@ -319,8 +323,10 @@ class MatrixOneToolSuite(DBToolSuite):
         "diff": "DATA BRANCH DIFF ... OUTPUT SUMMARY per table (native LCA)",
         "log": "SELECT from the _bb_commits bookkeeping table",
         "merge": "DATA BRANCH MERGE per table WHEN CONFLICT SKIP|ACCEPT; conflict rows/count "
-                 "from two native diffs against the fork snapshot; a resolve callable writes "
-                 "over the SKIP result",
+                 "from two native diffs against the fork snapshot; a resolve callable writes over "
+                 "the SKIP result. Tables and columns the source adds are created on the target "
+                 "first (the engine merges shared columns only and refuses a retyped one); in "
+                 "native-only mode that step is skipped and the engine's merge runs as it is",
         "rebase": ("re-fork: the branch's next generation is cloned from the upstream's head "
                    "snapshot and snapshotted (the new base); the branch's delta since its previous "
                    "base (a native diff of its own two snapshots) is copied in with SQL from "
@@ -334,7 +340,6 @@ class MatrixOneToolSuite(DBToolSuite):
                  + "; SQL row restore for commits inherited from a parent",
         "delete": "DATA BRANCH DELETE DATABASE (DROP DATABASE fallback)",
         "commit_refs": "time-travel reads t{snapshot = ...}",
-        "schema_diff": "catalog columns of each ref compared by the adapter",
         "multi_ref_exec": "cross-database queries",
     }
 
@@ -823,7 +828,20 @@ class MatrixOneToolSuite(DBToolSuite):
                 out.append({"table_name": table, "rows_added": int(n), "rows_deleted": 0,
                             "rows_modified": 0})
                 continue
-            (bi, bd, bu), (ai, ad, au) = self._summary(b.expr(table), a.expr(table))
+            try:
+                (bi, bd, bu), (ai, ad, au) = self._summary(b.expr(table), a.expr(table))
+            except Exception as e:
+                # The engine refuses a diff whose column sets are not the
+                # same objects (a column re-created by a reset, a retyped
+                # column: "schema compatibility check"). Simulate it then:
+                # anti-joins over the common columns through time-travel
+                # reads, as the single-server adapters do.
+                if "schema compatibility check" not in str(e) or MO_NATIVE_DIFF_ONLY:
+                    raise
+                added, deleted, modified = self._sql_summary(a, b, table)
+                out.append({"table_name": table, "rows_added": added, "rows_deleted": deleted,
+                            "rows_modified": modified, "simulated": True})
+                continue
             out.append({"table_name": table, "rows_added": bi + ad, "rows_deleted": bd + ai,
                         "rows_modified": bu + au,
                         "b_side": [bi, bd, bu], "a_side": [ai, ad, au]})
@@ -833,6 +851,39 @@ class MatrixOneToolSuite(DBToolSuite):
             "rows_deleted": sum(t["rows_deleted"] for t in out),
             "rows_modified": sum(t["rows_modified"] for t in out),
         }
+
+    def _expr_cols(self, expr: str) -> list:
+        """Column names a time-travel or plain table expression returns
+        (the snapshot's own columns, not the database's current ones)."""
+        with self.conn.cursor() as cur:
+            cur.execute(f"SELECT * FROM {expr} LIMIT 0")
+            return [d[0] for d in cur.description if not str(d[0]).startswith("__mo_")]
+
+    def _sql_summary(self, a: "_State", b: "_State", table: str) -> tuple:
+        """(added, deleted, modified) rows of ``table`` from a to b by SQL:
+        anti-joins on the primary key over the columns both sides share
+        (a keyless table is compared by whole row, added/deleted only)."""
+        ea, eb = a.expr(table), b.expr(table)
+        cols_b = set(self._expr_cols(eb))
+        cols = [c for c in self._expr_cols(ea) if c in cols_b]
+        pk = [c for c in self._pk(b.db, table) if c in cols] or [c for c in self._pk(a.db, table) if c in cols]
+        if not cols:
+            return 0, 0, 0
+        key = pk or cols
+        on = " AND ".join(f"x.{_quote(c)} = y.{_quote(c)}" for c in key)
+        first = _quote(key[0])
+
+        def count(sql):
+            return int(self._execute(sql)[0][0] or 0)
+        added = count(f"SELECT COUNT(*) FROM {eb} x LEFT JOIN {ea} y ON {on} WHERE y.{first} IS NULL")
+        deleted = count(f"SELECT COUNT(*) FROM {ea} x LEFT JOIN {eb} y ON {on} WHERE y.{first} IS NULL")
+        rest = [c for c in cols if c not in key]
+        modified = 0
+        if pk and rest:
+            differ = " OR ".join(f"NOT (x.{_quote(c)} = y.{_quote(c)} OR (x.{_quote(c)} IS NULL AND y.{_quote(c)} IS NULL))"
+                                 for c in rest)
+            modified = count(f"SELECT COUNT(*) FROM {ea} x JOIN {eb} y ON {on} WHERE {differ}")
+        return added, deleted, modified
 
     # -- schema reconciliation (merge, rebase) -----------------------------
 
@@ -989,7 +1040,14 @@ class MatrixOneToolSuite(DBToolSuite):
                        f"{theirs.db} and {ours_db} share no fork point: merging two-way")
         want_rows = callable(on_conflict)
         policy = "SKIP" if (want_rows or on_conflict == "ours") else "ACCEPT"
-        schema = self._reconcile_schema(ours_db, theirs)
+        if MO_NATIVE_MERGE_AS_IS:
+            # Native-only mode: the engine's merge as it is. A column the
+            # target lacks is left out of the result, a table only the
+            # source has is not merged, and a retyped column makes the
+            # engine refuse (a failed merge, caught by the checks).
+            schema = {"added_tables": [], "added_columns": []}
+        else:
+            schema = self._reconcile_schema(ours_db, theirs)
         conflicts = []
         self._fk_checks(False)
         try:

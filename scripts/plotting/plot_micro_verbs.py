@@ -7,10 +7,11 @@ on top, storage below, one line per system.
 Reads every micro_verbs_<backend>_w<W>_stats.json under --run-dir (all
 backends, all data sizes). Latency is the median with a p10-p90 band
 (log scale). Storage is the median bytes the verb added (negative:
-freed), symlog scale; for branch and commit a dashed line adds the
-deferred delta after the follow-up writes, minus the control (the same
-writes on a fresh branch with no verb). A system with no line on a
-figure is listed under it: unsupported, failed or not run.
+freed), symlog scale. The deferred delta the driver records for branch
+and commit (after 1,000 follow-up updates) is not drawn: on the
+PostgreSQL-based systems its value depends on page reuse at the time of
+the point, so it belongs in the text. A system with no line on a figure
+is listed under it: unsupported, failed or not run.
 """
 
 import argparse
@@ -40,7 +41,9 @@ def load(run_dir):
     """{system: {point_id: summary}} over every stats file, plus the
     control per (system, scale)."""
     points, control = {}, {}
-    for f in sorted(glob.glob(os.path.join(run_dir, "*", "micro_verbs_*_stats.json"))):
+    # Oldest file first, so a later measurement of the same point (a
+    # supplement, a re-measurement) replaces the earlier one.
+    for f in sorted(glob.glob(os.path.join(run_dir, "*", "micro_verbs_*_stats.json")), key=os.path.getmtime):
         d = json.load(open(f))
         sysname = NAMES.get(d["backend"], d["backend"])
         for p in d.get("points", []):
@@ -70,14 +73,26 @@ def _storage_axis(ax, values):
     powers of ten on both sides of zero."""
     mags = [abs(v) for v in values if v]
     lin = max(1024.0, min(mags) if mags else 1024.0)
+    if values and min(values) > 0:
+        # Nothing freed and nothing at zero: a plain log axis.
+        ax.set_yscale("log")
+        ax.yaxis.set_major_formatter(FuncFormatter(_bytes_fmt))
+        ax.yaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+        ax.set_ylim(min(values) / 3, max(values) * 3)
+        return
     ax.set_yscale("symlog", linthresh=lin, linscale=0.5)
     top = max(mags) if mags else lin
     decades = [10 ** k for k in range(int(np.floor(np.log10(lin))), int(np.ceil(np.log10(top))) + 1)]
     ticks = [-d for d in reversed(decades) if any(v <= -d / 10 for v in values)] + [0] + \
             [d for d in decades if any(v >= d / 10 for v in values)]
+    if any(v <= 0 for v in values):
+        ticks = [t for t in ticks if abs(t) != decades[0]]   # +-smallest decade would sit on 0 B
     ax.set_yticks(ticks)
     ax.yaxis.set_major_formatter(FuncFormatter(_bytes_fmt))
     ax.yaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+    # No empty half-panel below zero unless something was freed.
+    lo, hi = (min(values), max(values)) if values else (0, lin)
+    ax.set_ylim(bottom=-lin if lo >= 0 else lo * 3, top=hi * 3 if hi > 0 else lin)
 
 
 def _series(points, axis, key, which="latency"):
@@ -117,13 +132,6 @@ def plot_axis(axis, points, control, outdir):
                 # MatrixOne) background compaction makes the spread meaningless.
                 ax_s.plot(xs2, med2, "-o", color=c, ms=4, lw=1.6)
                 storage_vals += list(med2)
-            if axis.verb in ("branch", "commit"):
-                xs3, med3, _, _ = _series(pts, axis, "deferred")
-                if len(xs3):
-                    ctrl = [control.get((s, v if axis.name == "scale" else BASE["scale"])) or 0
-                            for v in [axis.values[i] for i in xs3]]
-                    ax_s.plot(xs3, med3 - np.array(ctrl), "--", color=c, lw=1.2)
-                    storage_vals += list(med3 - np.array(ctrl))
     ax_l.set_yscale("log")
     if lat_vals:
         lo_v, hi_v = min(v for v in lat_vals if v > 0), max(lat_vals)
@@ -152,9 +160,6 @@ def plot_axis(axis, points, control, outdir):
         fig.legend(handles, labels, fontsize=6.5, frameon=False, ncol=4, loc="lower center",
                    bbox_to_anchor=(0.5, 1.0))
     notes = ["latency: median, band p10-p90; storage: median of the reps"]
-    if axis.verb in ("branch", "commit") and has_storage:
-        notes.append("storage solid: at the verb; dashed: median after 1,000 follow-up updates, minus the control "
-                     "(on Chronos the follow-up writes cost 0.2 or 1.5 MB per rep depending on page reuse)")
     if missing:
         notes.append("no line: " + "; ".join(missing))
     fig.text(0.01, -0.01, "\n".join(notes), fontsize=6.3, color=MUTED, va="top")

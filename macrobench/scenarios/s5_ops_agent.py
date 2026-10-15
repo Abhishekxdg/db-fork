@@ -249,7 +249,7 @@ class OpsAgentScenario(Scenario):
 
     def _check_schema_reset(self, suite, target: dict, fault_k: int, reset, tag: str = "") -> None:
         """S5.3: the schema at the spine after the reset equals the schema
-        at the target commit (schema_diff reports no change). S5.4: the
+        at the target commit (the diff's schema half reports no change). S5.4: the
         dropped column's values are back (one 'ops' per routine deploy up
         to the target commit)."""
         inv, ctx = self.ctx.invariants, self.ctx
@@ -264,11 +264,13 @@ class OpsAgentScenario(Scenario):
             for n in names:
                 inv.not_applicable(n, "backend has no commits")
             return
-        sd = ctx.retry(lambda: suite.schema_diff(f"{ctx.spine}@{target['hash']}", ctx.spine, label="schema_diff"))
+        sd = ctx.retry(lambda: suite.diff(f"{ctx.spine}@{target['hash']}", ctx.spine, label="schema_diff"))
         if not sd.ok or not isinstance(sd.value, dict):
-            inv.check(names[0], False, f"schema diff failed: {sd.error[:100]}")
+            inv.check(names[0], False, f"diff failed: {sd.error[:100]}")
+        elif not isinstance(sd.value.get("schema"), dict):
+            inv.check(names[0], False, "the diff reports no schema (rows only)")
         else:
-            v = sd.value
+            v = sd.value["schema"]
             inv.check(names[0], not v.get("changed"),
                       f"tables_added={v.get('tables_added')} tables_dropped={v.get('tables_dropped')} "
                       f"columns_added={v.get('columns_added')} columns_dropped={v.get('columns_dropped')} "

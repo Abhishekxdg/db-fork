@@ -4,22 +4,19 @@ The spine holds shared task state (task, dependency). Each round the spine
 is checkpointed, N agents branch from that checkpoint, revise the plan
 (status/assignee edits with a configurable key overlap, subtasks,
 contradictory dependency edges, a scratch table created and dropped), commit
-with a message carrying their id and the log sentinel, read both histories
-with log(), and merge into the spine one at a time while the spine keeps
-receiving task updates. Merges resolve conflicts with the fixed policy:
+with a message carrying their id, and merge into the spine one at a time
+while the spine keeps receiving task updates. Merges resolve conflicts with the fixed policy:
 spine wins on task rows except the sentinel task 0 (last merger wins, it
 models a completion counter), and dependency edges are unioned and any
 cycle broken by dropping the merging agent's edge. Side branches are
 deleted after integration.
 
-Sentinels: the commit-message token LOGSENTINEL-<round>-<agent> must be
-visible through log(); task 0's status must show three different values
-before the first merge, between the two merges and after the second.
+Sentinel: task 0's status must show three different values before the
+first merge, between the two merges and after the second.
 
-Invariants: S3.1 the round's commits are readable in the spine's log;
-S3.2 the shared sentinel takes three distinct values across the first two
-merges; S3.3 after every successful merge the sentinel task carries the
-merging agent's value (the resolver takes theirs on that row).
+Invariants: S3.1 the shared sentinel takes three distinct values across
+the first two merges; S3.2 after every successful merge the sentinel task
+carries the merging agent's value (the resolver takes theirs on that row).
 """
 
 import threading
@@ -164,29 +161,20 @@ class MultiAgentScenario(Scenario):
 
         # Invariants for the round.
         merged = [m for m in self._merge_order if m["ok"]]
-        lg = suite.log(ctx.spine, limit=4 * p.agents + 10, label="history")
-        if not merged:
-            inv.not_applicable(f"S3.1 log sentinel readable (round {r})",
-                               "no agent commit reached the spine (every merge failed)")
-        else:
-            msgs = [str(e.get("message", "")) for e in (lg.value or [])]
-            hits = sum(1 for m in msgs if f"LOGSENTINEL-{r}-" in m)
-            inv.check(f"S3.1 log sentinel readable (round {r})", hits > 0,
-                      f"{hits} agent commits of round {r} in log({len(msgs)} entries)")
         if len(merged) < 2:
-            inv.not_applicable(f"S3.2 three sentinel values across two merges (round {r})",
+            inv.not_applicable(f"S3.1 three sentinel values across two merges (round {r})",
                                f"only {len(merged)} successful merges")
         else:
             v1, v2 = merged[0]["sentinel_after"], merged[1]["sentinel_after"]
-            inv.check(f"S3.2 three sentinel values across two merges (round {r})",
+            inv.check(f"S3.1 three sentinel values across two merges (round {r})",
                       before != v1 and v1 != v2 and before != v2
                       and v1 == merged[0]["sentinel_value"] and v2 == merged[1]["sentinel_value"],
                       f"before={before!r} after first merge={v1!r} after second={v2!r}")
-        # S3.3: after every successful merge the sentinel task carries the
+        # S3.2: after every successful merge the sentinel task carries the
         # merging agent's value (the resolver takes theirs on that row).
         wrong = [m["agent"] for m in merged if m["sentinel_after"] != m["sentinel_value"]]
         if merged:
-            inv.check(f"S3.3 sentinel carries each merging agent's value (round {r})", not wrong,
+            inv.check(f"S3.2 sentinel carries each merging agent's value (round {r})", not wrong,
                       f"{len(wrong)} of {len(merged)} merges left another value (agents {wrong[:5]})")
         ctx.add_metric(f"merge_order_round_{r}", [m["agent"] for m in self._merge_order])
         ctx.bump_metric("merges_ok", len(merged))
@@ -238,10 +226,7 @@ class MultiAgentScenario(Scenario):
             return None
         sentinel_value = f"r{r}-a{a}"
         w.exec(self._revision_script(w, r, a, sentinel_value), branch, label="revise")
-        w.commit(branch, f"agent {a} plan revision LOGSENTINEL-{r}-{a}", label="agent_commit")
-        # History access needed for resolution: both sides since divergence.
-        suite.log(branch, limit=5, label="history")
-        suite.log(ctx.spine, limit=10, label="history")
+        w.commit(branch, f"agent {a} plan revision (round {r})", label="agent_commit")
         with self._merge_lock:
             m = ctx.retry(lambda: suite.merge(ctx.spine, branch, message=f"merge agent {a} round {r}",
                                               on_conflict=fixed_policy, label="agent_merge"))

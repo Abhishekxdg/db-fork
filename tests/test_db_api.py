@@ -71,7 +71,7 @@ def test_branch_commit_log_diff_reset_delete(suite):
     log = suite.log("feat", limit=5)
     assert [e["message"] for e in log.value] == ["add", "init"]
     d = suite.diff("main", "feat")
-    assert d.value == {"rows_a": 1, "rows_b": 2}
+    assert d.value["rows_a"] == 1 and d.value["rows_b"] == 2 and "schema" in d.value
     # commit ref (supported here)
     at = suite.exec(["SELECT count(*) FROM t"], refs=[f"feat@{log.value[1]['hash']}"])
     assert at[0].ok and at[0].rows == [(1,)]
@@ -182,13 +182,13 @@ def test_schema_diff_compare_and_fake_catalog(suite):
     assert d["columns_added"] == {"t": ["w"]} and d["columns_dropped"] == {}
     assert d["columns_changed"] == {"t": [["v", "text", "varchar(8)"]]} and d["changed"]
     assert not FakeSuite._compare_schemas(a, a)["changed"]
-    assert FakeSuite.supports("schema_diff")          # the fake reads sqlite's catalog
+    assert "schema_diff" not in FakeSuite.implementation()   # one verb: diff covers rows and schema
     suite.branch("other", "main")
     suite.exec(["CREATE TABLE extra (id INT PRIMARY KEY, v TEXT)", "ALTER TABLE t ADD COLUMN w INT"], refs=["other"])
-    r = suite.schema_diff("main", "other")
-    assert r.ok and r.value["tables_added"] == ["extra"] and r.value["columns_added"] == {"t": ["w"]}
-    assert rows(suite, rslt.OpType.SCHEMA_DIFF)[0].status == rslt.OpStatus.OK
-    assert not suite.schema_diff("other", "other").value["changed"]
+    r = suite.diff("main", "other")
+    assert r.ok and r.value["schema"]["tables_added"] == ["extra"] and r.value["schema"]["columns_added"] == {"t": ["w"]}
+    assert rows(suite, rslt.OpType.DIFF)[-1].status == rslt.OpStatus.OK
+    assert not suite.diff("other", "other").value["schema"]["changed"]
 
 
 def test_commit_ref_fallback(suite, capsys):

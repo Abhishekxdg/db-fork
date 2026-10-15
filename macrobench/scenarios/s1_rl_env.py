@@ -29,7 +29,7 @@ delete-plus-add some backends report for a repair's update of a row in a
 table without a primary key; S1.5 the schema diff of a leaf against the
 commit it forked from reports exactly the DDL the rollout ran (the
 repair_audit table when the rollout started from the task commit, else
-the note_<step> columns it added; indexes are not part of a schema diff).
+the note_<step> columns it added; indexes are not part of the schema half of a diff).
 """
 
 import random
@@ -230,17 +230,22 @@ class RlEnvScenario(Scenario):
 
     def _check_schema_diff(self, w: Worker, fork_ref: str, leaf_ref: str, branch: str,
                            table_added: bool, cols_added: list) -> None:
-        """S1.5: the schema diff from the fork point to the leaf lists
-        exactly the rollout's DDL: the repair_audit table if this rollout
-        created it (its columns are then not listed separately), otherwise
-        the note_<step> columns it added; nothing dropped or retyped."""
+        """S1.5: the schema half of a diff from the fork point to the leaf
+        lists exactly the rollout's DDL: the repair_audit table if this
+        rollout created it (its columns are then not listed separately),
+        otherwise the note_<step> columns it added; nothing dropped or
+        retyped. An engine diff that covers rows only (no schema in the
+        result) fails the check."""
         ctx, inv = self.ctx, self.ctx.invariants
         name = f"S1.5 schema diff of {branch} against its fork point reports the rollout's DDL"
-        sd = ctx.retry(lambda: w.suite.schema_diff(fork_ref, leaf_ref, label="schema_diff"))
+        sd = ctx.retry(lambda: w.suite.diff(fork_ref, leaf_ref, label="fork_diff"))
         if not sd.ok or not isinstance(sd.value, dict):
-            inv.check(name, False, f"schema diff failed: {sd.error[:100]}")
+            inv.check(name, False, f"diff failed: {sd.error[:100]}")
             return
-        v = sd.value
+        v = sd.value.get("schema")
+        if not isinstance(v, dict):
+            inv.check(name, False, "the diff reports no schema (rows only)")
+            return
         want_tables = ["repair_audit"] if table_added else []
         want_cols = [] if table_added else sorted(cols_added)
         got_cols = sorted(v.get("columns_added", {}).get("repair_audit", []))

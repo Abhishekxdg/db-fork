@@ -285,6 +285,108 @@ def fig_bars(t, create_ms, scenarios, out, log=False):
     print("wrote", out)
 
 
+# --- cost_bars_grouped.png --------------------------------------------------
+
+GROUPS = [("branch-intensive", ["context_mgmt", "multi_agent", "dev_agent"]),
+          ("data-intensive", ["rl_env", "ops_agent", "data_agent"])]
+# One hatch per system so the bars stay apart in black and white.
+HATCHES = {"Doltgres": "", "Dolt": "//", "Chronos": "..", "MatrixOne": "xx", "file_copy": "\\\\",
+           "SeekDB": "--", "Neon": "++"}
+SHORT = {"rl_env": "S1 RL env", "context_mgmt": "S2 context mgmt", "multi_agent": "S3 multi-agent",
+         "dev_agent": "S4 dev agent", "ops_agent": "S5 ops agent", "data_agent": "S6 data agent"}
+ROWS = [("branch_s", "branch ops\n(worker-seconds)"), ("data_s", "data ops\n(worker-seconds)"),
+        ("elapsed", "elapsed\n(wall-clock s)")]
+
+
+def _tick_fmt(v, _pos):
+    return f"{v/1000:g}k" if v >= 10000 else f"{v:,.0f}"
+
+
+def _log_fmt(v, _pos):
+    return f"{v/1000:g}k" if v >= 1000 else f"{v:g}"
+
+
+def fig_bars_grouped(t, create_ms, out, log=False):
+    """Scenarios as columns in two groups, metrics as rows, one bar per
+    system coloured and hatched as in the legend; a failed run is a bare
+    X. Each panel has its own linear y axis; with ``log``, a log axis
+    shared along the row instead."""
+    from matplotlib.patches import Patch
+    from matplotlib.ticker import FuncFormatter, LogLocator, MaxNLocator, NullFormatter
+    systems = _systems(create_ms)
+    groups = [(name, [sc for sc in g if (t.scenario == sc).any()]) for name, g in GROUPS]
+    groups = [(name, g) for name, g in groups if g]
+    n = len(systems)
+    plt.rcParams["hatch.linewidth"] = 0.6
+    # One grid column per scenario plus a narrow spacer between groups.
+    widths, cols = [], {}
+    for gi, (_, g) in enumerate(groups):
+        if gi:
+            widths.append(0.35)
+        for sc in g:
+            cols[sc] = len(widths); widths.append(1.0)
+    fig = plt.figure(figsize=(2.1 * sum(widths), 6.6))
+    gs = fig.add_gridspec(len(ROWS), len(widths), width_ratios=widths, wspace=0.14 if log else 0.4,
+                          hspace=0.3, top=0.82, bottom=0.03, left=0.07, right=0.99)
+    axes = {}
+    for i, (col, lab) in enumerate(ROWS):
+        row_max, first = 1.0, None
+        for name, g in groups:
+            for sc in g:
+                ax = fig.add_subplot(gs[i, cols[sc]], sharey=first if log else None)
+                first = first or ax
+                axes[i, sc] = ax
+                d = t[t.scenario == sc].set_index("backend").reindex(systems)
+                invalid = d["invalid"].fillna("").astype(str).values
+                raw = np.nan_to_num(d[col].values.astype(float), nan=0.0)
+                vals = np.where(invalid != "", 0.0, raw)
+                row_max = max(row_max, vals.max())
+                top = vals.max() if vals.max() > 0 else 1.0
+                bars = ax.bar(range(n), vals, bottom=1.0 if log else 0.0, color=[COLORS[b] for b in systems],
+                              width=0.72, edgecolor="#222", linewidth=0.5)
+                for bar, b in zip(bars, systems):
+                    bar.set_hatch(HATCHES.get(b, ""))
+                for k in np.flatnonzero(invalid != ""):
+                    ax.text(k, 1.3 if log else top * 0.02, "\u2717", ha="center", va="bottom", fontsize=10,
+                            color=RED, fontweight="bold")
+                if not log:
+                    ax.set_ylim(0, top * 1.12)
+                    ax.yaxis.set_major_locator(MaxNLocator(4)); ax.yaxis.set_major_formatter(FuncFormatter(_tick_fmt))
+                    ax.tick_params(axis="y", labelsize=7.5)
+                ax.set_xlim(-0.6, n - 0.4); ax.set_xticks([])
+                ax.grid(axis="y", color="#e5e5e5", lw=0.6); ax.set_axisbelow(True)
+                for sp in ax.spines.values():
+                    sp.set_linewidth(0.8); sp.set_color("#444")
+                if i == 0:
+                    th = int(d.threads.median())
+                    ax.set_title(SHORT.get(sc, sc), fontsize=11, fontweight="bold", pad=16)
+                    ax.text(0.5, 1.03, f"{th} worker{'s' if th != 1 else ''} at peak", transform=ax.transAxes,
+                            ha="center", va="bottom", fontsize=8, color="#555")
+                if log:
+                    ax.tick_params(axis="y", which="minor", length=0)
+                    if ax is not first:
+                        ax.tick_params(axis="y", which="major", labelleft=False, length=0)
+        if log:
+            first.set_yscale("log"); first.set_ylim(1.0, row_max * 3)
+            first.yaxis.set_major_locator(LogLocator(base=10, numticks=8))
+            first.yaxis.set_major_formatter(FuncFormatter(_log_fmt))
+            first.yaxis.set_minor_formatter(NullFormatter())
+            first.tick_params(axis="y", which="major", labelsize=8)
+        first.set_ylabel(lab, fontsize=10, fontweight="bold")
+    # Group headers over their columns, with a rule under each.
+    for name, g in groups:
+        l, r = axes[0, g[0]].get_position(), axes[0, g[-1]].get_position()
+        y = l.y1 + 0.075
+        fig.text((l.x0 + r.x1) / 2, y + 0.008, name, ha="center", va="bottom", fontsize=11.5, fontweight="bold")
+        fig.add_artist(plt.Line2D([l.x0, r.x1], [y, y], color="#444", lw=0.8, transform=fig.transFigure))
+    handles = [Patch(facecolor=COLORS[b], hatch=HATCHES.get(b, ""), edgecolor="#222", linewidth=0.5,
+                     label=f"{b}  {_ms(create_ms[b])}") for b in systems]
+    fig.legend(handles=handles, loc="upper center", ncol=n, fontsize=9.5, frameon=False,
+               bbox_to_anchor=(0.5, 1.0), handlelength=1.6, handleheight=1.2, columnspacing=1.4)
+    fig.savefig(out, dpi=200, bbox_inches="tight"); plt.close(fig)
+    print("wrote", out)
+
+
 # --- cost_panels.png --------------------------------------------------------
 
 def fig_panels(t, create_ms, scenarios, out):
@@ -331,8 +433,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run-dir", required=True)
     ap.add_argument("--outdir", required=True)
-    ap.add_argument("--figures", nargs="*", default=["rank", "bars", "panels"], choices=["rank", "bars", "panels"])
-    ap.add_argument("--log", action="store_true", help="log x axis on the bars")
+    ap.add_argument("--figures", nargs="*", default=["rank", "bars", "panels", "grouped"],
+                    choices=["rank", "bars", "panels", "grouped"])
+    ap.add_argument("--log", action="store_true", help="log axis on the bars (shared per row when grouped)")
     a = ap.parse_args()
     os.makedirs(a.outdir, exist_ok=True)
     t, create_ms = load(a.run_dir)
@@ -345,6 +448,8 @@ def main():
         fig_bars(t, create_ms, present, os.path.join(a.outdir, "cost_bars_all.png"), a.log)
     if "panels" in a.figures:
         fig_panels(t, create_ms, four, os.path.join(a.outdir, "cost_panels.png"))
+    if "grouped" in a.figures:
+        fig_bars_grouped(t, create_ms, os.path.join(a.outdir, "cost_bars_grouped.png"), a.log)
 
 
 if __name__ == "__main__":

@@ -91,6 +91,8 @@ SEEKDB_DATA_DIR = _default_data_dir()
 
 # Use SeekDB's own MERGE TABLE instead of the SQL three-way merge.
 SEEKDB_NATIVE_MERGE = native_only()
+# Use SeekDB's own DIFF TABLE instead of the anti-joins between flashback reads.
+SEEKDB_NATIVE_DIFF = native_only()
 
 # OceanBase's default 10s query timeout is too short for seeding and for the
 # anti-joins behind merge/rebase/reset; one hour, in microseconds.
@@ -310,7 +312,7 @@ class SeekDBToolSuite(DBToolSuite):
     IMPLEMENTATION = {
         "branch": "native",
         "commit": "native",
-        "diff": "simulated",
+        "diff": "native" if SEEKDB_NATIVE_DIFF else "simulated",
         "log": "simulated",
         "merge": "native" if SEEKDB_NATIVE_MERGE else "simulated",
         "rebase": "simulated",
@@ -318,13 +320,13 @@ class SeekDBToolSuite(DBToolSuite):
         "reset": "simulated",
         "delete": "native",
         "commit_refs": "native",
-        "schema_diff": "simulated",
         "multi_ref_exec": "native",
     }
     IMPLEMENTATION_NOTES = {
         "branch": "FORK DATABASE (restored to the snapshot for a commit ref)",
         "commit": "current_scn() recorded in a _bb_commits row (flashback snapshot)",
-        "diff": "anti-joins between flashback reads",
+        "diff": ("DIFF TABLE per table (rows present on one side only, grouped by key; keyless or schema-differing tables skipped)"
+                 if SEEKDB_NATIVE_DIFF else "anti-joins between flashback reads"),
         "log": "SELECT from the _bb_commits bookkeeping table",
         "merge": ("MERGE TABLE ... STRATEGY OURS|THEIRS per table (no common ancestor)"
                   if SEEKDB_NATIVE_MERGE else "SQL three-way merge against the fork SCN"),
@@ -333,7 +335,6 @@ class SeekDBToolSuite(DBToolSuite):
         "reset": "rows restored with SQL from the flashback snapshot",
         "delete": "DROP DATABASE",
         "commit_refs": "flashback reads AS OF SNAPSHOT scn",
-        "schema_diff": "catalog columns of each ref compared by the adapter",
         "multi_ref_exec": "cross-database queries",
     }
 
@@ -751,6 +752,8 @@ class SeekDBToolSuite(DBToolSuite):
         ]
 
     def _diff_impl(self, ref_a: Ref, ref_b: Ref) -> dict:
+        if SEEKDB_NATIVE_DIFF:
+            return self._native_diff(ref_a, ref_b)
         a, b = self._state(ref_a), self._state(ref_b)
         tables_a = set(self._tables(a.db))
         tables_b = set(self._tables(b.db))
@@ -1278,6 +1281,70 @@ class SeekDBToolSuite(DBToolSuite):
             "merged_tables": merged,
             "skipped_tables": skipped,
             "native": True,
+        }
+
+    def _native_diff(self, ref_a: Ref, ref_b: Ref) -> dict:
+        """Native-only mode: SeekDB's ``DIFF TABLE b AGAINST a`` per
+        table, which lists every row present on one side only, tagged with
+        its side; rows are grouped by primary key into added (b only),
+        deleted (a only) and modified (both). A commit ref is read through
+        the database that materialises it (a fork restored to the commit).
+        DIFF TABLE refuses keyless tables and differing schemas; those
+        tables are skipped with a warning, as the native merge does."""
+        db_a = self._temp_db_for(ref_a) if ref_a.commit else self._db_for(ref_a.branch)
+        db_b = self._temp_db_for(ref_b) if ref_b.commit else self._db_for(ref_b.branch)
+        tables_a, tables_b = set(self._tables(db_a)), set(self._tables(db_b))
+        out = []
+        for table in sorted(tables_a | tables_b):
+            if table in tables_a and table not in tables_b:
+                n = self._execute(f"SELECT COUNT(*) FROM {_qt(db_a, table)}")[0][0]
+                out.append({"table_name": table, "rows_added": 0, "rows_deleted": int(n), "rows_modified": 0})
+                continue
+            if table in tables_b and table not in tables_a:
+                n = self._execute(f"SELECT COUNT(*) FROM {_qt(db_b, table)}")[0][0]
+                out.append({"table_name": table, "rows_added": int(n), "rows_deleted": 0, "rows_modified": 0})
+                continue
+            pk = self._pk(db_a, table)
+            reason = None if pk else "no primary key"
+            rows, cols = [], []
+            if not reason:
+                try:
+                    with self.conn.cursor() as cur:
+                        cur.execute(f"DIFF TABLE {_qt(db_b, table)} AGAINST {_qt(db_a, table)}")
+                        cols = [d[0] for d in cur.description]
+                        rows = cur.fetchall()
+                except pymysql.MySQLError as e:
+                    code = e.args[0] if e.args else None
+                    if code == _ER_SCHEMA_MISMATCH:
+                        reason = "schemas differ between the sides"
+                    elif code == _ER_NO_PRIMARY_KEY:
+                        reason = "no primary key"
+                    else:
+                        raise
+            if reason:
+                if (table, reason) not in self._merge_skip_warned:
+                    self._merge_skip_warned.add((table, reason))
+                    print(f"Warning: SeekDB DIFF TABLE skips table '{table}' ({reason})")
+                out.append({"table_name": table, "rows_added": 0, "rows_deleted": 0,
+                            "rows_modified": 0, "skipped": reason})
+                continue
+            kpos = [cols.index(c) for c in pk]
+            b_tag = f"{db_b}.{table}"
+            sides: dict = {}
+            for r in rows:
+                side = str(r[0], "utf-8") if isinstance(r[0], (bytes, bytearray)) else str(r[0])
+                key = tuple(r[i] for i in kpos)
+                sides.setdefault(key, set()).add("b" if side == b_tag else "a")
+            added = sum(1 for v in sides.values() if v == {"b"})
+            deleted = sum(1 for v in sides.values() if v == {"a"})
+            modified = sum(1 for v in sides.values() if v == {"a", "b"})
+            out.append({"table_name": table, "rows_added": added, "rows_deleted": deleted,
+                        "rows_modified": modified})
+        return {
+            "tables": out,
+            "rows_added": sum(t["rows_added"] for t in out),
+            "rows_deleted": sum(t["rows_deleted"] for t in out),
+            "rows_modified": sum(t["rows_modified"] for t in out),
         }
 
     def _native_conflicts(self, source_db: str, target_db: str, table: str):

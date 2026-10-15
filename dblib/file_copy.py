@@ -341,7 +341,6 @@ class FileCopyToolSuite(PgMergeMixin, DBToolSuite):
         "reset": "simulated",
         "delete": "simulated",
         "commit_refs": "simulated",
-        "schema_diff": "simulated",
         "multi_ref_exec": "simulated",
     }
     IMPLEMENTATION_NOTES = {
@@ -368,7 +367,6 @@ class FileCopyToolSuite(PgMergeMixin, DBToolSuite):
         "delete": "DROP DATABASE of the branch, its base clones and its snapshots (snapshots other "
                   "branches' logs reference are kept until the run's cleanup)",
         "commit_refs": "a commit ref connects to the commit's snapshot database (read-only)",
-        "schema_diff": "catalog columns of each ref compared by the adapter",
         "multi_ref_exec": "postgres_fdw: db.table(ref, t) imports the other database's table into "
                           "the session's database (re-imported per exec; the foreign server "
                           "connection is dropped when the exec ends)",

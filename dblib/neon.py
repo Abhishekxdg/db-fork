@@ -361,7 +361,6 @@ class NeonToolSuite(PgMergeMixin, DBToolSuite):
         "reset": "native",
         "delete": "native",
         "commit_refs": "native",
-        "schema_diff": "simulated",
         "multi_ref_exec": "unsupported",
     }
     IMPLEMENTATION_NOTES = {
@@ -383,7 +382,6 @@ class NeonToolSuite(PgMergeMixin, DBToolSuite):
                  "undeletable backup branch)",
         "delete": "DELETE /branches/{id}; a branch with children is deferred until they are gone",
         "commit_refs": "parent_lsn / restore to LSN; exec on a commit ref uses a temporary branch",
-        "schema_diff": "catalog columns of each ref compared by the adapter",
         "multi_ref_exec": "not provided: no multi-branch query semantics; the scenarios fall back "
                           "to running cross-branch reads once per branch",
     }
