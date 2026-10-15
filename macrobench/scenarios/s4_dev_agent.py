@@ -24,8 +24,9 @@ it on its side (moves its column to ``c_loyalty_tier``: add, copy, drop;
 commits) and retries the rebase; a backend that replays history meets the original
 commit again, and the branch then merges the spine in instead and keeps
 integrating by merge. Either way the spine's changes must arrive with
-both columns present. Branches created afterwards fail their feature DDL on
-the existing column and are not checked for it.
+both columns present. A branch forked after that migration finds c_tier
+taken and adds ``c_loyalty_tier`` instead, as the agent would; it has no
+conflict and is checked like every other branch.
 
 Invariants: S4.1 the feature table never reaches the spine; S4.2a/b the
 spine sentinel is invisible before and visible after the first rebase;
@@ -179,13 +180,17 @@ class DevAgentScenario(Scenario):
     def _dev_branch(self, w: Worker, i: int):
         ctx, p, inv, suite, rng = self.ctx, self.params, self.ctx.invariants, w.suite, w.rng
         branch = f"dev_{i}"
-        with self._spine_lock:
-            born_after_conflict = self._schema_conflict_applied
         res = ctx.branch(suite, branch, ctx.spine, label="dev_branch")
         if not res.ok:
             ctx.note(f"dev branch {branch}: {res.status_name} {res.error}")
             ctx.tick(p.dev_phase_steps + p.review_phase_steps)
             return None
+        # The branch's feature column. An agent looks before it adds: a fork
+        # taken after the spine's conflicting migration already has c_tier
+        # (INT), so the feature goes in as c_loyalty_tier and never conflicts.
+        taken = suite.exec(["SELECT COUNT(c_tier) FROM customer WHERE 1 = 0"],
+                           refs=[branch], label="invariant")[0].ok
+        col = "c_loyalty_tier" if taken else "c_tier"
         # Spine sentinel: inserted on the spine after the branch exists.
         sentinel_id = SPINE_SENTINEL_BASE + i
         with self._spine_lock, self.quiesced():
@@ -195,7 +200,6 @@ class DevAgentScenario(Scenario):
                        refs=[ctx.spine], label="spine_sentinel")
             suite.commit(ctx.spine, f"spine sentinel {i}", label="spine_commit")
 
-        col = "c_tier"            # the branch's feature column (renamed on a schema conflict)
         by_merge = False          # after a schema conflict a replaying backend cannot rebase past
                                   # the original commit; the branch then merges the spine in instead
         rebase_steps = {p.dev_phase_steps}
@@ -213,7 +217,7 @@ class DevAgentScenario(Scenario):
         for step in range(1, p.dev_phase_steps + 1):
             ctx.check_stop()
             if step == 1:
-                w.exec(self._feature_ddl(i), branch, label="feature_ddl")
+                w.exec(self._feature_ddl(i, col), branch, label="feature_ddl")
             else:
                 w.exec(self._backfill_script(i, step, chunk, rng, col), branch, label="backfill")
                 chunk += ctx.statements_per_step
@@ -256,14 +260,10 @@ class DevAgentScenario(Scenario):
                     return (sc["tiers"] == 3 and sc["events"] == events_before
                             and sc["feature_col"] and sc["tiered"] == tiered_before)
                 intact = is_intact(schema_after)
-                if born_after_conflict:
-                    # Forked from a spine that already has c_tier INT: the
-                    # feature DDL failed on creation, nothing to compare.
-                    inv.not_applicable(f"S4.3 schema-conflict rebase of {branch} (rebase {rebases_done})",
-                                       "branch created after the conflicting migration")
-                elif conflict_due and col == "c_tier":
+                if conflict_due and col == "c_tier":
                     # First integration after the conflicting migration; a
-                    # branch that already moved its column is checked as usual.
+                    # branch that already moved its column, or was born with
+                    # c_loyalty_tier, is checked as usual.
                     ctx.bump_metric("schema_conflict_rebases")
                     if rb.failed:
                         inv.check(f"S4.3a schema-conflict rebase of {branch} fails cleanly",
@@ -337,12 +337,8 @@ class DevAgentScenario(Scenario):
                               f"tiers={schema_after['tiers']} events={schema_after['events']}/{events_before} "
                               f"tiered={schema_after['tiered']}/{tiered_before} migrations={schema_after['migrations']}/{spine_migrations}")
                 if rebases_done == 1:
-                    if rb.unsupported:
-                        inv.not_applicable(f"S4.2b spine sentinel visible on {branch} after rebase",
-                                           "rebase unsupported")
-                    else:
-                        inv.expect(f"S4.2b spine sentinel visible on {branch} after rebase",
-                                   sentinel_visible(), 1, f"rebase {rb.status_name}")
+                    inv.expect(f"S4.2b spine sentinel visible on {branch} after rebase",
+                               sentinel_visible(), 1, f"rebase {rb.status_name}")
             ctx.tick()
 
         # Review phase: quiet, occasional modification.
@@ -409,13 +405,13 @@ class DevAgentScenario(Scenario):
                 "tiered": count(f"SELECT COUNT(*) FROM customer WHERE {col} IN ('gold', 'silver', 'bronze')"),
                 "migrations": count("SELECT COUNT(*) FROM migration_log")}
 
-    def _feature_ddl(self, i: int):
+    def _feature_ddl(self, i: int, col: str = "c_tier"):
         def script(db):
             db.sql("CREATE TABLE loyalty_tier (tier_id INT NOT NULL, name VARCHAR(16) NOT NULL, "
                    "min_payment DECIMAL(12,2) NOT NULL, PRIMARY KEY (tier_id))")
             db.sql("CREATE TABLE loyalty_event (event_id INT NOT NULL, c_w_id INT, c_d_id INT, "
                    "c_id INT, tier_id INT, created_at TIMESTAMP, PRIMARY KEY (event_id))")
-            db.sql("ALTER TABLE customer ADD COLUMN c_tier VARCHAR(8)")
+            db.sql(f"ALTER TABLE customer ADD COLUMN {col} VARCHAR(8)")
             db.sql("INSERT INTO loyalty_tier (tier_id, name, min_payment) VALUES "
                    "(1, 'bronze', 0), (2, 'silver', 5000), (3, 'gold', 9000)")
         return script

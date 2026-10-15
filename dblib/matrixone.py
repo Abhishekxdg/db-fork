@@ -43,9 +43,9 @@ report uses):
                base: the keys a native diff of the branch's own two
                snapshots lists (plus rows with a value in a column the
                branch added, which that diff does not see) are copied in
-               with SQL from the head snapshot's time-travel view, or, in
-               native-only mode, replayed with DATA BRANCH PICK ... BETWEEN
-               SNAPSHOT; conflicts with the upstream's delta are resolved
+               with SQL from the head snapshot's time-travel view (never
+               DATA BRANCH PICK, see the limitations; in native-only mode
+               rebase is unsupported); conflicts with the upstream's delta are resolved
                per on_conflict; the registry is repointed and the old
                generation dropped (the lineage now starts at the upstream
                head, so a later merge back sees only newer changes)
@@ -68,14 +68,18 @@ in a rebase "ours" is the upstream (the branch being rebased onto) and
 
 Known limitations (MatrixOne v4.2.5):
 
-- The native-only rebase (DATA BRANCH PICK) is not fully reliable. In a
-  long S4 run, from roughly 500 s in, about every other rebase's PICK
-  carries none of the branch's rows even though a time-travel read of
-  the same snapshots shows them all; the branch then silently loses that
-  backfill. Not reproduced standalone (spine load, delays, flushes,
-  checkpoints, intermediate commits, composite keys, migrations in the
-  window, prior ALTERs and sibling branch churn were all ruled out). The
-  default rebase copies the rows from the snapshot with SQL instead.
+- DATA BRANCH PICK ... BETWEEN SNAPSHOT, the engine's replay of a
+  branch's delta and the only candidate for a native rebase, is not
+  reliable. In a long S4 run, from roughly 500 s in, about every other
+  rebase's PICK carries none of the branch's rows even though a
+  time-travel read of the same snapshots shows them all; the branch then
+  silently loses that backfill. Not reproduced standalone (spine load,
+  delays, flushes, checkpoints, intermediate commits, composite keys,
+  migrations in the window, prior ALTERs and sibling branch churn were all
+  ruled out). It also refuses a table whose columns differ between the
+  sides ("column has different identity"). The rebase therefore copies
+  the rows from the snapshot with SQL, is reported as simulated, and is
+  unsupported in native-only mode (2026-10-15).
 - PICK and MERGE resolve conflicts per row, so "theirs" replaces the
   upstream's whole row, including columns only the upstream changed.
 - DATA BRANCH DIFF does not report a change confined to a column added
@@ -111,13 +115,13 @@ MO_DATA_DIR = os.path.expanduser(os.environ.get("MO_DATA_DIR", "~/mo/matrixone/m
 # even when on_conflict is "ours"/"theirs" and the count is only reported.
 MO_COUNT_CONFLICTS = os.environ.get("MO_COUNT_CONFLICTS", "1").lower() not in ("0", "false", "no")
 
-# Native-only mode (DBFORK_NATIVE_ONLY=1) uses the engine's own primitives
-# as they are: RESTORE DATABASE for reset() (it gives the restored tables
-# new identities and later lineage diffs across that edge misreport
-# updated rows) and DATA BRANCH PICK to replay the branch's delta in
-# rebase() (sporadically carries nothing late in long runs). Otherwise
-# both are done from a native diff of the branch's own two snapshots,
-# applied with SQL.
+# Native-only mode (DBFORK_NATIVE_ONLY=1) resets with the engine's own
+# RESTORE DATABASE as it is (it gives the restored tables new identities
+# and later lineage diffs across that edge misreport updated rows).
+# Otherwise reset undoes a native diff of the branch's own two snapshots
+# with SQL. Rebase has no native counterpart that meets the contract
+# (DATA BRANCH PICK, see the limitations), so it is simulated in every
+# mode and unsupported in native-only mode.
 MO_NATIVE_RESET = native_only()
 
 MAIN_BRANCH = "main"
@@ -301,7 +305,7 @@ class MatrixOneToolSuite(DBToolSuite):
         "diff": "native",
         "log": "simulated",
         "merge": "native",
-        "rebase": "native" if MO_NATIVE_RESET else "simulated",
+        "rebase": "simulated",   # PICK loses rows and refuses schema differences
         "revert": "simulated",
         "reset": "native" if MO_NATIVE_RESET else "simulated",
         "delete": "native",
@@ -319,11 +323,10 @@ class MatrixOneToolSuite(DBToolSuite):
                  "over the SKIP result",
         "rebase": ("re-fork: the branch's next generation is cloned from the upstream's head "
                    "snapshot and snapshotted (the new base); the branch's delta since its previous "
-                   "base (a native diff of its own two snapshots) is "
-                   + ("replayed with DATA BRANCH PICK ... BETWEEN SNAPSHOT" if MO_NATIVE_RESET else
-                      "copied in with SQL from its head snapshot's time-travel view")
-                   + "; conflicts from two native diffs; the registry is repointed and the old "
-                   "generation dropped"),
+                   "base (a native diff of its own two snapshots) is copied in with SQL from "
+                   "its head snapshot's time-travel view (DATA BRANCH PICK loses rows and refuses "
+                   "schema differences); conflicts from two native diffs; the registry is "
+                   "repointed and the old generation dropped"),
         "revert": "DATA BRANCH DIFF commit vs predecessor; inverse applied with SQL",
         "reset": ("RESTORE DATABASE {snapshot}" if MO_NATIVE_RESET else
                   "DATA BRANCH DIFF head vs the commit's snapshot, rows put back with SQL "
@@ -1088,7 +1091,6 @@ class MatrixOneToolSuite(DBToolSuite):
                       f"{{snapshot = '{upstream.snap}'}};")
         want_rows = callable(on_conflict)
         conflicts = []
-        touches = []
         base_snap = self._new_snapshot_name()
         try:
             # The new base: the branch's own snapshot of the upstream head,
@@ -1137,7 +1139,7 @@ class MatrixOneToolSuite(DBToolSuite):
                     # the same period, for the conflict count. The native diff
                     # does not list a row whose only change is in a column
                     # added since the base, so an empty delta cannot mean
-                    # "nothing to replay": PICK runs for every table.
+                    # "nothing to replay": every table is considered.
                     d_b = self._delta(branch_now.expr(table), branch_base.expr(table), pk)
                     d_u = {}
                     if up_base.snap and up_base.db == upstream.db and self._readable(up_base, table):
@@ -1149,28 +1151,17 @@ class MatrixOneToolSuite(DBToolSuite):
                     new_cols = [c.split(".", 1)[1] for c in schema["added_columns"]
                                 if c.startswith(table + ".")]
                     keys = self._replayed_keys(d_b, branch_now, table, pk, new_cols)
-                    if MO_NATIVE_RESET:
-                        self._execute(f"DATA BRANCH PICK {_qt(branch_db, table)} INTO {_qt(new_db, table)} "
-                                      f"BETWEEN SNAPSHOT '{s_b0}' AND '{s_now}' WHEN CONFLICT ACCEPT")
-                        # On a table with a foreign key, rows PICK writes are
-                        # invisible to a later PICK from this generation once
-                        # the source generation is dropped (v4.2.5, whether or
-                        # not foreign_key_checks is on), so they are rewritten
-                        # as ordinary writes of this generation after the drop.
-                        if keys:
-                            touches.append((table, pk, rest, keys))
-                    else:
-                        # Simulated replay: the branch's deletes, then its
-                        # inserted/updated rows copied from the head snapshot's
-                        # time-travel view (server-side; only keys travel).
-                        deleted = [k for k, (flag, _) in d_b.items() if flag == "DELETE"]
-                        for chunk in self._chunks(deleted):
-                            self._execute(f"DELETE FROM {_qt(new_db, table)} WHERE {self._in_keys(pk, chunk)}")
-                        for chunk in self._chunks(keys):
-                            self._execute(self._upsert(
-                                _qt(new_db, table), cols, pk,
-                                f"SELECT {self._cols('s', cols)} FROM {branch_now.expr(table)} s "
-                                f"WHERE {self._in_keys(pk, chunk)}"))
+                    # Replay: the branch's deletes, then its inserted/updated
+                    # rows copied from the head snapshot's time-travel view
+                    # (server-side; only keys travel).
+                    deleted = [k for k, (flag, _) in d_b.items() if flag == "DELETE"]
+                    for chunk in self._chunks(deleted):
+                        self._execute(f"DELETE FROM {_qt(new_db, table)} WHERE {self._in_keys(pk, chunk)}")
+                    for chunk in self._chunks(keys):
+                        self._execute(self._upsert(
+                            _qt(new_db, table), cols, pk,
+                            f"SELECT {self._cols('s', cols)} FROM {branch_now.expr(table)} s "
+                            f"WHERE {self._in_keys(pk, chunk)}"))
                     if keys or any(flag == "DELETE" for flag, _ in d_b.values()):
                         info["merged_tables"].append(table)
                     if not d_u:
@@ -1221,14 +1212,6 @@ class MatrixOneToolSuite(DBToolSuite):
         self._current_db = None
         self._use(new_db)
         self._drop_branch_db(branch_db)
-        # The rewrite has to come after the old generation is gone: until
-        # then the picked rows still read as the source's.
-        self._fk_checks(False)
-        try:
-            for table, pk, rest, keys in touches:
-                self._touch(_qt(new_db, table), pk, rest, keys)
-        finally:
-            self._fk_checks(True)
         info["schema_changes"] = schema
         info["generation"] = gen
         return info
@@ -1249,17 +1232,6 @@ class MatrixOneToolSuite(DBToolSuite):
                                  f"WHERE {_quote(col)} IS NOT NULL") or []
             keys.update(tuple(r) for r in rows)
         return list(keys)
-
-    def _touch(self, dst: str, pk: list, rest: list, keys: list) -> int:
-        """Rewrite the rows (an UPDATE of a non-key column to itself, which
-        MatrixOne records as a write; a key column set to itself is not)
-        so they are writes of dst's own history."""
-        if not rest or not keys:
-            return 0
-        col = _quote(rest[0])
-        for chunk in self._chunks(keys):
-            self._execute(f"UPDATE {dst} SET {col} = {col} WHERE {self._in_keys(pk, chunk)}")
-        return len(keys)
 
     def _upstream_moved(self, base_seq: int, upstream: _State) -> bool:
         """Has the upstream any commit after the common base?"""

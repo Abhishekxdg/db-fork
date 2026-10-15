@@ -509,10 +509,14 @@ class BackendManager:
         elif backend == tp.Backend.NEON:
             if require_db_setup:
                 # Leftovers of interrupted runs keep billing: drop them first.
-                stale = neon_mod.delete_stale_projects()
+                # Only this configuration's own projects: another run
+                # (the macrobench's project_macro_* in particular) may be
+                # live in the same org at the same time.
+                project_name = f"project_{db_name}"
+                stale = neon_mod.delete_stale_projects(prefix=project_name)
                 if stale:
                     print(f"Deleted stale Neon projects: {stale}")
-                neon_project = NeonToolSuite.create_neon_project(f"project_{db_name}")
+                neon_project = NeonToolSuite.create_neon_project(project_name)
                 info.neon_project_id = neon_project["project"]["id"]
                 info.default_uri = (
                     neon_project["connection_uris"][0]["connection_uri"]

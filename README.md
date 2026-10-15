@@ -6,8 +6,9 @@ backends (Dolt, Neon, Xata, SeekDB, MatrixOne, Bauplan, plain Postgres copies,
 is driven through one git-like API (`dblib/db_api.py`): `branch`, `commit`,
 `diff`, `log`, `merge`, `rebase`, `revert`, `reset`, `delete`, plus `exec()`
 to run a workload script on one or more branches. Each operation is timed and
-storage-measured, and an operation a backend cannot perform is recorded as
-unsupported instead of stopping the workload. Includes both macrobenchmark and
+storage-measured; an operation that errors is recorded and the workload goes
+on, while one the backend cannot perform ends the run as unsupported, naming
+the verb. Includes both macrobenchmark and
 microbenchmark workloads.
 
 ## Quick Start
@@ -252,9 +253,10 @@ workload {
 uv run python -m macrobench.runner --config macrobench/configs/ops_agent_mini.textproto --outdir run_stats
 ```
 
-A backend that lacks a verb still runs the whole scenario: the verb is
-recorded as UNSUPPORTED, `workflow_supported` is false in the e2e stats, and
-invariance checks that depend on it are reported as not applicable.
+A backend that lacks a verb does not run the scenario past it: the verb is
+recorded as UNSUPPORTED, the run stops there with every worker cancelled,
+`workflow_supported` is false and `status` is `unsupported: <VERB>: <reason>`
+in the e2e stats. Failed operations, by contrast, never stop a run.
 
 #### Storage
 

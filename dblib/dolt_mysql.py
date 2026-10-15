@@ -271,6 +271,13 @@ class DoltMySQLToolSuite(DBToolSuite):
         rows = self._execute('SELECT `table` FROM dolt_conflicts;')
         return [r[0] for r in rows or []]
 
+    def _conflict_row_count(self) -> int:
+        """Conflicting rows over every table of the working set: the count
+        the other backends report as ``conflicts`` (Dolt's own number is
+        per merge or per replayed commit)."""
+        rows = self._execute("SELECT COALESCE(SUM(num_conflicts), 0) FROM dolt_conflicts;")
+        return int(rows[0][0]) if rows else 0
+
     def _schema_conflicts(self) -> list:
         rows = self._execute(
             "SELECT table_name, description FROM dolt_schema_conflicts;"
@@ -286,7 +293,8 @@ class DoltMySQLToolSuite(DBToolSuite):
         """Resolve the data conflicts in the working set per on_conflict.
         Returns {"conflict_tables", "resolved", "resolution"}."""
         tables = self._conflict_tables()
-        info = {"conflict_tables": tables, "resolved": "", "resolution": None}
+        info = {"conflict_tables": tables, "resolved": "", "resolution": None,
+                "conflict_rows": self._conflict_row_count()}
         if not tables:
             return info
         if callable(on_conflict):
@@ -400,7 +408,7 @@ class DoltMySQLToolSuite(DBToolSuite):
     def _rebase_impl(self, ref: Ref, onto: Ref, on_conflict="ours") -> dict:
         self._on(ref)
         self._allow_conflicts()
-        info = {"conflicts": 0, "conflict_tables": [], "resolved": "",
+        info = {"conflicts": 0, "conflict_rows": 0, "conflict_tables": [], "resolved": "",
                 "up_to_date": False}
         # dolt_rebase refuses to start with uncommitted changes.
         self._execute("CALL DOLT_ADD('-A');")
@@ -436,6 +444,7 @@ class DoltMySQLToolSuite(DBToolSuite):
                     raise RuntimeError(f"schema conflict; rebase aborted: {e}")
                 resolved = self._resolve_conflicts(ref, on_conflict)
                 info["conflicts"] += 1
+                info["conflict_rows"] += resolved.get("conflict_rows", 0)
                 info["conflict_tables"] = sorted(
                     set(info["conflict_tables"]) | set(resolved["conflict_tables"])
                 )

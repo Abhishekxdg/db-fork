@@ -154,7 +154,7 @@ fi
 
 if $NATIVE_ONLY; then
     export DBFORK_NATIVE_ONLY=1
-    echo "Native-only mode: simulated operations run as unsupported"
+    echo "Native-only mode: simulated operations run as unsupported (the run ends at the first one)"
 fi
 PYTHONUNBUFFERED=1 uv run python -m macrobench.runner \
     --config "$TMP_CONFIG" \

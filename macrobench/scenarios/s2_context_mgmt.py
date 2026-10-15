@@ -298,19 +298,12 @@ class ContextMgmtScenario(Scenario):
             inv.not_applicable(n1, "backend has no commits to revert")
         else:
             r = ctx.retry(lambda: suite.revert(ctx.spine, rejected["commit"], label="revert_compaction"))
-            if r.unsupported:
-                inv.not_applicable(n1, "revert unsupported")
-            else:
-                inv.expect(n1, present(rejected["branch"]), 0, f"revert {r.status_name} {r.error}")
+            inv.expect(n1, present(rejected["branch"]), 0, f"revert {r.status_name} {r.error}")
         rb = ctx.retry(lambda: suite.rebase(ctx.spine, alt["branch"], on_conflict="theirs", label="rebase_onto_alternative"))
         if rb.ok and isinstance(rb.value, dict):
             ctx.add_metric("rebase_conflicts", rb.value.get("conflicts", 0))
         m = ctx.retry(lambda: suite.merge(ctx.spine, alt["branch"], message="fast-forward to alternative",
                                           label="fast_forward"))
-        if rb.unsupported and m.unsupported:
-            inv.not_applicable(n2, "rebase and merge unsupported")
-            inv.not_applicable(n3, "rebase and merge unsupported")
-            return
         inv.check(n2, alt_before == 0 and present(alt["branch"]) == 1,
                   f"before={alt_before} after={present(alt['branch'])} "
                   f"(rebase {rb.status_name}, merge {m.status_name})")

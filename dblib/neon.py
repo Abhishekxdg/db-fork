@@ -346,7 +346,7 @@ class _State:
 
 class NeonToolSuite(PgMergeMixin, DBToolSuite):
     BACKEND_NAME = "neon"
-    STORAGE_SCOPE = "default-branch"
+    STORAGE_SCOPE = "project"   # root logical size + child branches' WAL since fork
     SUPPORTS_COMMIT_REFS = True
     SCHEMA_DIALECT = "postgres"
     SUPPORTS_MULTI_REF_EXEC = False
@@ -396,6 +396,11 @@ class NeonToolSuite(PgMergeMixin, DBToolSuite):
     # and how many open connections each one has. Shared by every suite.
     _ACTIVE: dict = {}
     _HOLDS: dict = {}
+    # Storage accounting, project-wide: branch id -> parent LSN (None for a
+    # root) and branch id -> last flush LSN seen (see _storage_bytes).
+    _LINEAGE: dict = {}
+    _HEAD_LSN: dict = {}
+    _SIZE_LOCK = threading.Lock()
     _SUSPENDING: set = set()     # branch ids with a suspend request in flight
     _ACT_LOCK = threading.Lock()
 
@@ -484,6 +489,20 @@ class NeonToolSuite(PgMergeMixin, DBToolSuite):
 
     def _register(self, name: str, branch_id: str, parent_id, parent_lsn) -> None:
         self._branches[name] = {"id": branch_id, "parent_id": parent_id, "parent_lsn": parent_lsn}
+        with type(self)._SIZE_LOCK:
+            type(self)._LINEAGE[branch_id] = lsn_to_int(parent_lsn) if parent_lsn else None
+
+    def _note_head(self, conn, branch_id: str) -> None:
+        """Remember the branch's flush LSN (its WAL since the fork is its
+        storage); best effort, on a connection that is still open."""
+        if conn is None or getattr(conn, "closed", 0) or not branch_id:
+            return
+        try:
+            lsn = self._exec(conn, "SELECT pg_current_wal_flush_lsn()::text")[0][0]
+        except Exception:
+            return
+        with type(self)._SIZE_LOCK:
+            type(self)._HEAD_LSN[branch_id] = lsn_to_int(lsn)
 
     def _refresh_branches(self) -> None:
         resp = self._api("GET", f"projects/{self.project_id}/branches")
@@ -642,6 +661,8 @@ class NeonToolSuite(PgMergeMixin, DBToolSuite):
         if conn is None:
             return
         bid = getattr(self, "_conn_owner", {}).pop(id(conn), None)
+        if bid:
+            self._note_head(conn, bid)
         try:
             conn.close()
         except Exception:
@@ -917,18 +938,40 @@ class NeonToolSuite(PgMergeMixin, DBToolSuite):
     # ------------------------------------------------------------------
 
     def _storage_bytes(self) -> int:
-        """pg_database_size() of the run's database on the default branch,
-        over a dedicated connection (the API's logical_size and the
-        project's synthetic_storage_size lag by more than a run, so they
-        cannot feed the sampler). Branch computes are not touched, so this
-        is the spine's logical size, not the project's billed storage."""
+        """The project's storage as Neon defines it: the default branch's
+        logical size plus, for every other branch, the changes it
+        accumulated since its fork point. The logical size is
+        ``pg_cluster_size()`` of the ``neon`` extension, the pageserver's
+        figure read on demand over a dedicated connection to the root (the
+        API's ``logical_size`` is the same number published minutes late;
+        its project totals are deprecated and always 0). A child's changes
+        are its WAL since its parent LSN, from the flush LSN noted whenever
+        a connection to it closes (and for the current connection, now),
+        so no other compute is touched. Neon caps a child at its logical
+        size; the cap is not applied here, nor are the backup branches a
+        restore leaves, and a deleted branch drops out at once although
+        Neon keeps its data for the retention window."""
         if getattr(self, "_closed", False):
             return 0  # the run's project is gone (after cleanup)
+        root_id = self._branch_id(self.default_branch)
+        root = 0
         for attempt in range(2):
             try:
                 if getattr(self, "_size_conn", None) is None:
-                    self._size_conn = self._open(self._branch_id(self.default_branch), max_wait=15)
-                return int(self._exec(self._size_conn, "SELECT pg_database_size(current_database())")[0][0])
+                    self._size_conn = self._open(root_id, max_wait=15)
+                    try:
+                        self._exec(self._size_conn, "CREATE EXTENSION IF NOT EXISTS neon")
+                        self._cluster_size_ok = True
+                    except Exception as e:
+                        print(f"Warning: neon extension unavailable, storage falls back to "
+                              f"pg_database_size: {e}")
+                        self._cluster_size_ok = False
+                if self.conn is not None and self._conn_branch_id and self._conn_branch_id != root_id:
+                    self._note_head(self.conn, self._conn_branch_id)
+                q = ("SELECT pg_cluster_size()" if getattr(self, "_cluster_size_ok", False)
+                     else "SELECT pg_database_size(current_database())")
+                root = int(self._exec(self._size_conn, q)[0][0])
+                break
             except Exception:
                 try:
                     if getattr(self, "_size_conn", None) is not None:
@@ -938,7 +981,11 @@ class NeonToolSuite(PgMergeMixin, DBToolSuite):
                 self._size_conn = None
                 if attempt == 1:
                     raise
-        return 0
+        cls = type(self)
+        with cls._SIZE_LOCK:
+            children = sum(max(0, cls._HEAD_LSN.get(b, p) - p)
+                           for b, p in cls._LINEAGE.items() if b != root_id and p is not None)
+        return root + children
 
     def _branch_impl(self, name: str, from_ref: Ref) -> None:
         st = self._state(from_ref)
@@ -1239,6 +1286,9 @@ class NeonToolSuite(PgMergeMixin, DBToolSuite):
     # -- delete --------------------------------------------------------------
 
     def _delete_branch(self, branch_id: str) -> None:
+        with type(self)._SIZE_LOCK:
+            type(self)._LINEAGE.pop(branch_id, None)
+            type(self)._HEAD_LSN.pop(branch_id, None)
         resp = self._api("DELETE", f"projects/{self.project_id}/branches/{branch_id}")
         try:
             self._wait(resp.get("operations"))

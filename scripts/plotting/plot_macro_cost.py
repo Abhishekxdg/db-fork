@@ -15,6 +15,9 @@ Figures (all by default):
 * ``bars``   cost_bars.png (S1, S3, S4, S6) and cost_bars_all.png (S1 to S6):
              per scenario, worker-seconds in branch operations, in data
              operations and the elapsed, as bars with the operation counts.
+             A run that ended at an unsupported verb, failed an invariant
+             check or did not complete gets no bar: an X and the reason
+             stand in its row, since its cost is not that of the workflow.
 * ``panels`` cost_panels.png: the same three quantities as one marker per
              scenario on a shared row axis.
 
@@ -59,36 +62,66 @@ RED = "#b00020"
 
 
 def load(run_dir):
-    """One row per run: scenario, backend, elapsed, fails, the summed
-    latency per category (columns named as in CATS), branch_s / data_s and
-    branch_n / data_n (branch categories against the rest), and threads
-    (98th percentile of distinct threads per second). Second value: the
-    pooled median branch-creation latency per backend in ms."""
+    """One row per run: scenario, backend, elapsed, fails, status,
+    unsupported (the first unsupported verb, or ""), invalid (why the run's
+    cost is not comparable, or ""), the summed latency per category
+    (columns named as in CATS), branch_s / data_s and branch_n / data_n
+    (branch categories against the rest), and threads (98th percentile of
+    distinct threads per second). Second value: the pooled median
+    branch-creation latency per backend in ms."""
     rows, create = [], {}
     for f in sorted(glob.glob(os.path.join(run_dir, "*", "*_e2e_stats.json"))):
         d = json.load(open(f))
         be = NAMES.get(d["backend"], d["backend"])
         fails = sum(1 for c in d["invariants"]["results"] if c["passed"] is False)
         df = pd.read_parquet(f.replace("_e2e_stats.json", ".parquet"),
-                             columns=["op_name", "label", "latency", "thread_id", "start_time"])
+                             columns=["op_name", "status", "label", "latency", "thread_id", "start_time"])
+        # The unsupported verbs with the scenario step that issued them,
+        # e.g. "BRANCH (investigation_branch)", in order of first appearance.
+        uns = df[df.status == "UNSUPPORTED"][["op_name", "label"]].drop_duplicates()
+        uns_verbs = [f"{o} ({l})" if l else o for o, l in zip(uns.op_name, uns.label)]
         df = df[~df.label.isin(["spine", "spine_update", "invariant"]) & (df.op_name != "EXEC")]
         cat = df.op_name.map(lambda o: OP_CAT.get(o, "data"))
         secs = df.latency.groupby(cat).sum().to_dict()
         is_branch = cat.isin(BRANCH_CATS)
         sec = ((df.start_time - df.start_time.min()) // 1).astype(int)
         peak = int(df.assign(sec=sec).groupby("sec").thread_id.nunique().quantile(0.98))
-        create.setdefault(be, []).extend(df.latency[df.op_name == "BRANCH"].tolist())
+        create.setdefault(be, []).extend(df.latency[(df.op_name == "BRANCH") & (df.status == "OK")].tolist())
+        # Why the run's cost is not the workflow's: it ended at (or, in
+        # older runs, skipped) an unsupported verb, failed a check, or did
+        # not complete (interrupted, crashed, incomplete).
+        status = str(d.get("status", "completed"))
+        ops = d.get("unsupported_ops") or []
+        unsupported = ""
+        if ops or d.get("workflow_supported") is False or status.startswith("unsupported"):
+            unsupported = ", ".join(uns_verbs) or ", ".join(sorted({o.split(":")[0] for o in ops})) \
+                or status.split(":", 1)[-1].split(":")[0].strip() or "?"
+        if unsupported:
+            invalid = f"unsupported: {unsupported}"
+        elif fails:
+            invalid = f"{fails} check{'s' if fails != 1 else ''} failed"
+        elif status != "completed":
+            invalid = status.split(":")[0]
+        else:
+            invalid = ""
         row = {"scenario": d["scenario"], "backend": be, "elapsed": d["elapsed_sec"], "fails": fails,
+               "status": status, "unsupported": unsupported, "invalid": invalid,
                "branch_s": float(df.latency[is_branch].sum()), "data_s": float(df.latency[~is_branch].sum()),
                "branch_n": int(is_branch.sum()), "data_n": int((~is_branch).sum()), "threads": peak}
         for c, _ in CATS:
             row[c] = float(secs.get(c, 0.0))
         rows.append(row)
-    return pd.DataFrame(rows), {b: 1000 * pd.Series(v).median() for b, v in create.items()}
+    # A backend with no successful branch creation (native-only run of a
+    # simulated adapter) gets NaN and sorts last.
+    return pd.DataFrame(rows), {b: 1000 * pd.Series(v).median() if v else float("nan") for b, v in create.items()}
 
 
 def _systems(create_ms):
-    return sorted(create_ms, key=create_ms.get)
+    return sorted(create_ms, key=lambda b: (np.isnan(create_ms[b]), create_ms[b]))
+
+
+def _ms(v):
+    return "no branch" if np.isnan(v) else f"{v:,.0f} ms"
 
 
 def _tidy(ax):
@@ -99,7 +132,7 @@ def _tidy(ax):
 
 def _row_labels(ax, systems, create_ms, size=8.5, bold=False):
     ax.set_yticks(range(len(systems)))
-    ax.set_yticklabels([f"{b}  {create_ms[b]:,.0f} ms" for b in systems], fontsize=size)
+    ax.set_yticklabels([f"{b}  {_ms(create_ms[b])}" for b in systems], fontsize=size)
     for lab, b in zip(ax.get_yticklabels(), systems):
         lab.set_color(COLORS[b])
         if bold:
@@ -121,7 +154,7 @@ def panel_rank(ax, t, create_ms):
             if b in d:
                 xs.append(i + 1); ys.append(d.index(b))
         ax.plot(xs, ys, "-o", color=COLORS[b], lw=1.6, ms=5, alpha=0.9)
-        ax.annotate(f"{b}  {create_ms[b]:,.0f} ms", (0, systems.index(b)), xytext=(-6, 0), textcoords="offset points",
+        ax.annotate(f"{b}  {_ms(create_ms[b])}", (0, systems.index(b)), xytext=(-6, 0), textcoords="offset points",
                     ha="right", va="center", fontsize=8, color=COLORS[b])
     for i, s in enumerate(cols):
         d = t[t.scenario == s].sort_values("elapsed")
@@ -210,24 +243,27 @@ def fig_bars(t, create_ms, scenarios, out, log=False):
                              gridspec_kw={"wspace": 0.08, "hspace": 0.55}, squeeze=False)
     for i, sc in enumerate(scenarios):
         d = t[t.scenario == sc].set_index("backend").reindex(systems)
-        fails = d.fails.fillna(0).values
+        invalid = d["invalid"].fillna("").astype(str).values
         for j, (col, title, color) in enumerate(BAR_PANELS):
             ax = axes[i, j]
             raw = d[col].values.astype(float)
-            vals, missing = np.nan_to_num(raw, nan=0.0), np.isnan(raw)
-            bad = [col == "elapsed" and f > 0 for f in fails]
-            ax.barh(range(n), vals, color=[RED if b else color for b in bad], height=0.68)
+            missing = np.isnan(raw)
+            # No bar for an invalid run: an X and the reason take its place.
+            vals = np.where(missing | (invalid != ""), 0.0, np.nan_to_num(raw, nan=0.0))
+            ax.barh(range(n), vals, color=color, height=0.68)
             xmax = vals.max() if vals.max() > 0 else 1.0
             counts = d["branch_n"].values if col == "branch_s" else d["data_n"].values if col == "data_s" else None
             for k, v in enumerate(vals):
                 if missing[k]:
-                    ax.text(xmax * 0.015, k, "no valid run", va="center", fontsize=7.5, color="#999", style="italic")
+                    ax.text(xmax * 0.015, k, "no run", va="center", fontsize=7.5, color="#999", style="italic")
                     continue
-                lab = f"{v:,.0f}" + (f"  ✗{int(fails[k])}" if bad[k] else "")
+                if invalid[k]:
+                    ax.text(xmax * 0.015, k, f"✗ {invalid[k]}", va="center", fontsize=7.5, color=RED, fontweight="bold")
+                    continue
+                lab = f"{v:,.0f}"
                 if counts is not None:
                     lab += f"  ({_k(counts[k])} ops)"
-                ax.text(v * 1.06 if log else v + xmax * 0.015, k, lab, va="center", fontsize=7.5,
-                        color=RED if bad[k] else "#333", fontweight="bold" if bad[k] else "normal")
+                ax.text(v * 1.06 if log else v + xmax * 0.015, k, lab, va="center", fontsize=7.5, color="#333")
             if log:
                 ax.set_xscale("log"); ax.set_xlim(max(1, vals.min() / 3), xmax * 6)
             else:
@@ -244,7 +280,7 @@ def fig_bars(t, create_ms, scenarios, out, log=False):
         _row_labels(ax_row[0], systems, create_ms)
     fig.text(0.01, 0.005, "Systems ordered by branch-creation latency (pooled median beside the name). Worker-seconds = sum of every agent-side operation's "
              "latency across the scenario's concurrent workers, so a column can exceed the wall-clock elapsed; the spine's background load is excluded. "
-             "Red = run with invariant failures (count). One run per cell; 'no valid run' = cell to rerun.", fontsize=7.5, color="#555")
+             "✗ = no comparable cost: the run ended at an unsupported verb, failed invariant checks or did not complete. One run per cell.", fontsize=7.5, color="#555")
     fig.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
     print("wrote", out)
 
@@ -267,12 +303,13 @@ def fig_panels(t, create_ms, scenarios, out):
                 r = t[(t.scenario == sc) & (t.backend == b)]
                 if r.empty:
                     continue
-                v, f = float(r.iloc[0][col]), int(r.iloc[0].fails)
-                bad = col == "elapsed" and f > 0
-                ax.plot(max(v, 1e-3), k, marker=marker, ms=7, color=color, markerfacecolor="white" if bad else color,
-                        markeredgewidth=1.6, markeredgecolor=RED if bad else color, ls="none", zorder=3)
-                if bad:
-                    ax.text(v * 1.25, k, f"✗{f}", va="center", fontsize=7, color=RED, fontweight="bold")
+                v, why = float(r.iloc[0][col]), str(r.iloc[0]["invalid"] or "")
+                if why:
+                    # The run's cost is not the workflow's: an X in the
+                    # scenario's colour, at its value, instead of a marker.
+                    ax.plot(max(v, 1e-3), k, marker="x", ms=7, color=RED, markeredgewidth=1.8, ls="none", zorder=3)
+                    continue
+                ax.plot(max(v, 1e-3), k, marker=marker, ms=7, color=color, ls="none", zorder=3)
         ax.set_xscale("log"); _tidy(ax)
         ax.set_title(title, fontsize=9.5, loc="left")
         ax.tick_params(axis="x", labelsize=7.5)
@@ -280,8 +317,8 @@ def fig_panels(t, create_ms, scenarios, out):
     _row_labels(axes[0], systems, create_ms, bold=True)
     handles = [plt.Line2D([], [], marker=MARKERS[sc][0], color=MARKERS[sc][1], ls="none", ms=7) for sc in scenarios]
     labels = [TITLES[sc].split(" (")[0] for sc in scenarios]
-    handles.append(plt.Line2D([], [], marker="o", color=RED, markerfacecolor="white", markeredgewidth=1.6, ls="none", ms=7))
-    labels.append("run with invariant failures")
+    handles.append(plt.Line2D([], [], marker="x", color=RED, markeredgewidth=1.8, ls="none", ms=7))
+    labels.append("no comparable cost (unsupported verb, failed check or incomplete run)")
     fig.legend(handles, labels, ncol=len(labels), fontsize=8, frameon=False, loc="lower center", bbox_to_anchor=(0.5, -0.02))
     fig.text(0.01, -0.08, "Rows ordered by branch-creation latency (pooled median). Summed times add every agent-side operation's latency "
              "over all workers (workers run concurrently, so they exceed wall time); spine load excluded. One run per cell.",

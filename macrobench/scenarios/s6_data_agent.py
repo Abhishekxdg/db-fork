@@ -254,24 +254,21 @@ class DataAgentScenario(Scenario):
         elif m.failed:
             ctx.bump_metric("merges_failed")
             ctx.note(f"batch {b}: merge {m.error[:120]}")
-        if m.unsupported:
-            inv.not_applicable(f"S6.1 manifest hidden until merge (batch {b})", "merge unsupported")
-        else:
-            after = manifest_on_spine()
-            inv.check(f"S6.1 manifest hidden until merge (batch {b})",
-                      before == 0 and after == 1,
-                      f"before={before} after={after} (merge {m.status_name})")
-            # S6.4: the merge carried every row the batch loaded. S6.3: the
-            # derived tables on the spine equal a recomputation from the
-            # merged batch orders of every batch so far (the additive
-            # resolver's output is what this checks).
-            with self._merge_lock, self.quiesced():
-                on_spine = batch_orders_on(ctx.spine)
-                mism = self._derived_mismatches(suite, ctx.spine)
-            inv.expect(f"S6.4 batch {b} rows all on the spine after merge", on_spine, loaded,
-                       f"merge {m.status_name}")
-            inv.expect(f"S6.3 derived tables match merged batch orders (after batch {b})", mism, 0,
-                       "daily_revenue/customer_summary rows differing from the base tables")
+        after = manifest_on_spine()
+        inv.check(f"S6.1 manifest hidden until merge (batch {b})",
+                  before == 0 and after == 1,
+                  f"before={before} after={after} (merge {m.status_name})")
+        # S6.4: the merge carried every row the batch loaded. S6.3: the
+        # derived tables on the spine equal a recomputation from the
+        # merged batch orders of every batch so far (the additive
+        # resolver's output is what this checks).
+        with self._merge_lock, self.quiesced():
+            on_spine = batch_orders_on(ctx.spine)
+            mism = self._derived_mismatches(suite, ctx.spine)
+        inv.expect(f"S6.4 batch {b} rows all on the spine after merge", on_spine, loaded,
+                   f"merge {m.status_name}")
+        inv.expect(f"S6.3 derived tables match merged batch orders (after batch {b})", mism, 0,
+                   "daily_revenue/customer_summary rows differing from the base tables")
         ctx.bump_metric("resets", resets)
         ctx.bump_metric("integrity_mismatches", mismatches)
         ctx.bump_metric("rows_loaded", loaded)

@@ -429,6 +429,9 @@ def main(argv=None):
         timed_out = bool(args.max_runtime_sec) and stopped and elapsed >= args.max_runtime_sec
         if status == "completed" and stopped:
             status = "interrupted"
+        if ctx.unsupported_abort:
+            # The first unsupported verb ended the run (see scenarios/base.py).
+            status = f"unsupported: {ctx.unsupported_abort}"
         # The scenario ran to its end, but an operation the watchdog
         # cancelled never finished: the workflow is incomplete.
         stalled_failed = [st for st in collector.stalls if st["outcome"] == "failed"]

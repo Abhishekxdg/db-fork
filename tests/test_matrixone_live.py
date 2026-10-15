@@ -416,9 +416,9 @@ def test_generations_resolve_across_workers(suite):
 
 
 def test_second_rebase_keeps_picked_rows_on_fk_table(suite):
-    """On a table with a foreign key, rows a rebase's PICK wrote are not
-    seen by the next rebase's PICK once the old generation is dropped
-    (v4.2.5); the adapter rewrites them, so a second rebase keeps them."""
+    """A second rebase keeps the rows the first one replayed on a table
+    with a foreign key (the case where v4.2.5's PICK, no longer used, lost
+    them once the old generation was dropped)."""
     suite.exec(["CREATE TABLE parent (p INT PRIMARY KEY)", "INSERT INTO parent VALUES (1)",
                 "CREATE TABLE child (id INT PRIMARY KEY, p INT, v INT, "
                 "FOREIGN KEY (p) REFERENCES parent (p) ON DELETE CASCADE)",

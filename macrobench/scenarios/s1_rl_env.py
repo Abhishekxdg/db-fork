@@ -237,9 +237,6 @@ class RlEnvScenario(Scenario):
         ctx, inv = self.ctx, self.ctx.invariants
         name = f"S1.5 schema diff of {branch} against its fork point reports the rollout's DDL"
         sd = ctx.retry(lambda: w.suite.schema_diff(fork_ref, leaf_ref, label="schema_diff"))
-        if sd.unsupported:
-            inv.not_applicable(name, f"schema diff unsupported: {sd.error[:80]}")
-            return
         if not sd.ok or not isinstance(sd.value, dict):
             inv.check(name, False, f"schema diff failed: {sd.error[:100]}")
             return

@@ -165,11 +165,9 @@ class MultiAgentScenario(Scenario):
         # Invariants for the round.
         merged = [m for m in self._merge_order if m["ok"]]
         lg = suite.log(ctx.spine, limit=4 * p.agents + 10, label="history")
-        if lg.unsupported:
-            inv.not_applicable(f"S3.1 log sentinel readable (round {r})", "log unsupported")
-        elif not merged:
+        if not merged:
             inv.not_applicable(f"S3.1 log sentinel readable (round {r})",
-                               "no agent commit reached the spine (merge unsupported or failed)")
+                               "no agent commit reached the spine (every merge failed)")
         else:
             msgs = [str(e.get("message", "")) for e in (lg.value or [])]
             hits = sum(1 for m in msgs if f"LOGSENTINEL-{r}-" in m)

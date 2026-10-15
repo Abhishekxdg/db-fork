@@ -11,8 +11,8 @@
 #                 (default: all seven; bauplan and xata are not run by default)
 #   --scenarios   comma-separated subset of: rl_env context_mgmt multi_agent
 #                 dev_agent ops_agent data_agent (default: all six)
-#   --native-only every operation an adapter simulates runs as unsupported
-#                 (DBFORK_NATIVE_ONLY=1), to measure the engines' own primitives
+#   --native-only every operation an adapter simulates runs as unsupported and
+#                 ends its run (DBFORK_NATIVE_ONLY=1), to measure the engines' own primitives
 #   --parallel    run the backends at the same time, each going through its
 #                 scenarios in order (for one server per machine, or Neon next
 #                 to local servers); implies --no-manage-servers, so every

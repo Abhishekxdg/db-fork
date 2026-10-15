@@ -18,9 +18,9 @@ Incidents: the spine commits form incidents of ``commits_per_incident``
 commits (0 = one incident), each with its own bad deploy, an equal share
 of the investigation branches, and its own reset; production continues
 from the reset head into the next incident, so branch intensity k gives
-k incidents. When an incident's reset is unsupported or fails, the spine
-keeps the fault's schema, so the later incidents are reported as not
-applicable rather than run on a broken schema. With more than one
+k incidents. When an incident's reset fails, the spine keeps the fault's
+schema, so the later incidents are reported as not applicable rather
+than run on a broken schema. With more than one
 incident the sentinel version and the check names carry the incident
 number.
 
@@ -36,7 +36,17 @@ S5.3: after the reset the schema diff from the target commit to the
 spine reports no change. S5.4: the dropped column is back with its
 values (one 'ops' per routine deploy up to the target commit). A backend
 that cannot restore a state older than a dropped column reports the
-reset (and a branch from such a commit) as unsupported.
+reset (and a branch from such a commit) as unsupported, which ends the
+run.
+
+Lineage across the reset (S5.5): the spine's history must still read
+correctly after a reset. S5.5a: right after the reset, a diff from the
+target commit to the spine reports no change. S5.5b: after one probe
+deploy on the spine (one deploy_log row inserted, one routine deploy's
+note updated, committed), the same diff reports exactly one added and
+one modified row and nothing deleted. A reset that rebuilds the tables
+under new identities (MatrixOne's RESTORE DATABASE) fails here: the
+later diff lists the updated row as deleted plus added on both sides.
 """
 
 import time
@@ -169,14 +179,14 @@ class OpsAgentScenario(Scenario):
                     inv.not_applicable("S5.2 head sentinel gone after reset" + tag, "no investigation results")
                 else:
                     to = target["hash"] or target["timestamp"]
+                    # The load stays paused from the reset through the
+                    # checks: S5.5 diffs the spine against the target
+                    # commit, so no spine transaction may land in between.
                     with self.quiesced():
                         reset = ctx.retry(lambda: suite.reset(ctx.spine, to, label="pitr_reset"))
-                    ctx.add_metric("reset_status" + sfx, reset.status_name)
-                    ctx.add_metric("reset_target_commit" + sfx, target["k"])
-                    ctx.add_metric("fault_commit" + sfx, fault_k)
-                    if reset.unsupported:
-                        inv.not_applicable("S5.2 head sentinel gone after reset" + tag, "reset unsupported")
-                    else:
+                        ctx.add_metric("reset_status" + sfx, reset.status_name)
+                        ctx.add_metric("reset_target_commit" + sfx, target["k"])
+                        ctx.add_metric("fault_commit" + sfx, fault_k)
                         if reset.ok:
                             self._deploy_ks = {x for x in self._deploy_ks if x <= target["k"]}
                         r = suite.exec([("SELECT COUNT(*) FROM deploy_log WHERE version = %s", (bad_version,))],
@@ -190,6 +200,7 @@ class OpsAgentScenario(Scenario):
                                                f"selected commit {target['k']} is after the bad deploy {fault_k}")
                         if p.schema_fault:
                             self._check_schema_reset(suite, target, fault_k, reset, tag)
+                        self._check_diff_across_reset(suite, target, fault_k, reset, inc, tag)
                 ctx.add_metric("time_to_recovery_sec" + sfx, round(time.time() - t_start, 3))
                 ctx.tick()
 
@@ -253,14 +264,8 @@ class OpsAgentScenario(Scenario):
             for n in names:
                 inv.not_applicable(n, "backend has no commits")
             return
-        if reset.unsupported:
-            for n in names:
-                inv.not_applicable(n, f"reset unsupported: {reset.error[:80]}")
-            return
         sd = ctx.retry(lambda: suite.schema_diff(f"{ctx.spine}@{target['hash']}", ctx.spine, label="schema_diff"))
-        if sd.unsupported:
-            inv.not_applicable(names[0], f"schema diff unsupported: {sd.error[:80]}")
-        elif not sd.ok or not isinstance(sd.value, dict):
+        if not sd.ok or not isinstance(sd.value, dict):
             inv.check(names[0], False, f"schema diff failed: {sd.error[:100]}")
         else:
             v = sd.value
@@ -280,6 +285,64 @@ class OpsAgentScenario(Scenario):
         inv.check(names[1], got == want,
                   f"rows with approved_by='ops' = {got} (want {want}: routine deploys up to commit {target['k']})"
                   + ("" if r.ok else f"; read failed: {r.error[:80]}"))
+
+    def _check_diff_across_reset(self, suite, target: dict, fault_k: int, reset, inc: int,
+                                 tag: str = "") -> None:
+        """S5.5a: a diff from the target commit to the reset spine reports
+        no change. S5.5b: after a probe deploy (one deploy_log row inserted,
+        one routine deploy's note updated, committed), the diff reports
+        exactly 1 added, 1 modified, 0 deleted rows. Runs inside the
+        caller's quiesced block, so the spine load (which keeps running
+        in the full config) cannot add rows between the reset and the
+        diffs."""
+        inv, ctx = self.ctx.invariants, self.ctx
+        names = ("S5.5a diff from the target commit to the reset spine is empty" + tag,
+                 "S5.5b diff across the reset reports exactly the probe deploy" + tag)
+        if target["k"] >= fault_k:
+            for n in names:
+                inv.not_applicable(n, f"selected commit {target['k']} is after the bad deploy {fault_k}")
+            return
+        if not target["hash"]:
+            for n in names:
+                inv.not_applicable(n, "backend has no commits")
+            return
+        if not reset.ok:
+            for n in names:
+                inv.check(n, False, f"reset {reset.status_name}: {reset.error[:100]}")
+            return
+        target_ref = f"{ctx.spine}@{target['hash']}"
+
+        def counts(d):
+            v = d.value if (d.ok and isinstance(d.value, dict)) else {}
+            return tuple(int(v.get(k) or 0) for k in ("rows_added", "rows_deleted", "rows_modified"))
+
+        d0 = ctx.retry(lambda: suite.diff(target_ref, ctx.spine, label="invariant"))
+        a0, dl0, m0 = counts(d0)
+        inv.check(names[0], d0.ok and (a0, dl0, m0) == (0, 0, 0),
+                  f"added={a0} deleted={dl0} modified={m0}" + ("" if d0.ok else f"; diff failed: {d0.error[:80]}"))
+        # Probe: one routine deploy's note updated (the latest one still on
+        # the spine, if any) and one new deploy_log row, as production would
+        # write them; committed so the diff is between two commits.
+        updated = max((x for x in self._deploy_ks if x <= target["k"]), default=None)
+        probe_id = 900000 + inc
+
+        def probe(db):
+            if updated is not None:
+                db.sql("UPDATE deploy_log SET note = %s WHERE deploy_id = %s", (f"post-reset probe {inc}", updated))
+            db.sql("INSERT INTO deploy_log (deploy_id, version, deployed_at, note) "
+                   "VALUES (%s, %s, CURRENT_TIMESTAMP, 'post-reset probe')", (probe_id, f"probe{inc}"))
+        with self.quiesced():
+            r = suite.exec(probe, refs=[ctx.spine], label="invariant")[0]
+            c = suite.commit(ctx.spine, f"post-reset probe {inc}", label="invariant")
+        if not (r.ok and c.ok):
+            inv.check(names[1], False, f"probe {'write' if not r.ok else 'commit'} failed: {(r.error or c.error)[:100]}")
+            return
+        d1 = ctx.retry(lambda: suite.diff(target_ref, ctx.spine, label="invariant"))
+        a1, dl1, m1 = counts(d1)
+        want_mod = 1 if updated is not None else 0
+        inv.check(names[1], d1.ok and (a1, dl1, m1) == (1, 0, want_mod),
+                  f"added={a1} deleted={dl1} modified={m1} (want 1/0/{want_mod})"
+                  + ("" if d1.ok else f"; diff failed: {d1.error[:80]}"))
 
     def _deploy_script(self, k, fault, fw, fd, bad, version=BAD_VERSION):
         def script(db):
