@@ -32,6 +32,7 @@ import os
 
 import matplotlib
 matplotlib.use("Agg")
+matplotlib.rcParams["pdf.fonttype"] = 42  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
@@ -287,14 +288,14 @@ def fig_bars(t, create_ms, scenarios, out, log=False):
 
 # --- cost_bars_grouped.png --------------------------------------------------
 
-GROUPS = [("branch-intensive", ["context_mgmt", "multi_agent", "dev_agent"]),
-          ("data-intensive", ["rl_env", "ops_agent", "data_agent"])]
+GROUPS = [("Branch Intensive", ["context_mgmt", "multi_agent", "dev_agent"]),
+          ("Data Intensive", ["rl_env", "ops_agent", "data_agent"])]
 # One hatch per system so the bars stay apart in black and white.
 HATCHES = {"Doltgres": "", "Dolt": "//", "Chronos": "..", "MatrixOne": "xx", "file_copy": "\\\\",
            "SeekDB": "--", "Neon": "++"}
 SHORT = {"rl_env": "S1 RL env", "context_mgmt": "S2 context mgmt", "multi_agent": "S3 multi-agent",
          "dev_agent": "S4 dev agent", "ops_agent": "S5 ops agent", "data_agent": "S6 data agent"}
-ROWS = [("branch_s", "branch ops\n(worker-seconds)"), ("data_s", "data ops\n(worker-seconds)"),
+ROWS = [("branch_s", "branch ops\n(worker-sec)"), ("data_s", "data ops\n(worker-sec)"),
         ("elapsed", "elapsed\n(wall-clock s)")]
 
 
@@ -317,7 +318,7 @@ def fig_bars_grouped(t, create_ms, out, log=False):
     groups = [(name, [sc for sc in g if (t.scenario == sc).any()]) for name, g in GROUPS]
     groups = [(name, g) for name, g in groups if g]
     n = len(systems)
-    plt.rcParams["hatch.linewidth"] = 0.6
+    plt.rcParams["hatch.linewidth"] = 0.4
     # One grid column per scenario plus a narrow spacer between groups.
     widths, cols = [], {}
     for gi, (_, g) in enumerate(groups):
@@ -325,9 +326,12 @@ def fig_bars_grouped(t, create_ms, out, log=False):
             widths.append(0.35)
         for sc in g:
             cols[sc] = len(widths); widths.append(1.0)
-    fig = plt.figure(figsize=(2.1 * sum(widths), 6.6))
-    gs = fig.add_gridspec(len(ROWS), len(widths), width_ratios=widths, wspace=0.14 if log else 0.4,
-                          hspace=0.3, top=0.82, bottom=0.03, left=0.07, right=0.99)
+    # Sized and styled like the micro stories figures (plot_micro_stories.py):
+    # a 7.2 in wide page figure with small type, so the panels fill the
+    # column when the figure is scaled to the text width.
+    fig = plt.figure(figsize=(7.4, 3.3))
+    gs = fig.add_gridspec(len(ROWS), len(widths), width_ratios=widths, wspace=0.14 if log else 0.55,
+                          hspace=0.38, top=0.78, bottom=0.025, left=0.07, right=0.995)
     axes = {}
     for i, (col, lab) in enumerate(ROWS):
         row_max, first = 1.0, None
@@ -347,21 +351,21 @@ def fig_bars_grouped(t, create_ms, out, log=False):
                 for bar, b in zip(bars, systems):
                     bar.set_hatch(HATCHES.get(b, ""))
                 for k in np.flatnonzero(invalid != ""):
-                    ax.text(k, 1.3 if log else top * 0.02, "\u2717", ha="center", va="bottom", fontsize=10,
+                    ax.text(k, 1.3 if log else top * 0.02, "\u2717", ha="center", va="bottom", fontsize=7,
                             color=RED, fontweight="bold")
                 if not log:
                     ax.set_ylim(0, top * 1.12)
                     ax.yaxis.set_major_locator(MaxNLocator(4)); ax.yaxis.set_major_formatter(FuncFormatter(_tick_fmt))
-                    ax.tick_params(axis="y", labelsize=7.5)
+                ax.tick_params(axis="y", labelsize=6.5, length=2.5, width=0.5, pad=2)
                 ax.set_xlim(-0.6, n - 0.4); ax.set_xticks([])
-                ax.grid(axis="y", color="#e5e5e5", lw=0.6); ax.set_axisbelow(True)
+                ax.grid(axis="y", color="#eee", lw=0.5); ax.set_axisbelow(True)
                 for sp in ax.spines.values():
-                    sp.set_linewidth(0.8); sp.set_color("#444")
+                    sp.set_linewidth(0.6); sp.set_color("#444")
                 if i == 0:
                     th = int(d.threads.median())
-                    ax.set_title(SHORT.get(sc, sc), fontsize=11, fontweight="bold", pad=16)
+                    ax.set_title(SHORT.get(sc, sc), fontsize=7.5, fontweight="bold", color="#1f1f1f", pad=10)
                     ax.text(0.5, 1.03, f"{th} worker{'s' if th != 1 else ''} at peak", transform=ax.transAxes,
-                            ha="center", va="bottom", fontsize=8, color="#555")
+                            ha="center", va="bottom", fontsize=6, color="#555")
                 if log:
                     ax.tick_params(axis="y", which="minor", length=0)
                     if ax is not first:
@@ -371,20 +375,23 @@ def fig_bars_grouped(t, create_ms, out, log=False):
             first.yaxis.set_major_locator(LogLocator(base=10, numticks=8))
             first.yaxis.set_major_formatter(FuncFormatter(_log_fmt))
             first.yaxis.set_minor_formatter(NullFormatter())
-            first.tick_params(axis="y", which="major", labelsize=8)
-        first.set_ylabel(lab, fontsize=10, fontweight="bold")
+            first.tick_params(axis="y", which="major", labelsize=6.5)
+        first.set_ylabel(lab, fontsize=7, fontweight="bold")
+        first.yaxis.set_label_coords(-0.6, 0.5)  # same x for every row, whatever its tick width
     # Group headers over their columns, with a rule under each.
     for name, g in groups:
         l, r = axes[0, g[0]].get_position(), axes[0, g[-1]].get_position()
-        y = l.y1 + 0.075
-        fig.text((l.x0 + r.x1) / 2, y + 0.008, name, ha="center", va="bottom", fontsize=11.5, fontweight="bold")
-        fig.add_artist(plt.Line2D([l.x0, r.x1], [y, y], color="#444", lw=0.8, transform=fig.transFigure))
+        y = l.y1 + 0.09
+        fig.text((l.x0 + r.x1) / 2, y + 0.006, name, ha="center", va="bottom", fontsize=8.5, fontweight="bold")
+        fig.add_artist(plt.Line2D([l.x0, r.x1], [y, y], color="#444", lw=0.6, transform=fig.transFigure))
     handles = [Patch(facecolor=COLORS[b], hatch=HATCHES.get(b, ""), edgecolor="#222", linewidth=0.5,
-                     label=f"{b}  {_ms(create_ms[b])}") for b in systems]
-    fig.legend(handles=handles, loc="upper center", ncol=n, fontsize=9.5, frameon=False,
-               bbox_to_anchor=(0.5, 1.0), handlelength=1.6, handleheight=1.2, columnspacing=1.4)
-    fig.savefig(out, dpi=200, bbox_inches="tight"); plt.close(fig)
-    print("wrote", out)
+                     label=b) for b in systems]
+    fig.legend(handles=handles, loc="upper center", ncol=n, fontsize=6.5, frameon=False,
+               bbox_to_anchor=(0.5, 1.005), handlelength=1.2, handleheight=1.0, columnspacing=1.0, handletextpad=0.4)
+    fig.savefig(out, dpi=300, bbox_inches="tight", pad_inches=0.02)
+    fig.savefig(os.path.splitext(out)[0] + ".pdf", bbox_inches="tight", pad_inches=0.02)
+    plt.close(fig)
+    print("wrote", out, "and .pdf")
 
 
 # --- cost_panels.png --------------------------------------------------------

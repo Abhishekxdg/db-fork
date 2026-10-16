@@ -1316,6 +1316,13 @@ class MatrixOneToolSuite(DBToolSuite):
             self._undo_since(db, _State(db, row["snap"]), fp)
             self._execute(f"DELETE FROM {_qt(db, COMMITS_TABLE)} WHERE seq > %s", (int(row["seq"]),))
             return
+        if MO_NATIVE_RESET:
+            # RESTORE DATABASE restores a database to its own snapshot; a
+            # commit made on another generation of the branch (before a
+            # rebase) has none for this database, and the SQL restore is a
+            # simulation.
+            raise self._unsupported("reset", f"commit made on {row['db']}, another generation of the branch; "
+                                             "RESTORE DATABASE needs the database's own snapshot")
         self._warn(("reset_sql", db), f"reset of {db} to a commit made on {row['db']}: rows restored with SQL")
         self._restore_sql(db, _State(row["db"], row["snap"]), fp)
         self._execute(

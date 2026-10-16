@@ -7,7 +7,9 @@ spine (``concurrent_branches`` alive at once, ``dev_branches`` in total).
 Each implements the loyalty feature: loyalty_tier and loyalty_event tables,
 customer.c_tier, and a chunked backfill of customer rows (a share
 ``key_overlap`` of which also rewrites c_data, which Payment transactions
-on the spine rewrite too). The branch is hot for ``dev_phase_steps``, then
+on the spine rewrite too); each dev step is ``statements_per_step``
+statements split by ``write_fraction`` into backfill chunks and reads
+of the feature (tier counts, event counts, top customers of a tier). The branch is hot for ``dev_phase_steps``, then
 quiet for ``review_phase_steps`` with occasional modifications, rebases
 onto the spine once or twice (conflicts resolved in the branch's favour),
 and is deleted without merging.
@@ -46,7 +48,7 @@ from macrobench.scenarios.base import Scenario, Worker, register
 from macrobench.datagen.ch import DISTRICTS_PER_WAREHOUSE
 
 SPINE_SENTINEL_BASE = 100_000
-REVIEW_IDLE_SEC = 0.05
+REVIEW_IDLE_SEC = 0.5   # idle time per review step without an edit (2026-10-16, was 0.05)
 DEFAULT_SPINE_COMMIT_EVERY_TXNS = 200
 SPINE_COMMIT_PERIOD_SEC = 2.0     # checkpoint period without a spine load
 
@@ -220,7 +222,7 @@ class DevAgentScenario(Scenario):
                 w.exec(self._feature_ddl(i, col), branch, label="feature_ddl")
             else:
                 w.exec(self._backfill_script(i, step, chunk, rng, col), branch, label="backfill")
-                chunk += ctx.statements_per_step
+                chunk += self._backfill_writes()
             committed = ctx.should_commit(step - 1, last_step=(step == p.dev_phase_steps))
             if committed:
                 w.commit(branch, f"dev {i} step {step}", label="dev_commit")
@@ -416,16 +418,29 @@ class DevAgentScenario(Scenario):
                    "(1, 'bronze', 0), (2, 'silver', 5000), (3, 'gold', 9000)")
         return script
 
+    def _backfill_writes(self) -> int:
+        """Backfill chunks per dev step: statements_per_step split by
+        write_fraction, as in S1 and S2; the rest of the step is reads."""
+        n = self.ctx.statements_per_step
+        return max(1, round(n * self.ctx.data_ops.write_fraction)) if n > 1 else 1
+
     def _backfill_script(self, i: int, step: int, chunk: int, rng, col: str = "c_tier"):
+        """One dev step: ``writes`` backfill chunks (a range update of
+        rows_per_write customers plus an event insert each) and then
+        ``reads`` queries a developer would run against the feature."""
         ctx = self.ctx
         n = ctx.statements_per_step
+        writes = self._backfill_writes()
+        reads = max(0, n - writes)
         rows = ctx.rows_per_write
         customers = ctx.scale.customers_per_district
         per_district = max(1, (customers + rows - 1) // rows)
         overlap = self.params.key_overlap
+        read_kinds = [rng.randrange(4) for _ in range(reads)]
 
         def script(db):
-            for k in range(n):
+            last = (1, 1)
+            for k in range(writes):
                 idx = chunk + k
                 w_id = 1 + (idx // (per_district * DISTRICTS_PER_WAREHOUSE)) % ctx.scale.warehouses
                 d_id = 1 + (idx // per_district) % DISTRICTS_PER_WAREHOUSE
@@ -445,5 +460,17 @@ class DevAgentScenario(Scenario):
                 db.sql("INSERT INTO loyalty_event (event_id, c_w_id, c_d_id, c_id, tier_id, created_at) "
                        "VALUES (%s, %s, %s, %s, 1, CURRENT_TIMESTAMP)",
                        (i * 1_000_000 + step * 1000 + k, w_id, d_id, lo))
-            db.sql(f"SELECT {col}, COUNT(*) FROM customer GROUP BY {col}")
+                last = (w_id, d_id)
+            w_id, d_id = last
+            for kind in read_kinds:
+                if kind == 0:
+                    db.sql(f"SELECT {col}, COUNT(*) FROM customer GROUP BY {col}")
+                elif kind == 1:
+                    db.sql("SELECT COUNT(*) FROM loyalty_event WHERE c_w_id = %s", (w_id,))
+                elif kind == 2:
+                    db.sql(f"SELECT c_id, c_ytd_payment FROM customer WHERE c_w_id = %s AND c_d_id = %s "
+                           f"AND {col} = 'gold' ORDER BY c_ytd_payment DESC LIMIT 10", (w_id, d_id))
+                else:
+                    db.sql("SELECT t.name, COUNT(e.event_id) FROM loyalty_tier t "
+                           "LEFT JOIN loyalty_event e ON e.tier_id = t.tier_id GROUP BY t.name")
         return script

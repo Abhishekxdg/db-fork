@@ -12,9 +12,12 @@ simulated merges find their base at the fork point of the side that
 descends from the other.
 """
 
+import threading
+import time
 from dataclasses import dataclass, field
 
-from dblib.db_api import DBToolSuite, OpResult
+from dblib import result_collector as rc
+from dblib.db_api import DBToolSuite, OpResult, OpStatus
 from microbench.verbs.grid import FOLLOW_UP_ROWS, STOCK_ROWS, key_ranges
 
 ROWS_PER_HISTORY_COMMIT = 10
@@ -27,6 +30,7 @@ class Ctx:
     rep: int = 0
     stock_rows: int = STOCK_ROWS
     log: callable = print
+    new_suite: callable = None     # a fresh suite (own connection) for a concurrent client
 
 
 # -- untimed helpers ------------------------------------------------------
@@ -153,22 +157,90 @@ class Commit(Verb):
 class Delete(Verb):
     name = "delete"
 
+    def prepare_point(self, ctx, p):
+        # Other live branches on the database while one is deleted (the
+        # deleted branch itself is the last of the ``live`` count).
+        return {"live": [fork(ctx.suite, f"{ctx.point}l{i}", ctx.point) for i in range(p["live"] - 1)]}
+
     def prepare_rep(self, ctx, p, ps):
-        child = fork(ctx.suite, f"{ctx.point}a{ctx.rep}", ctx.point)
-        start, start_b = key_ranges(ctx.rep, max(p["written"], p["commits"] * ROWS_PER_HISTORY_COMMIT, 1),
-                                    stock_rows=ctx.stock_rows)
-        update_rows(ctx.suite, child, start, p["written"])
-        commits_of(ctx.suite, child, p["commits"], ROWS_PER_HISTORY_COMMIT, start_b)
-        return {"child": child, "deleted": False}
+        # ``parallel`` branches, each with the point's rows and commits on
+        # its own key range; one is the plain delete, more are deleted at
+        # once by that many clients.
+        k = max(1, int(p["parallel"]))
+        n = max(p["written"], p["commits"] * ROWS_PER_HISTORY_COMMIT, 1)
+        children = []
+        for j in range(k):
+            child = fork(ctx.suite, f"{ctx.point}a{ctx.rep}" + (f"_{j}" if k > 1 else ""), ctx.point)
+            start, start_b = key_ranges(ctx.rep * k + j, n, stock_rows=ctx.stock_rows)
+            update_rows(ctx.suite, child, start, p["written"])
+            commits_of(ctx.suite, child, p["commits"], ROWS_PER_HISTORY_COMMIT, start_b)
+            children.append(child)
+        return {"children": children, "deleted": [False] * k}
 
     def run(self, ctx, p, ps, rs, timed, label):
-        res = ctx.suite.delete(rs["child"], timed=timed, label=label)
-        rs["deleted"] = res.ok
-        return res
+        if len(rs["children"]) == 1:
+            res = ctx.suite.delete(rs["children"][0], timed=timed, label=label)
+            rs["deleted"][0] = res.ok
+            return res
+        return self._run_parallel(ctx, rs, timed, label)
+
+    def _run_parallel(self, ctx, rs, timed, label):
+        """Every branch deleted by its own client (suite and connection)
+        at the same time. The result's latency is the batch's wall-clock
+        time from the first delete starting to the last finishing; each
+        client's own delete is recorded as usual, and the per-delete
+        latencies are in the value."""
+        k = len(rs["children"])
+        # The point's own connection was last used on one of the branches
+        # about to be deleted under it; park it on the point branch first.
+        ctx.suite.exec(["SELECT 1"], refs=[ctx.point], timed=False)
+        results = [None] * k
+        spans = [None] * k
+        gate = threading.Barrier(k)
+
+        def client(j):
+            rc.set_current_thread_id(100 + j)
+            suite = ctx.new_suite()
+            try:
+                gate.wait()
+                t0 = time.perf_counter()
+                results[j] = suite.delete(rs["children"][j], timed=timed, label=label)
+                spans[j] = (t0, time.perf_counter())
+            except Exception as e:
+                results[j] = OpResult(op="delete", status=OpStatus.FAILED, ref=rs["children"][j],
+                                      error=f"{type(e).__name__}: {e}")
+                spans[j] = (time.perf_counter(), time.perf_counter())
+            finally:
+                try:
+                    suite.close_connection()
+                except Exception:
+                    pass
+
+        threads = [threading.Thread(target=client, args=(j,), name=f"delete-{j}") for j in range(k)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        for j, r in enumerate(results):
+            rs["deleted"][j] = bool(r is not None and r.ok)
+        wall = max(e for _, e in spans) - min(s for s, _ in spans)
+        bad = [r for r in results if r is None or not r.ok]
+        status = OpStatus.OK
+        if bad:
+            status = OpStatus.UNSUPPORTED if any(r is not None and r.unsupported for r in bad) else OpStatus.FAILED
+        return OpResult(op="delete", status=status, ref=rs["children"][0], latency=wall,
+                        error=(bad[0].error if bad and bad[0] is not None else ""),
+                        value={"parallel": k, "per_delete": [r.latency if r else None for r in results],
+                               "sum": sum(r.latency for r in results if r), "failed": len(bad)})
 
     def cleanup_rep(self, ctx, rs):
-        if not rs["deleted"]:
-            drop(ctx.suite, rs["child"])
+        for child, done in zip(rs["children"], rs["deleted"]):
+            if not done:
+                drop(ctx.suite, child)
+
+    def cleanup_point(self, ctx, ps):
+        for b in ps["live"]:
+            drop(ctx.suite, b)
 
 
 class Diff(Verb):

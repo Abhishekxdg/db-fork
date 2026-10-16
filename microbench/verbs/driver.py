@@ -63,9 +63,9 @@ def _quantiles(xs):
 
 
 def run_point(point_id, verb, params, suite, backend, spine, point_branch, *, reps, warmup,
-              storage_reps, stock_rows, log):
+              storage_reps, stock_rows, log, new_suite=None):
     """All reps of one point on ``point_branch``. Returns the summary."""
-    ctx = Ctx(suite=suite, point=point_branch, stock_rows=stock_rows, log=log)
+    ctx = Ctx(suite=suite, point=point_branch, stock_rows=stock_rows, log=log, new_suite=new_suite)
     out = {"id": point_id, "verb": verb.name, "params": params, "status": "ok", "reps": [],
            "errors": [], "prep_sec": 0.0}
     t0 = time.time()
@@ -96,6 +96,9 @@ def run_point(point_id, verb, params, suite, backend, spine, point_branch, *, re
                 if res is not None:
                     rep["status"] = res.status_name
                     rep["latency"] = res.latency
+                    if isinstance(res.value, dict) and "parallel" in res.value:
+                        rep["per_delete"] = res.value["per_delete"]
+                        rep["sum_latency"] = res.value["sum"]
                     if isinstance(res.value, dict) and "conflicts" in res.value:
                         # Rows on every backend: Dolt's ``conflicts`` counts
                         # merges or replayed commits, its ``conflict_rows`` rows.
@@ -258,7 +261,7 @@ def main(argv=None):
                 fork(suite, point_branch, spine)
                 res = run_point(pid, verb, params, suite, backend, spine, point_branch, reps=reps,
                                 warmup=args.warmup, storage_reps=args.storage_reps,
-                                stock_rows=args.stock_rows, log=log)
+                                stock_rows=args.stock_rows, log=log, new_suite=new_suite)
             except Exception as e:
                 traceback.print_exc()
                 res = {"id": pid, "verb": verb.name, "params": params, "status": "crashed",

@@ -21,9 +21,10 @@ BASE = {
     "scale": 1,        # W warehouses of CH-benCHmark data
     "rows": 100,       # rows the verb carries (changed rows per side)
     "age": 0,          # branch: commits behind the head the source commit is (0 = head)
-    "live": 1,         # branch: live branches already on the database
+    "live": 1,         # branch/delete: live branches already on the database
     "commits": 1,      # delete/rebase: commits on the branch
     "written": 100,    # delete: rows written on the branch before it is deleted
+    "parallel": 1,     # delete: branches deleted at the same time, one client each
     "upstream": 100,   # rebase: rows the upstream moved by
     "conflict": 0.0,   # merge: share of each side's rows the other side also changed
     "distance": 100,   # reset: rows written after the target commit
@@ -64,6 +65,8 @@ AXES = (
     Axis("delete", "scale", SCALES, "data size (warehouses)"),
     Axis("delete", "commits", (0,) + POW2, "commits on the branch"),
     Axis("delete", "written", (0, 100, 1_000, 10_000, 100_000), "rows written on the branch"),
+    Axis("delete", "live", POW2, "live branches"),
+    Axis("delete", "parallel", (1, 2, 4, 8, 16, 32), "branches deleted at once"),
     Axis("diff", "rows", ROWS, "rows changed"),
     Axis("diff", "scale", SCALES, "data size (warehouses)"),
     Axis("merge", "rows", ROWS, "rows changed per side"),

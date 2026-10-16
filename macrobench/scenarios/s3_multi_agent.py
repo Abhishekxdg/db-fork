@@ -2,8 +2,11 @@
 
 The spine holds shared task state (task, dependency). Each round the spine
 is checkpointed, N agents branch from that checkpoint, revise the plan
-(status/assignee edits with a configurable key overlap, subtasks,
-contradictory dependency edges, a scratch table created and dropped), commit
+(``statements_per_step`` statements split by ``write_fraction``: task
+status/assignee edits with a configurable key overlap and subtask
+inserts with their edges, then reads; plus three fixed probes: the
+sentinel update, a contradictory dependency edge and a scratch table
+created and dropped), commit
 with a message carrying their id, and merge into the spine one at a time
 while the spine keeps receiving task updates. Merges resolve conflicts with the fixed policy:
 spine wins on task rows except the sentinel task 0 (last merger wins, it
@@ -245,21 +248,29 @@ class MultiAgentScenario(Scenario):
 
     def _revision_script(self, w: Worker, r: int, a: int, sentinel_value: str):
         ctx, p, rng = self.ctx, self.params, w.rng
+        # Plan work sized by DataOps like S1 and S2: statements_per_step
+        # split by write_fraction into writes and reads. A third of the
+        # writes (at least one) are subtask inserts, each with its
+        # dependency edge; the rest are task edits. The sentinel update,
+        # the contradictory edge and the scratch table are fixed probes.
         n = ctx.statements_per_step
+        writes = max(1, round(n * ctx.data_ops.write_fraction)) if n > 1 else 1
+        reads = max(0, n - writes)
+        subtasks = max(1, writes // 3)
+        n_edits = max(1, writes - subtasks)
         shared = self._shared_keys()
         private = [t for t in range(1, self.num_tasks + 1) if t not in shared] or shared
         edits = []
-        for _ in range(max(1, n // 2)):
+        for _ in range(n_edits):
             pool = shared if (shared and rng.random() < p.key_overlap) else private
             edits.append(rng.choice(pool))
-        reads = max(0, n - len(edits))
         agent = f"agent-{a}"
         # Contradictory edges: odd agents add reconcile -> fulfil (2 -> 1),
         # even agents the reverse.
         edge = (2, 1) if a % 2 else (1, 2)
         with self._id_lock:
             sub_base = self._next_task_id
-            self._next_task_id += 2
+            self._next_task_id += subtasks
 
         def script(db):
             db.sql(f"CREATE TABLE scratch_{a} (id INT NOT NULL, v INT, PRIMARY KEY (id))")
@@ -269,7 +280,7 @@ class MultiAgentScenario(Scenario):
                        "updated_step = %s WHERE task_id = %s",
                        (rng.choice(["in_progress", "done", "blocked"]), agent, r, t))
             parent = edits[0]
-            for i in range(2):
+            for i in range(subtasks):
                 db.sql("INSERT INTO task (task_id, parent_id, title, status, assignee, version, updated_step) "
                        "VALUES (%s, %s, %s, 'open', %s, 0, %s)",
                        (sub_base + i, parent, f"subtask {sub_base + i} of {parent}", agent, r))

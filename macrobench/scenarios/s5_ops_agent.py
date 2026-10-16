@@ -9,8 +9,10 @@ deployment ``fault_commit_offset`` commits before the end injects a fault
 from the catalog and writes the deploy_log row that is the head sentinel.
 Investigation branches are created at ``investigation_branches`` commit
 points among the last ``history_offset`` commits; each creates
-incident_finding, evaluates the TPC-C consistency conditions, diffs
-against the corrupted head and commits its findings. The spine is then
+incident_finding, evaluates the TPC-C consistency conditions plus
+diagnostic reads and writes finding rows (``statements_per_step``
+statements split by ``write_fraction``; the conditions always run),
+diffs against the corrupted head and commits its findings. The spine is then
 reset hard to the latest commit at which every condition held, and the
 investigation branches are deleted.
 
@@ -369,12 +371,31 @@ class OpsAgentScenario(Scenario):
             ctx.tick()
             return None
 
+        # Sized by DataOps like S1 and S2: statements_per_step split by
+        # write_fraction. The consistency conditions always run (the
+        # recovery point depends on all of them) and count as the first
+        # reads; further reads are diagnostics from a pool. Writes are
+        # finding rows: one per condition, then one per diagnostic.
+        n = ctx.statements_per_step
+        writes = max(1, round(n * ctx.data_ops.write_fraction)) if n > 1 else 1
+        reads = max(0, n - writes)
+        diagnostics = [
+            "SELECT deploy_id, version, deployed_at FROM deploy_log ORDER BY deploy_id DESC LIMIT 10",
+            "SELECT COUNT(*) FROM orders WHERE o_carrier_id IS NULL",
+            "SELECT w_id, w_ytd FROM warehouse ORDER BY w_ytd DESC LIMIT 5",
+            "SELECT COUNT(*) FROM stock WHERE s_quantity < 10",
+        ]
+
         def script(db):
             db.sql("CREATE TABLE incident_finding (finding_id INT NOT NULL, branch_name VARCHAR(64), "
                    "commit_hash VARCHAR(64), condition_name VARCHAR(8), violations INT, "
                    "PRIMARY KEY (finding_id))")
             violations = faults.check_consistency(db)
-            for i, (cond, v) in enumerate(violations.items()):
+            findings = list(violations.items())
+            for j in range(max(0, reads - len(violations))):
+                rows = db.sql(diagnostics[j % len(diagnostics)])
+                findings.append((f"D{j + 1}", len(rows or [])))
+            for i, (cond, v) in enumerate(findings[:writes]):
                 db.sql("INSERT INTO incident_finding (finding_id, branch_name, commit_hash, "
                        "condition_name, violations) VALUES (%s, %s, %s, %s, %s)",
                        (k * 100 + i, branch, h or "", cond, v))

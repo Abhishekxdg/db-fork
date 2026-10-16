@@ -4,7 +4,9 @@ A single spine records an assistant's interactions (turn and tool_call
 rows). Every ``compaction_interval`` steps the spine is committed and
 ``fanout`` candidate branches try a curation strategy each (A: summarize
 old turns, B: replace large tool results by references, C: deduplicate
-turns), commit, and read their curated context through a view; the
+turns), commit, and read their curated context; with probability
+``data_ops.ddl_fraction`` a candidate also creates a view over that
+context and an index on turn and reads through the view. The
 candidates run concurrently, one worker each (``worker_threads``, capped
 by ``fanout``), while the spine is driven from the main thread. A
 cross-branch policy check picks one candidate and the spine fast-forwards
@@ -21,7 +23,7 @@ The rebase replays every spine commit since the compaction point onto the
 alternative, including the rejected compaction commit and its revert;
 these cancel out, so the result equals replaying the work commits only.
 Conflict-freedom is a schema property: candidates rewrite old rows and add
-notes, views and indexes; the spine only appends new turn/tool_call rows.
+notes (and views and indexes); the spine only appends new turn/tool_call rows.
 
 Sentinels: the ``note`` row with kind 'compaction' naming the candidate.
 
@@ -105,11 +107,17 @@ class ContextMgmtScenario(Scenario):
                     if not res.ok:
                         ctx.note(f"candidate {name}: {res.status_name} {res.error}")
                         return None
-                    w.exec(self._curation_script(name, strategy, step, w.rng), name, label="curation")
+                    # DDL (a view over the curated context and an index) with
+                    # probability ddl_fraction; without it the candidate reads
+                    # its context straight from the turn table.
+                    ddl = w.rng.random() < ctx.data_ops.ddl_fraction
+                    w.exec(self._curation_script(name, strategy, step, w.rng, ddl), name, label="curation")
                     c = w.commit(name, f"compaction {cycle} {strategy} ({name})",
                                  label="curation_commit")
-                    w.exec([f"SELECT COUNT(*), SUM(token_count) FROM context_v_{name}"],
-                           name, label="curated_context")
+                    cutoff = max(0, step - 2)
+                    context_sql = (f"SELECT COUNT(*), SUM(token_count) FROM context_v_{name}" if ddl else
+                                   f"SELECT COUNT(*), SUM(token_count) FROM turn WHERE step >= {cutoff}")
+                    w.exec([context_sql], name, label="curated_context")
                     return {"branch": name, "commit": c.value if c.ok else None,
                             "strategy": strategy}
 
@@ -200,7 +208,7 @@ class ContextMgmtScenario(Scenario):
             self._note_id += 1
             return self._note_id
 
-    def _curation_script(self, name, strategy, step, rng):
+    def _curation_script(self, name, strategy, step, rng, ddl: bool = True):
         cutoff = max(0, step - 2)   # "older" = before the last two steps
 
         def script(db):
@@ -227,18 +235,20 @@ class ContextMgmtScenario(Scenario):
             db.sql("INSERT INTO note (note_id, kind, candidate, content, created_at) "
                    "VALUES (%s, 'compaction', %s, %s, CURRENT_TIMESTAMP)",
                    (note_id, name, f"strategy {strategy}"))
+            if not ddl:
+                return
             db.sql(f"CREATE VIEW context_v_{name} AS SELECT turn_id, step, role, content, token_count "
                    f"FROM turn WHERE step >= {cutoff}")
             # One index per strategy, each on its own column set: Dolt
             # cannot merge two indexes covering the same columns, and a
             # strategy chosen earlier may already have put its index on
             # the spine (then the CREATE fails and is ignored).
-            ddl = f"idx_turn_{strategy} ON turn {INDEX_COLUMNS[strategy]}"
+            index_ddl = f"idx_turn_{strategy} ON turn {INDEX_COLUMNS[strategy]}"
             try:
-                db.sql(f"CREATE INDEX IF NOT EXISTS {ddl}")
+                db.sql(f"CREATE INDEX IF NOT EXISTS {index_ddl}")
             except Exception:
                 try:  # MySQL dialects lack IF NOT EXISTS
-                    db.sql(f"CREATE INDEX {ddl}")
+                    db.sql(f"CREATE INDEX {index_ddl}")
                 except Exception:
                     pass
         return script
