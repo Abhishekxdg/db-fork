@@ -362,10 +362,7 @@ def fig_bars_grouped(t, create_ms, out, log=False):
                 for sp in ax.spines.values():
                     sp.set_linewidth(0.6); sp.set_color("#444")
                 if i == 0:
-                    th = int(d.threads.median())
-                    ax.set_title(SHORT.get(sc, sc), fontsize=7.5, fontweight="bold", color="#1f1f1f", pad=10)
-                    ax.text(0.5, 1.03, f"{th} worker{'s' if th != 1 else ''} at peak", transform=ax.transAxes,
-                            ha="center", va="bottom", fontsize=6, color="#555")
+                    ax.set_title(SHORT.get(sc, sc), fontsize=7.5, fontweight="bold", color="#1f1f1f", pad=4)
                 if log:
                     ax.tick_params(axis="y", which="minor", length=0)
                     if ax is not first:

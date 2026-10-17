@@ -4,7 +4,7 @@
 # Usage:
 #   ./scripts/run_macrobench.sh [--mini] [--outdir DIR] [--max-runtime-sec N] [--op-stall-sec N] \
 #       [--measure-storage] [--storage-sample-interval SEC] [--branch-intensity X] [--data-intensity Y] \
-#       [--native-only] \
+#       [--native-only] [--seed N] \
 #       <scenario> <backend> [scale_factor]
 #
 # Arguments:
@@ -13,7 +13,10 @@
 #   scale_factor  W warehouses for the generated CH-benCHmark data (default: the config's)
 #
 # The base config is macrobench/configs/<scenario>[_mini].textproto; run_id,
-# backend and scale_factor are patched into a temporary copy.
+# backend, scale_factor and seed are patched into a temporary copy. --seed N
+# sets every random choice of the run (data generation, the scenario's and
+# its workers' streams, the spine load; the config's seed, or 42, otherwise)
+# and appends _s<N> to the run id.
 #
 # Examples:
 #   ./scripts/run_macrobench.sh --mini rl_env dolt
@@ -50,6 +53,7 @@ NATIVE_ONLY=false
 OUTDIR="run_stats/"
 BRANCH_INTENSITY=""
 DATA_INTENSITY=""
+SEED=""
 MAX_RUNTIME_SEC=""
 DEFAULT_CAP_SEC=3600
 STORAGE_SAMPLE_INTERVAL=""
@@ -63,6 +67,7 @@ while [[ $# -gt 0 ]]; do
         --outdir)          OUTDIR="$2"; shift 2 ;;
         --branch-intensity) BRANCH_INTENSITY="$2"; shift 2 ;;
         --data-intensity)   DATA_INTENSITY="$2"; shift 2 ;;
+        --seed)            SEED="$2"; shift 2 ;;
         --max-runtime-sec) MAX_RUNTIME_SEC="$2"; shift 2 ;;
         --op-stall-sec)    OP_STALL_SEC="$2"; shift 2 ;;
         --storage-sample-interval) STORAGE_SAMPLE_INTERVAL="$2"; shift 2 ;;
@@ -71,7 +76,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ $# -lt 2 || $# -gt 3 ]]; then
-    echo "Usage: $0 [--mini] [--outdir DIR] [--max-runtime-sec N] [--op-stall-sec N] [--measure-storage] [--native-only] [--storage-sample-interval SEC] [--branch-intensity X] [--data-intensity Y] <scenario> <backend> [scale_factor]"
+    echo "Usage: $0 [--mini] [--outdir DIR] [--max-runtime-sec N] [--op-stall-sec N] [--measure-storage] [--native-only] [--storage-sample-interval SEC] [--branch-intensity X] [--data-intensity Y] [--seed N] <scenario> <backend> [scale_factor]"
     echo "  scenario:  rl_env | context_mgmt | multi_agent | dev_agent | ops_agent | data_agent"
     echo "  backend:   dolt | dolt_mysql | seekdb | matrixone | bauplan | neon | xata | file_copy | chronos"
     exit 1
@@ -98,7 +103,7 @@ if $MINI; then
 else
     SUFFIX=""
 fi
-RUN_ID="macro_${SCENARIO}${SUFFIX}_${BACKEND}${SCALE:+_w$SCALE}${BRANCH_INTENSITY:+_b$BRANCH_INTENSITY}${DATA_INTENSITY:+_d$DATA_INTENSITY}"
+RUN_ID="macro_${SCENARIO}${SUFFIX}_${BACKEND}${SCALE:+_w$SCALE}${BRANCH_INTENSITY:+_b$BRANCH_INTENSITY}${DATA_INTENSITY:+_d$DATA_INTENSITY}${SEED:+_s$SEED}"
 BASE_CONFIG="macrobench/configs/${SCENARIO}${SUFFIX}.textproto"
 if [[ ! -f "$BASE_CONFIG" ]]; then
     echo "Error: base config not found: $BASE_CONFIG"
@@ -113,6 +118,11 @@ if [[ -n "$SCALE" ]]; then
     SED_ARGS+=(-e "s|scale_factor: [0-9]*|scale_factor: ${SCALE}|")
 fi
 sed "${SED_ARGS[@]}" "$BASE_CONFIG" > "$TMP_CONFIG"
+# The seed is a top-level field: drop the config's own, if any, and append ours.
+if [[ -n "$SEED" ]]; then
+    sed -i -e '/^seed:/d' "$TMP_CONFIG"
+    printf 'seed: %s\n' "$SEED" >> "$TMP_CONFIG"
+fi
 # Intensity multipliers are inserted as the first lines of the workload block.
 if [[ -n "$BRANCH_INTENSITY" || -n "$DATA_INTENSITY" ]]; then
     INTENSITY_LINES=""

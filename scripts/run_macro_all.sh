@@ -5,7 +5,7 @@
 # Usage:
 #   ./scripts/run_macro_all.sh [--mini] [--max-runtime-sec N] [--outroot DIR] \
 #       [--no-manage-servers] [--storage-sample-interval SEC] [--measure-storage] \
-#       [--scenarios a,b,...] [--native-only] [--parallel] [--colocate-drivers] [backend ...]
+#       [--scenarios a,b,...] [--native-only] [--seed N] [--parallel] [--colocate-drivers] [backend ...]
 #
 #   backend ...   subset of: dolt dolt_mysql seekdb matrixone neon file_copy chronos
 #                 (default: all seven; bauplan and xata are not run by default)
@@ -86,6 +86,7 @@ fi
 
 MINI=""
 MAX_RUNTIME_SEC=14400
+SEED=""
 OUTROOT=""
 MANAGE_SERVERS=true
 PARALLEL=false
@@ -102,6 +103,7 @@ while [[ $# -gt 0 ]]; do
         --measure-storage)   STORAGE_FLAGS+=(--measure-storage); shift ;;
         --scenarios)         IFS=',' read -r -a SCENARIOS <<< "$2"; shift 2 ;;
         --native-only)       STORAGE_FLAGS+=(--native-only); shift ;;
+        --seed)              STORAGE_FLAGS+=(--seed "$2"); SEED="$2"; shift 2 ;;
         --parallel)          PARALLEL=true; MANAGE_SERVERS=false; shift ;;
         --colocate-drivers)  COLOCATE_DRIVERS=true; shift ;;
         --*)                 echo "unknown option $1"; exit 1 ;;
@@ -375,7 +377,7 @@ run_scenarios() {
     done
 }
 
-log "RUN SET outroot=$OUTROOT backends=${BACKENDS[*]} mini=${MINI:-no} cap=${MAX_RUNTIME_SEC}s manage_servers=$MANAGE_SERVERS parallel=$PARALLEL colocate_drivers=$COLOCATE_DRIVERS"
+log "RUN SET outroot=$OUTROOT backends=${BACKENDS[*]} mini=${MINI:-no} cap=${MAX_RUNTIME_SEC}s seed=${SEED:-config} manage_servers=$MANAGE_SERVERS parallel=$PARALLEL colocate_drivers=$COLOCATE_DRIVERS"
 if $PARALLEL; then
     PIDS=()
     for b in "${BACKENDS[@]}"; do
