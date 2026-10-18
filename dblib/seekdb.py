@@ -813,25 +813,36 @@ class SeekDBToolSuite(DBToolSuite):
         but not in db are recreated."""
         here = set(self._tables(db))
         there = set(self._tables(target.db))
+        readd = []
         if target.schema is not None:
             there &= set(target.schema)
             # Upfront schema comparison: what the target had and the branch
-            # has since dropped cannot come back with its values (a
-            # re-added column or table is new to the engine; a flashback
-            # read returns NULL or nothing for it). Refuse before touching
-            # anything rather than restore NULLs or a half-reset branch.
-            lost = []
+            # has since dropped is new to the engine when it comes back,
+            # and a flashback read returns NULL for a re-added column
+            # (probed 2026-10-17). A dropped column is re-added with its
+            # recorded type and its rows come back NULL, which the
+            # scenario's checks then report (S5.4); a dropped table has no
+            # recorded definition beyond its columns and is refused.
+            lost, readd = [], []
             for table, fp in target.schema.items():
                 if table not in here:
                     if target.db == db or table not in set(self._tables(target.db)):
                         lost.append(f"table {table}")
                     continue
                 now = {col for col, _, _, _ in self._columns(db, table)}
-                lost += [f"{table}.{c}" for c in fp if c not in now]
+                types = fp if isinstance(fp, dict) else {}
+                for c in fp:
+                    if c not in now:
+                        if types.get(c):
+                            readd.append((table, c, types[c]))
+                        else:
+                            lost.append(f"{table}.{c}")
             if lost:
-                raise self._unsupported("restore to a state before a dropped column or table",
+                raise self._unsupported("restore to a state before a dropped table",
                                         "flashback versions rows under the current schema only; dropped since "
                                         f"the target and not restorable: {', '.join(lost)}")
+            for table, col, ctype in readd:
+                self._execute(f"ALTER TABLE {_qt(db, table)} ADD COLUMN {_quote(col)} {ctype} NULL")
         dropped, restored, created, skipped = [], [], [], []
         retyped: dict = {}
         for table in sorted(here | there):
@@ -871,7 +882,8 @@ class SeekDBToolSuite(DBToolSuite):
             for col, ctype in cols:
                 self._execute(f"ALTER TABLE {_qt(db, table)} MODIFY {_quote(col)} {ctype}")
         return {"restored": restored, "dropped": dropped, "created": created,
-                "not_restored": skipped}
+                "not_restored": skipped,
+                "readded_columns_null": [f"{t}.{c}" for t, c, _ in readd]}
 
     def _restore_table(self, db: str, table: str, target: _State) -> None:
         cols_here = [c[0] for c in self._columns(db, table)]
