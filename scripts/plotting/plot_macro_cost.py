@@ -81,6 +81,7 @@ def load(run_dir):
         # e.g. "BRANCH (investigation_branch)", in order of first appearance.
         uns = df[df.status == "UNSUPPORTED"][["op_name", "label"]].drop_duplicates()
         uns_verbs = [f"{o} ({l})" if l else o for o, l in zip(uns.op_name, uns.label)]
+        spine_s = float(df.latency[df.label.isin(["spine", "spine_update"]) & (df.op_name != "EXEC")].sum())
         df = df[~df.label.isin(["spine", "spine_update", "invariant"]) & (df.op_name != "EXEC")]
         cat = df.op_name.map(lambda o: OP_CAT.get(o, "data"))
         secs = df.latency.groupby(cat).sum().to_dict()
@@ -108,13 +109,22 @@ def load(run_dir):
         row = {"scenario": d["scenario"], "backend": be, "elapsed": d["elapsed_sec"], "fails": fails,
                "status": status, "unsupported": unsupported, "invalid": invalid,
                "branch_s": float(df.latency[is_branch].sum()), "data_s": float(df.latency[~is_branch].sum()),
-               "branch_n": int(is_branch.sum()), "data_n": int((~is_branch).sum()), "threads": peak}
+               "branch_n": int(is_branch.sum()), "data_n": int((~is_branch).sum()), "threads": peak,
+               "spine_s": spine_s}
         for c, _ in CATS:
             row[c] = float(secs.get(c, 0.0))
         rows.append(row)
     # A backend with no successful branch creation (native-only run of a
     # simulated adapter) gets NaN and sorts last.
     return pd.DataFrame(rows), {b: 1000 * pd.Series(v).median() if v else float("nan") for b, v in create.items()}
+
+
+def _hatch_color(c):
+    """A darker shade of a bar colour, used as the edge colour so the hatch
+    stays visible without a black outline (hatches take the edge colour)."""
+    import matplotlib.colors as mc
+    r, g, b = mc.to_rgb(c)
+    return (r * 0.6, g * 0.6, b * 0.6)
 
 
 def _systems(create_ms):
@@ -295,6 +305,11 @@ HATCHES = {"Doltgres": "", "Dolt": "//", "Chronos": "..", "MatrixOne": "xx", "fi
            "SeekDB": "--", "Neon": "++"}
 SHORT = {"rl_env": "S1 RL env", "context_mgmt": "S2 context mgmt", "multi_agent": "S3 multi-agent",
          "dev_agent": "S4 dev agent", "ops_agent": "S5 ops agent", "data_agent": "S6 data agent"}
+# Scenarios whose spine traffic is counted with the data ops (stacked as a
+# lighter segment): S5's production phase is the workload itself (the
+# scenario drives the spine commits and waits for the load between them),
+# whereas S4's and S6's spine load is background traffic.
+SPINE_IN_DATA = {"ops_agent"}
 ROWS = [("branch_s", "branch ops\n(worker-sec)"), ("data_s", "data ops\n(worker-sec)"),
         ("elapsed", "elapsed\n(wall-clock s)")]
 
@@ -307,11 +322,13 @@ def _log_fmt(v, _pos):
     return f"{v/1000:g}k" if v >= 1000 else f"{v:g}"
 
 
-def fig_bars_grouped(t, create_ms, out, log=False):
+def fig_bars_grouped(t, create_ms, out, log=False, horizontal=False):
     """Scenarios as columns in two groups, metrics as rows, one bar per
     system coloured and hatched as in the legend; a failed run is a bare
     X. Each panel has its own linear y axis; with ``log``, a log axis
-    shared along the row instead."""
+    shared along the row instead. ``horizontal`` lays the bars sideways,
+    one row per system (fastest brancher on top) with the system names
+    down the first panel of each group instead of a legend."""
     from matplotlib.patches import Patch
     from matplotlib.ticker import FuncFormatter, LogLocator, MaxNLocator, NullFormatter
     systems = _systems(create_ms)
@@ -329,9 +346,11 @@ def fig_bars_grouped(t, create_ms, out, log=False):
     # Sized and styled like the micro stories figures (plot_micro_stories.py):
     # a 7.2 in wide page figure with small type, so the panels fill the
     # column when the figure is scaled to the text width.
-    fig = plt.figure(figsize=(7.4, 3.3))
-    gs = fig.add_gridspec(len(ROWS), len(widths), width_ratios=widths, wspace=0.14 if log else 0.55,
-                          hspace=0.38, top=0.78, bottom=0.025, left=0.07, right=0.995)
+    fig = plt.figure(figsize=(7.4, 3.1 if horizontal else 3.3))
+    gs = fig.add_gridspec(len(ROWS), len(widths), width_ratios=widths, wspace=0.14 if log else (0.3 if horizontal else 0.55),
+                          hspace=0.38 if horizontal else 0.38, top=0.83 if horizontal else 0.78, bottom=0.07 if horizontal else 0.025,
+                          left=0.14 if horizontal else 0.07, right=0.995)
+    first_of_group = {g[0] for _, g in groups}
     axes = {}
     for i, (col, lab) in enumerate(ROWS):
         row_max, first = 1.0, None
@@ -344,22 +363,43 @@ def fig_bars_grouped(t, create_ms, out, log=False):
                 invalid = d["invalid"].fillna("").astype(str).values
                 raw = np.nan_to_num(d[col].values.astype(float), nan=0.0)
                 vals = np.where(invalid != "", 0.0, raw)
+                spine = np.zeros(n)
+                if col == "data_s" and sc in SPINE_IN_DATA and "spine_s" in d:
+                    spine = np.where(invalid != "", 0.0, np.nan_to_num(d["spine_s"].values.astype(float), nan=0.0))
+                vals = vals + spine          # S5: one bar of agent plus spine traffic
                 row_max = max(row_max, vals.max())
                 top = vals.max() if vals.max() > 0 else 1.0
-                bars = ax.bar(range(n), vals, bottom=1.0 if log else 0.0, color=[COLORS[b] for b in systems],
-                              width=0.72, edgecolor="#222", linewidth=0.5)
-                for bar, b in zip(bars, systems):
-                    bar.set_hatch(HATCHES.get(b, ""))
-                for k in np.flatnonzero(invalid != ""):
-                    ax.text(k, 1.3 if log else top * 0.02, "\u2717", ha="center", va="bottom", fontsize=7,
-                            color=RED, fontweight="bold")
-                if not log:
-                    ax.set_ylim(0, top * 1.12)
-                    ax.yaxis.set_major_locator(MaxNLocator(4)); ax.yaxis.set_major_formatter(FuncFormatter(_tick_fmt))
-                ax.tick_params(axis="y", labelsize=6.5, length=2.5, width=0.5, pad=2)
-                ax.set_xlim(-0.6, n - 0.4); ax.set_xticks([])
-                ax.grid(axis="y", color="#eee", lw=0.5); ax.set_axisbelow(True)
-                for sp in ax.spines.values():
+                if horizontal:
+                    bars = ax.barh(range(n), vals, color=[COLORS[b] for b in systems], height=0.72,
+                                   edgecolor="#222", linewidth=0.5)
+                    for k in np.flatnonzero(invalid != ""):
+                        ax.text(top * 0.03, k, "\u2717", ha="left", va="center", fontsize=7, color=RED, fontweight="bold")
+                    ax.set_xlim(0, top * 1.12)
+                    ax.xaxis.set_major_locator(MaxNLocator(3)); ax.xaxis.set_major_formatter(FuncFormatter(_tick_fmt))
+                    ax.tick_params(axis="x", labelsize=6.5, length=2.5, width=0.5, pad=2)
+                    ax.set_ylim(n - 0.4, -0.6)
+                    if sc in first_of_group:
+                        ax.set_yticks(range(n)); ax.set_yticklabels(systems, fontsize=5.5)
+                        for tl, b in zip(ax.get_yticklabels(), systems):
+                            tl.set_color(COLORS[b])
+                        ax.tick_params(axis="y", length=0, pad=2)
+                    else:
+                        ax.set_yticks([])
+                    ax.grid(axis="x", color="#eee", lw=0.5); ax.set_axisbelow(True)
+                else:
+                    bars = ax.bar(range(n), vals, bottom=1.0 if log else 0.0, color=[COLORS[b] for b in systems],
+                                  width=0.72, edgecolor="#222", linewidth=0.5)
+                    for k in np.flatnonzero(invalid != ""):
+                        ax.text(k, 1.3 if log else top * 0.02, "\u2717", ha="center", va="bottom", fontsize=7,
+                                color=RED, fontweight="bold")
+                    if not log:
+                        ax.set_ylim(0, top * 1.12)
+                        ax.yaxis.set_major_locator(MaxNLocator(4)); ax.yaxis.set_major_formatter(FuncFormatter(_tick_fmt))
+                    ax.tick_params(axis="y", labelsize=6.5, length=2.5, width=0.5, pad=2)
+                    ax.set_xlim(-0.6, n - 0.4); ax.set_xticks([])
+                    ax.grid(axis="y", color="#eee", lw=0.5); ax.set_axisbelow(True)
+                for name_sp, sp in ax.spines.items():
+                    sp.set_visible(name_sp in ("left", "bottom"))
                     sp.set_linewidth(0.6); sp.set_color("#444")
                 if i == 0:
                     ax.set_title(SHORT.get(sc, sc), fontsize=7.5, fontweight="bold", color="#1f1f1f", pad=4)
@@ -374,17 +414,20 @@ def fig_bars_grouped(t, create_ms, out, log=False):
             first.yaxis.set_minor_formatter(NullFormatter())
             first.tick_params(axis="y", which="major", labelsize=6.5)
         first.set_ylabel(lab, fontsize=7, fontweight="bold")
-        first.yaxis.set_label_coords(-0.6, 0.5)  # same x for every row, whatever its tick width
+        # Same x for every row, whatever its tick width (further out when
+        # the system names sit on the axis).
+        first.yaxis.set_label_coords(-0.85 if horizontal else -0.6, 0.5)
     # Group headers over their columns, with a rule under each.
     for name, g in groups:
         l, r = axes[0, g[0]].get_position(), axes[0, g[-1]].get_position()
         y = l.y1 + 0.09
         fig.text((l.x0 + r.x1) / 2, y + 0.006, name, ha="center", va="bottom", fontsize=8.5, fontweight="bold")
         fig.add_artist(plt.Line2D([l.x0, r.x1], [y, y], color="#444", lw=0.6, transform=fig.transFigure))
-    handles = [Patch(facecolor=COLORS[b], hatch=HATCHES.get(b, ""), edgecolor="#222", linewidth=0.5,
-                     label=b) for b in systems]
-    fig.legend(handles=handles, loc="upper center", ncol=n, fontsize=6.5, frameon=False,
-               bbox_to_anchor=(0.5, 1.005), handlelength=1.2, handleheight=1.0, columnspacing=1.0, handletextpad=0.4)
+    if not horizontal:   # sideways bars carry the system names on the axis
+        handles = [Patch(facecolor=COLORS[b], hatch=HATCHES.get(b, ""), edgecolor="#222", linewidth=0.5,
+                         label=b) for b in systems]
+        fig.legend(handles=handles, loc="upper center", ncol=n, fontsize=6.5, frameon=False,
+                   bbox_to_anchor=(0.5, 1.005), handlelength=1.2, handleheight=1.0, columnspacing=1.0, handletextpad=0.4)
     fig.savefig(out, dpi=300, bbox_inches="tight", pad_inches=0.02)
     fig.savefig(os.path.splitext(out)[0] + ".pdf", bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
@@ -440,7 +483,13 @@ def main():
     ap.add_argument("--figures", nargs="*", default=["rank", "bars", "panels", "grouped"],
                     choices=["rank", "bars", "panels", "grouped"])
     ap.add_argument("--log", action="store_true", help="log axis on the bars (shared per row when grouped)")
+    ap.add_argument("--horizontal", action="store_true", help="grouped figure with sideways bars (cost_bars_grouped_h)")
+    ap.add_argument("--spine-scenarios", default=None,
+                    help="comma-separated scenarios whose spine traffic is stacked onto the data-ops bar "
+                         "(default: ops_agent; '' for none)")
     a = ap.parse_args()
+    if a.spine_scenarios is not None:
+        SPINE_IN_DATA.clear(); SPINE_IN_DATA.update(x for x in a.spine_scenarios.split(",") if x)
     os.makedirs(a.outdir, exist_ok=True)
     t, create_ms = load(a.run_dir)
     present = [s for s, _ in SCENARIOS if (t.scenario == s).any()]
@@ -454,6 +503,8 @@ def main():
         fig_panels(t, create_ms, four, os.path.join(a.outdir, "cost_panels.png"))
     if "grouped" in a.figures:
         fig_bars_grouped(t, create_ms, os.path.join(a.outdir, "cost_bars_grouped.png"), a.log)
+        if a.horizontal:
+            fig_bars_grouped(t, create_ms, os.path.join(a.outdir, "cost_bars_grouped_h.png"), log=a.log, horizontal=True)
 
 
 if __name__ == "__main__":
