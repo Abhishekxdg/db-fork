@@ -369,6 +369,13 @@ class SpineLoad:
             t.join(timeout)
         return self
 
+    def restart(self):
+        """Start the clients again after stop() (S5's next incident)."""
+        self.stop()
+        self._stop.clear()
+        self._threads = []
+        return self.start()
+
     @property
     def running(self) -> bool:
         return any(t.is_alive() for t in self._threads)

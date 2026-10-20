@@ -43,9 +43,9 @@ report uses):
                base: the keys a native diff of the branch's own two
                snapshots lists (plus rows with a value in a column the
                branch added, which that diff does not see) are copied in
-               with SQL from the head snapshot's time-travel view, or, in
-               native-only mode, replayed with DATA BRANCH PICK ... BETWEEN
-               SNAPSHOT; conflicts with the upstream's delta are resolved
+               with SQL from the head snapshot's time-travel view (never
+               DATA BRANCH PICK, see the limitations; in native-only mode
+               rebase is unsupported); conflicts with the upstream's delta are resolved
                per on_conflict; the registry is repointed and the old
                generation dropped (the lineage now starts at the upstream
                head, so a later merge back sees only newer changes)
@@ -68,14 +68,18 @@ in a rebase "ours" is the upstream (the branch being rebased onto) and
 
 Known limitations (MatrixOne v4.2.5):
 
-- The native-only rebase (DATA BRANCH PICK) is not fully reliable. In a
-  long S4 run, from roughly 500 s in, about every other rebase's PICK
-  carries none of the branch's rows even though a time-travel read of
-  the same snapshots shows them all; the branch then silently loses that
-  backfill. Not reproduced standalone (spine load, delays, flushes,
-  checkpoints, intermediate commits, composite keys, migrations in the
-  window, prior ALTERs and sibling branch churn were all ruled out). The
-  default rebase copies the rows from the snapshot with SQL instead.
+- DATA BRANCH PICK ... BETWEEN SNAPSHOT, the engine's replay of a
+  branch's delta and the only candidate for a native rebase, is not
+  reliable. In a long S4 run, from roughly 500 s in, about every other
+  rebase's PICK carries none of the branch's rows even though a
+  time-travel read of the same snapshots shows them all; the branch then
+  silently loses that backfill. Not reproduced standalone (spine load,
+  delays, flushes, checkpoints, intermediate commits, composite keys,
+  migrations in the window, prior ALTERs and sibling branch churn were all
+  ruled out). It also refuses a table whose columns differ between the
+  sides ("column has different identity"). The rebase therefore copies
+  the rows from the snapshot with SQL, is reported as simulated, and is
+  unsupported in native-only mode (2026-10-15).
 - PICK and MERGE resolve conflicts per row, so "theirs" replaces the
   upstream's whole row, including columns only the upstream changed.
 - DATA BRANCH DIFF does not report a change confined to a column added
@@ -84,6 +88,8 @@ Known limitations (MatrixOne v4.2.5):
   tarLCASnapshot/baseLCASnapshot in pkg/frontend/data_branch_types.go).
 """
 
+import csv
+import io
 import json
 import os
 import re
@@ -109,14 +115,19 @@ MO_DATA_DIR = os.path.expanduser(os.environ.get("MO_DATA_DIR", "~/mo/matrixone/m
 # even when on_conflict is "ours"/"theirs" and the count is only reported.
 MO_COUNT_CONFLICTS = os.environ.get("MO_COUNT_CONFLICTS", "1").lower() not in ("0", "false", "no")
 
-# Native-only mode (DBFORK_NATIVE_ONLY=1) uses the engine's own primitives
-# as they are: RESTORE DATABASE for reset() (it gives the restored tables
-# new identities and later lineage diffs across that edge misreport
-# updated rows) and DATA BRANCH PICK to replay the branch's delta in
-# rebase() (sporadically carries nothing late in long runs). Otherwise
-# both are done from a native diff of the branch's own two snapshots,
-# applied with SQL.
+# Native-only mode (DBFORK_NATIVE_ONLY=1) resets with the engine's own
+# RESTORE DATABASE as it is (it gives the restored tables new identities
+# and later lineage diffs across that edge misreport updated rows).
+# Otherwise reset undoes a native diff of the branch's own two snapshots
+# with SQL. Rebase has no native counterpart that meets the contract
+# (DATA BRANCH PICK, see the limitations), so it is simulated in every
+# mode and unsupported in native-only mode.
 MO_NATIVE_RESET = native_only()
+# Native-only mode: merge skips the adapter's schema reconciliation (added
+# tables/columns replayed on the target before the per-table engine merge).
+MO_NATIVE_MERGE_AS_IS = native_only()
+# Native-only mode: a diff the engine refuses stays refused (no SQL fallback).
+MO_NATIVE_DIFF_ONLY = native_only()
 
 MAIN_BRANCH = "main"
 _BRANCH_SEP = "__"
@@ -156,7 +167,6 @@ CREATE TABLE IF NOT EXISTS {table} (
 )
 """
 
-_CONFLICT_ROW_LIMIT = 1000
 
 
 def connect(db_name: str = None, autocommit: bool = True, **kwargs):
@@ -210,6 +220,9 @@ def branch_of_db(db_name: str, db: str) -> str:
     return m.group(1) if m else name
 
 
+# MatrixOne stores database names in lowercase (SHOW DATABASES and
+# information_schema report them so) while accepting any case in
+# statements, so catalog lookups compare case-insensitively.
 def meta_db_name(db_name: str) -> str:
     return f"{db_name}{_BRANCH_SEP}{_META_NAME}"
 
@@ -297,12 +310,11 @@ class MatrixOneToolSuite(DBToolSuite):
         "diff": "native",
         "log": "simulated",
         "merge": "native",
-        "rebase": "native" if MO_NATIVE_RESET else "simulated",
+        "rebase": "simulated",   # PICK loses rows and refuses schema differences
         "revert": "simulated",
         "reset": "native" if MO_NATIVE_RESET else "simulated",
         "delete": "native",
         "commit_refs": "native",
-        "schema_diff": "simulated",
         "multi_ref_exec": "native",
     }
     IMPLEMENTATION_NOTES = {
@@ -311,15 +323,16 @@ class MatrixOneToolSuite(DBToolSuite):
         "diff": "DATA BRANCH DIFF ... OUTPUT SUMMARY per table (native LCA)",
         "log": "SELECT from the _bb_commits bookkeeping table",
         "merge": "DATA BRANCH MERGE per table WHEN CONFLICT SKIP|ACCEPT; conflict rows/count "
-                 "from two native diffs against the fork snapshot; a resolve callable writes "
-                 "over the SKIP result",
+                 "from two native diffs against the fork snapshot; a resolve callable writes over "
+                 "the SKIP result. Tables and columns the source adds are created on the target "
+                 "first (the engine merges shared columns only and refuses a retyped one); in "
+                 "native-only mode that step is skipped and the engine's merge runs as it is",
         "rebase": ("re-fork: the branch's next generation is cloned from the upstream's head "
                    "snapshot and snapshotted (the new base); the branch's delta since its previous "
-                   "base (a native diff of its own two snapshots) is "
-                   + ("replayed with DATA BRANCH PICK ... BETWEEN SNAPSHOT" if MO_NATIVE_RESET else
-                      "copied in with SQL from its head snapshot's time-travel view")
-                   + "; conflicts from two native diffs; the registry is repointed and the old "
-                   "generation dropped"),
+                   "base (a native diff of its own two snapshots) is copied in with SQL from "
+                   "its head snapshot's time-travel view (DATA BRANCH PICK loses rows and refuses "
+                   "schema differences); conflicts from two native diffs; the registry is "
+                   "repointed and the old generation dropped"),
         "revert": "DATA BRANCH DIFF commit vs predecessor; inverse applied with SQL",
         "reset": ("RESTORE DATABASE {snapshot}" if MO_NATIVE_RESET else
                   "DATA BRANCH DIFF head vs the commit's snapshot, rows put back with SQL "
@@ -327,7 +340,6 @@ class MatrixOneToolSuite(DBToolSuite):
                  + "; SQL row restore for commits inherited from a parent",
         "delete": "DATA BRANCH DELETE DATABASE (DROP DATABASE fallback)",
         "commit_refs": "time-travel reads t{snapshot = ...}",
-        "schema_diff": "catalog columns of each ref compared by the adapter",
         "multi_ref_exec": "cross-database queries",
     }
 
@@ -343,7 +355,10 @@ class MatrixOneToolSuite(DBToolSuite):
     def init_for_bench(cls, collector: rc.ResultCollector, db_name: str,
                        default_branch_name: str = MAIN_BRANCH,
                        measure_storage: bool = False):
-        return cls(connect(db_name), collector, db_name, default_branch_name,
+        # No default database: main's own database is replaced by its next
+        # generation when main is rebased, so a connection must not depend
+        # on it; every statement names its database or follows a USE.
+        return cls(connect(None), collector, db_name, default_branch_name,
                    measure_storage)
 
     def __init__(self, connection, collector: rc.ResultCollector, db_name: str,
@@ -471,7 +486,7 @@ class MatrixOneToolSuite(DBToolSuite):
             "SELECT c.table_name, c.column_name, c.column_type, c.column_key "
             "FROM information_schema.columns c JOIN information_schema.tables t "
             "ON t.table_schema = c.table_schema AND t.table_name = c.table_name "
-            "WHERE c.table_schema = %s AND t.table_type = 'BASE TABLE' AND c.table_name NOT LIKE %s "
+            "WHERE LOWER(c.table_schema) = LOWER(%s) AND t.table_type = 'BASE TABLE' AND c.table_name NOT LIKE %s "
             "ORDER BY c.table_name, c.ordinal_position",
             (db, META_PREFIX.replace("_", r"\_") + "%")) or []
         out: dict = {}
@@ -591,7 +606,7 @@ class MatrixOneToolSuite(DBToolSuite):
     def _tables(self, db: str) -> list:
         rows = self._execute(
             "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema = %s AND table_type = 'BASE TABLE' "
+            "WHERE LOWER(table_schema) = LOWER(%s) AND table_type = 'BASE TABLE' "
             "AND table_name NOT LIKE %s ORDER BY table_name",
             (db, META_PREFIX.replace("_", r"\_") + "%"))
         return [r[0] for r in rows or []]
@@ -600,7 +615,7 @@ class MatrixOneToolSuite(DBToolSuite):
         """[(name, column_type, is_nullable, column_default)]"""
         rows = self._execute(
             "SELECT column_name, column_type, is_nullable, column_default "
-            "FROM information_schema.columns WHERE table_schema = %s AND table_name = %s "
+            "FROM information_schema.columns WHERE LOWER(table_schema) = LOWER(%s) AND table_name = %s "
             "ORDER BY ordinal_position", (db, table))
         return [(r[0], r[1], r[2], r[3]) for r in rows or [] if not str(r[0]).startswith("__mo_")]
 
@@ -676,6 +691,49 @@ class MatrixOneToolSuite(DBToolSuite):
     # ------------------------------------------------------------------
     # Hooks
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Seed bulk load (untimed setup only)
+    # ------------------------------------------------------------------
+
+    SEED_LOAD_CHUNK_ROWS = 20000
+
+    def seed_bulk_insert(self, db, table: str, columns: list, rows, batch_rows: int = 500) -> int:
+        """Load seed rows with ``LOAD DATA INLINE`` instead of multi-row
+        INSERTs. MatrixOne's INSERT path costs about 1.4 ms per row even in
+        500-row batches (the CH seed took 14 min); its bulk loader takes CSV
+        text in the statement. Used by ``macrobench.datagen.ch.insert_rows``
+        for the untimed seed only, never for measured operations. NULL is
+        backslash-N, strings are quoted with doubled quotes, and ``batch_rows``
+        is ignored in favour of SEED_LOAD_CHUNK_ROWS."""
+        cols = ", ".join(f"`{c}`" for c in columns)
+        stmt = (f"LOAD DATA INLINE FORMAT='csv', DATA=%s INTO TABLE `{table}` "
+                f"FIELDS TERMINATED BY ',' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' ({cols})")
+
+        def cell(v):
+            if v is None:
+                return "\\N"
+            if isinstance(v, bool):
+                return "1" if v else "0"
+            return v
+
+        total = 0
+        buf = io.StringIO()
+        writer = csv.writer(buf, lineterminator="\n", quoting=csv.QUOTE_MINIMAL, doublequote=True)
+        n = 0
+        for row in rows:
+            writer.writerow([cell(v) for v in row])
+            n += 1
+            if n >= self.SEED_LOAD_CHUNK_ROWS:
+                db.sql(stmt, (buf.getvalue(),))
+                total += n
+                buf = io.StringIO()
+                writer = csv.writer(buf, lineterminator="\n", quoting=csv.QUOTE_MINIMAL, doublequote=True)
+                n = 0
+        if n:
+            db.sql(stmt, (buf.getvalue(),))
+            total += n
+        return total
 
     def _storage_bytes(self) -> int:
         """Size of the server's data directory (object store plus log
@@ -770,7 +828,20 @@ class MatrixOneToolSuite(DBToolSuite):
                 out.append({"table_name": table, "rows_added": int(n), "rows_deleted": 0,
                             "rows_modified": 0})
                 continue
-            (bi, bd, bu), (ai, ad, au) = self._summary(b.expr(table), a.expr(table))
+            try:
+                (bi, bd, bu), (ai, ad, au) = self._summary(b.expr(table), a.expr(table))
+            except Exception as e:
+                # The engine refuses a diff whose column sets are not the
+                # same objects (a column re-created by a reset, a retyped
+                # column: "schema compatibility check"). Simulate it then:
+                # anti-joins over the common columns through time-travel
+                # reads, as the single-server adapters do.
+                if "schema compatibility check" not in str(e) or MO_NATIVE_DIFF_ONLY:
+                    raise
+                added, deleted, modified = self._sql_summary(a, b, table)
+                out.append({"table_name": table, "rows_added": added, "rows_deleted": deleted,
+                            "rows_modified": modified, "simulated": True})
+                continue
             out.append({"table_name": table, "rows_added": bi + ad, "rows_deleted": bd + ai,
                         "rows_modified": bu + au,
                         "b_side": [bi, bd, bu], "a_side": [ai, ad, au]})
@@ -780,6 +851,39 @@ class MatrixOneToolSuite(DBToolSuite):
             "rows_deleted": sum(t["rows_deleted"] for t in out),
             "rows_modified": sum(t["rows_modified"] for t in out),
         }
+
+    def _expr_cols(self, expr: str) -> list:
+        """Column names a time-travel or plain table expression returns
+        (the snapshot's own columns, not the database's current ones)."""
+        with self.conn.cursor() as cur:
+            cur.execute(f"SELECT * FROM {expr} LIMIT 0")
+            return [d[0] for d in cur.description if not str(d[0]).startswith("__mo_")]
+
+    def _sql_summary(self, a: "_State", b: "_State", table: str) -> tuple:
+        """(added, deleted, modified) rows of ``table`` from a to b by SQL:
+        anti-joins on the primary key over the columns both sides share
+        (a keyless table is compared by whole row, added/deleted only)."""
+        ea, eb = a.expr(table), b.expr(table)
+        cols_b = set(self._expr_cols(eb))
+        cols = [c for c in self._expr_cols(ea) if c in cols_b]
+        pk = [c for c in self._pk(b.db, table) if c in cols] or [c for c in self._pk(a.db, table) if c in cols]
+        if not cols:
+            return 0, 0, 0
+        key = pk or cols
+        on = " AND ".join(f"x.{_quote(c)} = y.{_quote(c)}" for c in key)
+        first = _quote(key[0])
+
+        def count(sql):
+            return int(self._execute(sql)[0][0] or 0)
+        added = count(f"SELECT COUNT(*) FROM {eb} x LEFT JOIN {ea} y ON {on} WHERE y.{first} IS NULL")
+        deleted = count(f"SELECT COUNT(*) FROM {ea} x LEFT JOIN {eb} y ON {on} WHERE y.{first} IS NULL")
+        rest = [c for c in cols if c not in key]
+        modified = 0
+        if pk and rest:
+            differ = " OR ".join(f"NOT (x.{_quote(c)} = y.{_quote(c)} OR (x.{_quote(c)} IS NULL AND y.{_quote(c)} IS NULL))"
+                                 for c in rest)
+            modified = count(f"SELECT COUNT(*) FROM {ea} x JOIN {eb} y ON {on} WHERE {differ}")
+        return added, deleted, modified
 
     # -- schema reconciliation (merge, rebase) -----------------------------
 
@@ -842,7 +946,6 @@ class MatrixOneToolSuite(DBToolSuite):
                         pk: list, cols: list) -> list:
         """Rows in Dolt's dolt_conflicts_<table> shape: base_*, our_*,
         their_* columns plus our_diff_type / their_diff_type."""
-        keys = keys[:_CONFLICT_ROW_LIMIT]
         base_rows = {}
         kpos = [cols.index(c) for c in pk]
         for chunk in self._chunks(keys):
@@ -937,7 +1040,14 @@ class MatrixOneToolSuite(DBToolSuite):
                        f"{theirs.db} and {ours_db} share no fork point: merging two-way")
         want_rows = callable(on_conflict)
         policy = "SKIP" if (want_rows or on_conflict == "ours") else "ACCEPT"
-        schema = self._reconcile_schema(ours_db, theirs)
+        if MO_NATIVE_MERGE_AS_IS:
+            # Native-only mode: the engine's merge as it is. A column the
+            # target lacks is left out of the result, a table only the
+            # source has is not merged, and a retyped column makes the
+            # engine refuse (a failed merge, caught by the checks).
+            schema = {"added_tables": [], "added_columns": []}
+        else:
+            schema = self._reconcile_schema(ours_db, theirs)
         conflicts = []
         self._fk_checks(False)
         try:
@@ -1039,7 +1149,6 @@ class MatrixOneToolSuite(DBToolSuite):
                       f"{{snapshot = '{upstream.snap}'}};")
         want_rows = callable(on_conflict)
         conflicts = []
-        touches = []
         base_snap = self._new_snapshot_name()
         try:
             # The new base: the branch's own snapshot of the upstream head,
@@ -1088,7 +1197,7 @@ class MatrixOneToolSuite(DBToolSuite):
                     # the same period, for the conflict count. The native diff
                     # does not list a row whose only change is in a column
                     # added since the base, so an empty delta cannot mean
-                    # "nothing to replay": PICK runs for every table.
+                    # "nothing to replay": every table is considered.
                     d_b = self._delta(branch_now.expr(table), branch_base.expr(table), pk)
                     d_u = {}
                     if up_base.snap and up_base.db == upstream.db and self._readable(up_base, table):
@@ -1100,28 +1209,17 @@ class MatrixOneToolSuite(DBToolSuite):
                     new_cols = [c.split(".", 1)[1] for c in schema["added_columns"]
                                 if c.startswith(table + ".")]
                     keys = self._replayed_keys(d_b, branch_now, table, pk, new_cols)
-                    if MO_NATIVE_RESET:
-                        self._execute(f"DATA BRANCH PICK {_qt(branch_db, table)} INTO {_qt(new_db, table)} "
-                                      f"BETWEEN SNAPSHOT '{s_b0}' AND '{s_now}' WHEN CONFLICT ACCEPT")
-                        # On a table with a foreign key, rows PICK writes are
-                        # invisible to a later PICK from this generation once
-                        # the source generation is dropped (v4.2.5, whether or
-                        # not foreign_key_checks is on), so they are rewritten
-                        # as ordinary writes of this generation after the drop.
-                        if keys:
-                            touches.append((table, pk, rest, keys))
-                    else:
-                        # Simulated replay: the branch's deletes, then its
-                        # inserted/updated rows copied from the head snapshot's
-                        # time-travel view (server-side; only keys travel).
-                        deleted = [k for k, (flag, _) in d_b.items() if flag == "DELETE"]
-                        for chunk in self._chunks(deleted):
-                            self._execute(f"DELETE FROM {_qt(new_db, table)} WHERE {self._in_keys(pk, chunk)}")
-                        for chunk in self._chunks(keys):
-                            self._execute(self._upsert(
-                                _qt(new_db, table), cols, pk,
-                                f"SELECT {self._cols('s', cols)} FROM {branch_now.expr(table)} s "
-                                f"WHERE {self._in_keys(pk, chunk)}"))
+                    # Replay: the branch's deletes, then its inserted/updated
+                    # rows copied from the head snapshot's time-travel view
+                    # (server-side; only keys travel).
+                    deleted = [k for k, (flag, _) in d_b.items() if flag == "DELETE"]
+                    for chunk in self._chunks(deleted):
+                        self._execute(f"DELETE FROM {_qt(new_db, table)} WHERE {self._in_keys(pk, chunk)}")
+                    for chunk in self._chunks(keys):
+                        self._execute(self._upsert(
+                            _qt(new_db, table), cols, pk,
+                            f"SELECT {self._cols('s', cols)} FROM {branch_now.expr(table)} s "
+                            f"WHERE {self._in_keys(pk, chunk)}"))
                     if keys or any(flag == "DELETE" for flag, _ in d_b.values()):
                         info["merged_tables"].append(table)
                     if not d_u:
@@ -1172,14 +1270,6 @@ class MatrixOneToolSuite(DBToolSuite):
         self._current_db = None
         self._use(new_db)
         self._drop_branch_db(branch_db)
-        # The rewrite has to come after the old generation is gone: until
-        # then the picked rows still read as the source's.
-        self._fk_checks(False)
-        try:
-            for table, pk, rest, keys in touches:
-                self._touch(_qt(new_db, table), pk, rest, keys)
-        finally:
-            self._fk_checks(True)
         info["schema_changes"] = schema
         info["generation"] = gen
         return info
@@ -1200,17 +1290,6 @@ class MatrixOneToolSuite(DBToolSuite):
                                  f"WHERE {_quote(col)} IS NOT NULL") or []
             keys.update(tuple(r) for r in rows)
         return list(keys)
-
-    def _touch(self, dst: str, pk: list, rest: list, keys: list) -> int:
-        """Rewrite the rows (an UPDATE of a non-key column to itself, which
-        MatrixOne records as a write; a key column set to itself is not)
-        so they are writes of dst's own history."""
-        if not rest or not keys:
-            return 0
-        col = _quote(rest[0])
-        for chunk in self._chunks(keys):
-            self._execute(f"UPDATE {dst} SET {col} = {col} WHERE {self._in_keys(pk, chunk)}")
-        return len(keys)
 
     def _upstream_moved(self, base_seq: int, upstream: _State) -> bool:
         """Has the upstream any commit after the common base?"""
@@ -1237,6 +1316,13 @@ class MatrixOneToolSuite(DBToolSuite):
             self._undo_since(db, _State(db, row["snap"]), fp)
             self._execute(f"DELETE FROM {_qt(db, COMMITS_TABLE)} WHERE seq > %s", (int(row["seq"]),))
             return
+        if MO_NATIVE_RESET:
+            # RESTORE DATABASE restores a database to its own snapshot; a
+            # commit made on another generation of the branch (before a
+            # rebase) has none for this database, and the SQL restore is a
+            # simulation.
+            raise self._unsupported("reset", f"commit made on {row['db']}, another generation of the branch; "
+                                             "RESTORE DATABASE needs the database's own snapshot")
         self._warn(("reset_sql", db), f"reset of {db} to a commit made on {row['db']}: rows restored with SQL")
         self._restore_sql(db, _State(row["db"], row["snap"]), fp)
         self._execute(
@@ -1509,7 +1595,7 @@ class MatrixOneToolSuite(DBToolSuite):
     # ------------------------------------------------------------------
 
     async def open_async_pool(self, size: int) -> None:
-        self.async_pool = await create_pool_async(self.db_name, size)
+        self.async_pool = await create_pool_async(None, size)
 
     def _pool_connection(self):
         return mysql_common.aiomysql_pool_connection(self.async_pool)

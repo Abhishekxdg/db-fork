@@ -2,24 +2,24 @@
 
 The spine holds shared task state (task, dependency). Each round the spine
 is checkpointed, N agents branch from that checkpoint, revise the plan
-(status/assignee edits with a configurable key overlap, subtasks,
-contradictory dependency edges, a scratch table created and dropped), commit
-with a message carrying their id and the log sentinel, read both histories
-with log(), and merge into the spine one at a time while the spine keeps
-receiving task updates. Merges resolve conflicts with the fixed policy:
+(``statements_per_step`` statements split by ``write_fraction``: task
+status/assignee edits with a configurable key overlap and subtask
+inserts with their edges, then reads; plus three fixed probes: the
+sentinel update, a contradictory dependency edge and a scratch table
+created and dropped), commit
+with a message carrying their id, and merge into the spine one at a time
+while the spine keeps receiving task updates. Merges resolve conflicts with the fixed policy:
 spine wins on task rows except the sentinel task 0 (last merger wins, it
 models a completion counter), and dependency edges are unioned and any
 cycle broken by dropping the merging agent's edge. Side branches are
 deleted after integration.
 
-Sentinels: the commit-message token LOGSENTINEL-<round>-<agent> must be
-visible through log(); task 0's status must show three different values
-before the first merge, between the two merges and after the second.
+Sentinel: task 0's status must show three different values before the
+first merge, between the two merges and after the second.
 
-Invariants: S3.1 the round's commits are readable in the spine's log;
-S3.2 the shared sentinel takes three distinct values across the first two
-merges; S3.3 after every successful merge the sentinel task carries the
-merging agent's value (the resolver takes theirs on that row).
+Invariants: S3.1 the shared sentinel takes three distinct values across
+the first two merges; S3.2 after every successful merge the sentinel task
+carries the merging agent's value (the resolver takes theirs on that row).
 """
 
 import threading
@@ -164,31 +164,20 @@ class MultiAgentScenario(Scenario):
 
         # Invariants for the round.
         merged = [m for m in self._merge_order if m["ok"]]
-        lg = suite.log(ctx.spine, limit=4 * p.agents + 10, label="history")
-        if lg.unsupported:
-            inv.not_applicable(f"S3.1 log sentinel readable (round {r})", "log unsupported")
-        elif not merged:
-            inv.not_applicable(f"S3.1 log sentinel readable (round {r})",
-                               "no agent commit reached the spine (merge unsupported or failed)")
-        else:
-            msgs = [str(e.get("message", "")) for e in (lg.value or [])]
-            hits = sum(1 for m in msgs if f"LOGSENTINEL-{r}-" in m)
-            inv.check(f"S3.1 log sentinel readable (round {r})", hits > 0,
-                      f"{hits} agent commits of round {r} in log({len(msgs)} entries)")
         if len(merged) < 2:
-            inv.not_applicable(f"S3.2 three sentinel values across two merges (round {r})",
+            inv.not_applicable(f"S3.1 three sentinel values across two merges (round {r})",
                                f"only {len(merged)} successful merges")
         else:
             v1, v2 = merged[0]["sentinel_after"], merged[1]["sentinel_after"]
-            inv.check(f"S3.2 three sentinel values across two merges (round {r})",
+            inv.check(f"S3.1 three sentinel values across two merges (round {r})",
                       before != v1 and v1 != v2 and before != v2
                       and v1 == merged[0]["sentinel_value"] and v2 == merged[1]["sentinel_value"],
                       f"before={before!r} after first merge={v1!r} after second={v2!r}")
-        # S3.3: after every successful merge the sentinel task carries the
+        # S3.2: after every successful merge the sentinel task carries the
         # merging agent's value (the resolver takes theirs on that row).
         wrong = [m["agent"] for m in merged if m["sentinel_after"] != m["sentinel_value"]]
         if merged:
-            inv.check(f"S3.3 sentinel carries each merging agent's value (round {r})", not wrong,
+            inv.check(f"S3.2 sentinel carries each merging agent's value (round {r})", not wrong,
                       f"{len(wrong)} of {len(merged)} merges left another value (agents {wrong[:5]})")
         ctx.add_metric(f"merge_order_round_{r}", [m["agent"] for m in self._merge_order])
         ctx.bump_metric("merges_ok", len(merged))
@@ -240,10 +229,7 @@ class MultiAgentScenario(Scenario):
             return None
         sentinel_value = f"r{r}-a{a}"
         w.exec(self._revision_script(w, r, a, sentinel_value), branch, label="revise")
-        w.commit(branch, f"agent {a} plan revision LOGSENTINEL-{r}-{a}", label="agent_commit")
-        # History access needed for resolution: both sides since divergence.
-        suite.log(branch, limit=5, label="history")
-        suite.log(ctx.spine, limit=10, label="history")
+        w.commit(branch, f"agent {a} plan revision (round {r})", label="agent_commit")
         with self._merge_lock:
             m = ctx.retry(lambda: suite.merge(ctx.spine, branch, message=f"merge agent {a} round {r}",
                                               on_conflict=fixed_policy, label="agent_merge"))
@@ -262,21 +248,29 @@ class MultiAgentScenario(Scenario):
 
     def _revision_script(self, w: Worker, r: int, a: int, sentinel_value: str):
         ctx, p, rng = self.ctx, self.params, w.rng
+        # Plan work sized by DataOps like S1 and S2: statements_per_step
+        # split by write_fraction into writes and reads. A third of the
+        # writes (at least one) are subtask inserts, each with its
+        # dependency edge; the rest are task edits. The sentinel update,
+        # the contradictory edge and the scratch table are fixed probes.
         n = ctx.statements_per_step
+        writes = max(1, round(n * ctx.data_ops.write_fraction)) if n > 1 else 1
+        reads = max(0, n - writes)
+        subtasks = max(1, writes // 3)
+        n_edits = max(1, writes - subtasks)
         shared = self._shared_keys()
         private = [t for t in range(1, self.num_tasks + 1) if t not in shared] or shared
         edits = []
-        for _ in range(max(1, n // 2)):
+        for _ in range(n_edits):
             pool = shared if (shared and rng.random() < p.key_overlap) else private
             edits.append(rng.choice(pool))
-        reads = max(0, n - len(edits))
         agent = f"agent-{a}"
         # Contradictory edges: odd agents add reconcile -> fulfil (2 -> 1),
         # even agents the reverse.
         edge = (2, 1) if a % 2 else (1, 2)
         with self._id_lock:
             sub_base = self._next_task_id
-            self._next_task_id += 2
+            self._next_task_id += subtasks
 
         def script(db):
             db.sql(f"CREATE TABLE scratch_{a} (id INT NOT NULL, v INT, PRIMARY KEY (id))")
@@ -286,7 +280,7 @@ class MultiAgentScenario(Scenario):
                        "updated_step = %s WHERE task_id = %s",
                        (rng.choice(["in_progress", "done", "blocked"]), agent, r, t))
             parent = edits[0]
-            for i in range(2):
+            for i in range(subtasks):
                 db.sql("INSERT INTO task (task_id, parent_id, title, status, assignee, version, updated_step) "
                        "VALUES (%s, %s, %s, 'open', %s, 0, %s)",
                        (sub_base + i, parent, f"subtask {sub_base + i} of {parent}", agent, r))

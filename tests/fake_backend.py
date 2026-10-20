@@ -183,13 +183,33 @@ class FakeSuite(DBToolSuite):
         return [{"hash": h, "message": self.commits[h][2]} for h in hashes]
 
     def _diff_impl(self, a: Ref, b: Ref):
-        def count(ref):
+        """Row counts per state plus rows_added / rows_deleted /
+        rows_modified over every user table, keyed by primary key (whole
+        row for a keyless table)."""
+        def state(ref):
             c = (self.commits[ref.commit][1] if ref.commit
                  else self.branches[ref.branch])
             cur = c.raw.cursor()
-            cur.execute("SELECT count(*) FROM t")
-            return cur.fetchone()[0]
-        return {"rows_a": count(a), "rows_b": count(b)}
+            cur.execute("SELECT name FROM sqlite_master WHERE type = 'table' "
+                        "AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '\\_bb\\_%' ESCAPE '\\'")
+            out = {}
+            for (name,) in cur.fetchall():
+                cur.execute(f'PRAGMA table_info("{name}")')
+                cols = cur.fetchall()
+                pk = [i for i, col in enumerate(cols) if col[5]]
+                cur.execute(f'SELECT * FROM "{name}"')
+                rows = cur.fetchall()
+                out[name] = {(tuple(r[i] for i in pk) if pk else r): r for r in rows}
+            return out
+        sa, sb = state(a), state(b)
+        added = deleted = modified = 0
+        for t in set(sa) | set(sb):
+            ra, rb = sa.get(t, {}), sb.get(t, {})
+            added += len(set(rb) - set(ra))
+            deleted += len(set(ra) - set(rb))
+            modified += sum(1 for k in set(ra) & set(rb) if ra[k] != rb[k])
+        return {"rows_a": sum(len(v) for v in sa.values()), "rows_b": sum(len(v) for v in sb.values()),
+                "rows_added": added, "rows_deleted": deleted, "rows_modified": modified}
 
     def _reset_impl(self, ref: Ref, to: str) -> None:
         self.branches[ref.branch] = self.commits[to][1].copy()

@@ -8,8 +8,10 @@ record the effective values.
 branch_intensity scales the number of branch verbs a scenario issues:
 
 * ``branch_ops.commit_interval`` is divided (more commits per step).
-* Scenario counts of branches, forks, rounds, rebases and investigation
-  points (``BRANCH_FIELDS``).
+* Scenario counts of branches, forks, rounds, rebases, investigation
+  points and S6's resets per batch (``BRANCH_FIELDS``). S2's rejections follow from its cycles
+  (one per ``cycles_per_rejection`` cycles) and S5's incidents from its
+  spine commits (one per ``commits_per_incident``), so they scale too.
 
 data_intensity scales how much SQL runs on each branch:
 
@@ -20,7 +22,8 @@ Threads (``worker_threads``, ``concurrent_*``), probabilities, fractions and
 caps such as ``max_live_branches`` are left alone, because they bound the
 run rather than size it. Scaled ints are rounded and never drop below 1;
 a few fields have hard caps the scenarios enforce (S2 fanout <= 10, S4
-rebases_per_branch <= 2) and S5 keeps ``fault_commit_offset`` inside
+rebases_per_branch <= 2, S1 group_size <= 32 with rollouts_per_round <= group_size)
+and S5 keeps ``fault_commit_offset`` inside
 ``spine_commits``.
 """
 
@@ -30,12 +33,12 @@ from macrobench import task_pb2 as tp
 
 # Per-scenario int fields that grow with branch_intensity.
 BRANCH_FIELDS = {
-    "rl_env": ("tasks", "group_size", "rollouts_per_round"),
+    "rl_env": ("tasks", "group_size"),   # rollouts_per_round is concurrency, not size
     "context_mgmt": ("fanout", "compaction_cycles"),
     "multi_agent": ("agents", "rounds"),
     "dev_agent": ("dev_branches", "rebases_per_branch"),
-    "ops_agent": ("spine_commits", "investigation_branches", "history_offset"),
-    "data_agent": ("batches",),
+    "ops_agent": ("spine_commits", "investigation_branches"),   # per-incident window/offset fixed
+    "data_agent": ("batches", "resets_per_batch"),
 }
 
 # Per-scenario int fields that grow with data_intensity.
@@ -54,6 +57,9 @@ DATA_OPS_FIELDS = ("statements_per_step", "rows_per_write", "spine_clients")
 CAPS = {
     ("context_mgmt", "fanout"): 10,
     ("dev_agent", "rebases_per_branch"): 2,
+    # A GRPO group: more rollouts per task than this is not a realistic
+    # group size, so branch intensity grows the number of tasks instead.
+    ("rl_env", "group_size"): 32,
 }
 
 
@@ -95,11 +101,18 @@ def apply_intensity(workload: tp.Workload) -> dict:
                 workload.branch_ops.commit_interval = after
                 changed["branch_ops.commit_interval"] = (ci, after)
         _scale_fields(params, BRANCH_FIELDS[key], bi, key, changed)
-        if key == "ops_agent":
-            # Keep the fault offset strictly inside the (scaled) spine.
+        if key == "rl_env":
+            # Rounds never exceed the (capped) group.
             p = params
-            off = _scale(p.fault_commit_offset, bi)
-            off = min(off, max(1, p.spine_commits - 1))
+            if p.rollouts_per_round > p.group_size:
+                changed["rl_env.rollouts_per_round"] = (changed.get("rl_env.rollouts_per_round", (p.rollouts_per_round,))[0], p.group_size)
+                p.rollouts_per_round = p.group_size
+        if key == "ops_agent":
+            # The fault offset is per incident and not scaled; keep it
+            # strictly inside an incident (or the whole spine).
+            p = params
+            limit = p.commits_per_incident or p.spine_commits
+            off = min(p.fault_commit_offset, max(1, limit - 1))
             if off != p.fault_commit_offset:
                 changed["ops_agent.fault_commit_offset"] = (p.fault_commit_offset, off)
                 p.fault_commit_offset = off

@@ -472,6 +472,9 @@ chronos = [
     { name = "chronos-core" },
     { name = "sqlglot" },
 ]
+terminusdb = [
+    { name = "sqlglot" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -501,9 +504,10 @@ requires-dist = [
     { name = "setuptools" },
     { name = "sqlglot", specifier = ">=30.22.0" },
     { name = "sqlglot", marker = "extra == 'chronos'", specifier = ">=25" },
+    { name = "sqlglot", marker = "extra == 'terminusdb'", specifier = ">=25" },
     { name = "tqdm" },
 ]
-provides-extras = ["chronos"]
+provides-extras = ["chronos", "terminusdb"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest" }]

@@ -29,6 +29,7 @@ from macrobench import task_pb2 as tp
 from macrobench.datagen.ch import CHScale, seed_ch
 from macrobench.intensity import apply_intensity
 from macrobench.scenarios import (  # noqa: F401 (registers the scenarios)
+    SCENARIOS,
     InvariantFailed,
     InvariantRecorder,
     ScenarioContext,
@@ -294,6 +295,15 @@ def main(argv=None):
     if args.op_stall_sec > 0:
         print(f"Operation stall limit: {args.op_stall_sec:g}s")
     sample_sec = storage_sample_interval(config, args.storage_sample_interval)
+    spine_only = config.spine_only_sec > 0
+    if spine_only:
+        has_load = getattr(SCENARIOS.get(scenario_key), "uses_spine_load", False)
+        clients = config.workload.data_ops.spine_clients
+        if not (has_load and clients > 0):
+            print(f"Error: spine_only_sec needs a scenario with a spine load and spine_clients > 0 "
+                  f"({scenario_key}: {'a' if has_load else 'no'} spine load, spine_clients {clients})")
+            sys.exit(1)
+        print(f"Spine-only baseline: {config.spine_only_sec}s, {clients} spine client(s), no workflow")
     print(f"Storage sampling: every {sample_sec:g}s" if sample_sec > 0 else "Storage sampling: off")
 
     backend_mgr = BackendManager(
@@ -384,11 +394,19 @@ def main(argv=None):
         ctx.cancel_all(f"signal {name}")
     previous_handlers = {s: signal.signal(s, _on_signal) for s in (signal.SIGINT, signal.SIGTERM)}
 
-    print(f"\nStarting scenario {scenario.name}...")
+    if spine_only:
+        print(f"\nSpine-only baseline: {config.spine_only_sec}s of spine load, no workflow...")
+    else:
+        print(f"\nStarting scenario {scenario.name}...")
     start_time = time.time()
     status = "completed"
     try:
-        scenario.run()
+        if spine_only:
+            # A signal or the runtime cap sets the stop event and ends the
+            # wait early; the run is then recorded as interrupted.
+            ctx.stop_event.wait(config.spine_only_sec)
+        else:
+            scenario.run()
     except ScenarioStopped:
         status = "interrupted"
     except InvariantFailed as e:
@@ -411,6 +429,9 @@ def main(argv=None):
         timed_out = bool(args.max_runtime_sec) and stopped and elapsed >= args.max_runtime_sec
         if status == "completed" and stopped:
             status = "interrupted"
+        if ctx.unsupported_abort:
+            # The first unsupported verb ended the run (see scenarios/base.py).
+            status = f"unsupported: {ctx.unsupported_abort}"
         # The scenario ran to its end, but an operation the watchdog
         # cancelled never finished: the workflow is incomplete.
         stalled_failed = [st for st in collector.stalls if st["outcome"] == "failed"]
@@ -480,6 +501,7 @@ def main(argv=None):
             "capabilities": _capabilities_for(config.backend),
             "implementation": _implementation_for(config.backend),
             "native_only": native_only(),
+            "spine_only_sec": config.spine_only_sec,
             "invariants": inv,
             "metrics": ctx.metrics,
         }

@@ -3,10 +3,15 @@
 A Scenario is one of the six workflows (S1-S6). It gets a ScenarioContext
 with the parsed config, a DBToolSuite factory, the shared ResultCollector,
 the invariant recorder and the stop event, and drives the backend through
-the git-like verbs and exec(). Scenarios never raise on a backend's
-UNSUPPORTED or FAILED result: they read the OpResult, record what they can
-and go on, so a backend lacking merge or rebase still runs the whole
-lifecycle and the support summary says what it could not do.
+the git-like verbs and exec(). A FAILED result never stops the workload:
+scenarios read the OpResult, record what they can and go on, as an agent
+that catches exceptions would. An UNSUPPORTED result ends the run: the
+context installs a hook on the result collector that records the verb,
+cancels every worker and raises UnsupportedOperationAbort, and the runner
+reports the run as unsupported naming the verb. A scenario therefore never
+sees an unsupported result, and a check is not applicable only when its
+own precondition did not arise (no commit to revert, a target after the
+fault, and so on).
 """
 
 import random
@@ -27,6 +32,10 @@ class ScenarioStopped(Exception):
     """Raised inside workers when the runtime cap hits."""
 
 
+class UnsupportedOperationAbort(ScenarioStopped):
+    """The backend reported a verb unsupported; the run ends there."""
+
+
 class InvariantFailed(Exception):
     """Raised by the recorder in fail_fast mode."""
 
@@ -34,7 +43,7 @@ class InvariantFailed(Exception):
 @dataclass
 class InvariantResult:
     name: str
-    passed: Optional[bool]   # None = not applicable (needs an unsupported verb)
+    passed: Optional[bool]   # None = not applicable (its precondition did not arise)
     detail: str = ""
 
 
@@ -107,6 +116,7 @@ class ScenarioContext:
     progress: object = None         # SharedProgress or None
     stop_event: threading.Event = field(default_factory=threading.Event)
     stop_reason: str = ""
+    unsupported_abort: str = ""     # "VERB: reason" of the unsupported verb that ended the run
     log: Callable[[str], None] = print
     metrics: dict = field(default_factory=dict)
     worker_conns: dict = field(default_factory=dict)
@@ -123,6 +133,19 @@ class ScenarioContext:
         cap = self.branch_ops.max_live_branches
         self._slots = threading.BoundedSemaphore(cap) if cap > 0 else None
         self._branch_seq = 0
+        self.collector.on_unsupported = self._abort_on_unsupported
+
+    def _abort_on_unsupported(self, op: str, reason: str) -> None:
+        """Collector hook: the first unsupported verb ends the run. Runs on
+        the thread that issued the verb, after its row was recorded."""
+        what = f"{op}: {reason}" if reason else op
+        with self._lock:
+            first = not self.unsupported_abort
+            if first:
+                self.unsupported_abort = what
+        if first:
+            self.cancel_all(f"unsupported operation {what}")
+        raise UnsupportedOperationAbort(what)
 
     # -- config helpers ----------------------------------------------------
 
@@ -157,6 +180,8 @@ class ScenarioContext:
 
     def check_stop(self) -> None:
         if self.stop_event.is_set():
+            if self.unsupported_abort:
+                raise UnsupportedOperationAbort(self.unsupported_abort)
             raise ScenarioStopped()
 
     def tick(self, n: int = 1) -> None:
@@ -250,6 +275,8 @@ class ScenarioContext:
                     if not isinstance(e, ScenarioStopped):
                         self.note(f"[W{w.id}] {type(e).__name__}: {e}")
             self.close_suite(w.suite)
+            if self.unsupported_abort:
+                raise UnsupportedOperationAbort(self.unsupported_abort)
             return results
 
         workers_made = []
@@ -265,6 +292,10 @@ class ScenarioContext:
                     self.close_suite(w.suite)
             for _ in range(threads):
                 pool.submit(closer).result()
+        # A worker's unsupported verb ended the run: surface it on the
+        # caller's thread too, so the scenario does not go on without it.
+        if self.unsupported_abort:
+            raise UnsupportedOperationAbort(self.unsupported_abort)
         return results
 
     # -- branch helpers ----------------------------------------------------

@@ -8,6 +8,7 @@ connection closes. Multi-ref scripts address other branches as
 "<db>/<branch>".public.<table>.
 """
 
+import csv
 import os
 
 import psycopg2
@@ -57,22 +58,24 @@ def commit_dolt_schema(db_uri: str, message: str = "Load SQL schema") -> None:
             conn.close()
 
 
-def _first(value):
-    """First element of a Dolt function result cell, which psycopg2 may
-    hand back as a list or as the text form of an array ("{a,b}")."""
-    if isinstance(value, (list, tuple)):
-        return value[0] if value else None
-    if isinstance(value, str) and value.startswith("{"):
-        return value.strip("{}").split(",")[0].strip('"')
-    return value
-
-
 def _cells(value) -> list:
+    """Fields of a Dolt procedure result (dolt_merge, dolt_commit, ...).
+    psycopg may hand the cell back as a list, as the text of an array
+    (Doltgres up to 0.57: ``{hash,1,0,"merge successful"}``) or as the text
+    of a record (Doltgres 1.x: ``(hash,1,0,"merge successful")``). Quoted
+    fields may contain commas and doubled quotes."""
     if isinstance(value, (list, tuple)):
         return list(value)
-    if isinstance(value, str) and value.startswith("{"):
-        return [c.strip('"') for c in value.strip("{}").split(",")]
+    if isinstance(value, str) and value[:1] in ("{", "(") and value[-1:] in ("}", ")"):
+        return next(csv.reader([value[1:-1]], delimiter=",", quotechar='"',
+                               doublequote=True, skipinitialspace=False))
     return [value]
+
+
+def _first(value):
+    """First field of a Dolt procedure result cell (see _cells)."""
+    cells = _cells(value)
+    return cells[0] if cells else None
 
 
 class DoltToolSuite(DBToolSuite):
@@ -209,6 +212,8 @@ class DoltToolSuite(DBToolSuite):
             "rows_modified": sum(t.get("rows_modified") or 0 for t in tables),
         }
 
+    SCHEMA_DIFF_HALF = "native"   # dolt_schema_diff
+
     def _schema_diff_impl(self, ref_a: Ref, ref_b: Ref) -> dict:
         """dolt_schema_diff names the tables whose schema differs (added,
         dropped or changed); the column detail of changed tables comes from
@@ -255,22 +260,30 @@ class DoltToolSuite(DBToolSuite):
         rows = self._execute('SELECT "table" FROM dolt_conflicts;')
         return [r[0] for r in rows or []]
 
+    def _conflict_row_count(self) -> int:
+        """Conflicting rows over every table of the working set: the count
+        the other backends report as ``conflicts`` (Dolt's own number is
+        per merge or per replayed commit)."""
+        rows = self._execute("SELECT COALESCE(SUM(num_conflicts), 0) FROM dolt_conflicts;")
+        return int(rows[0][0]) if rows else 0
+
     def _schema_conflicts(self) -> list:
         rows = self._execute(
             "SELECT table_name, description FROM dolt_schema_conflicts;"
         )
         return [{"table": r[0], "description": r[1]} for r in rows or []]
 
-    def _conflict_rows(self, table: str, limit: int = 1000) -> list:
-        return self._rows_as_dicts(
-            f"SELECT * FROM dolt_conflicts_{table} LIMIT {int(limit)};"
-        )
+    def _conflict_rows(self, table: str) -> list:
+        """Every conflict row: a resolve callable must see them all, or the
+        rows it never saw keep the working set's stale version."""
+        return self._rows_as_dicts(f"SELECT * FROM dolt_conflicts_{table};")
 
     def _resolve_conflicts(self, ref: Ref, on_conflict) -> dict:
         """Resolve the data conflicts in the working set per on_conflict.
         Returns {"conflict_tables", "resolved", "resolution"}."""
         tables = self._conflict_tables()
-        info = {"conflict_tables": tables, "resolved": "", "resolution": None}
+        info = {"conflict_tables": tables, "resolved": "", "resolution": None,
+                "conflict_rows": self._conflict_row_count()}
         if not tables:
             return info
         if callable(on_conflict):
@@ -386,7 +399,7 @@ class DoltToolSuite(DBToolSuite):
     def _rebase_impl(self, ref: Ref, onto: Ref, on_conflict="ours") -> dict:
         self._on(ref)
         self._allow_conflicts()
-        info = {"conflicts": 0, "conflict_tables": [], "resolved": "",
+        info = {"conflicts": 0, "conflict_rows": 0, "conflict_tables": [], "resolved": "",
                 "up_to_date": False}
         # dolt_rebase refuses to start with uncommitted changes.
         self._execute("SELECT dolt_add('-A');")
@@ -422,6 +435,7 @@ class DoltToolSuite(DBToolSuite):
                     raise RuntimeError(f"schema conflict; rebase aborted: {e}")
                 resolved = self._resolve_conflicts(ref, on_conflict)
                 info["conflicts"] += 1
+                info["conflict_rows"] += resolved.get("conflict_rows", 0)
                 info["conflict_tables"] = sorted(
                     set(info["conflict_tables"]) | set(resolved["conflict_tables"])
                 )

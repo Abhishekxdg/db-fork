@@ -1,0 +1,15 @@
+# Spine-only baseline for S5: the S5 spine (8 TPC-C clients, 5% CH
+# analytical, seed 42) alone on main for spine_only_sec seconds. No
+# commits, no fault, no investigation branches. Compare its spine
+# throughput and p99 against the S5 run of the same backend. ops_agent
+# params are kept only to pass validation.
+run_id: "macro_spine_only_ops_agent_dolt"
+backend: DOLT
+database_setup { db_name: "macro_spine_only_ops_agent" cleanup: true generated {} }
+schema { base: CH_BENCH scale_factor: 1 }
+spine_only_sec: 300
+workload {
+  branch_ops { commit_interval: 1 }
+  data_ops { statements_per_step: 4 rows_per_write: 10 spine_clients: 8 analytical_fraction: 0.05 worker_threads: 4 }
+  ops_agent { spine_commits: 500 fault_commit_offset: 40 investigation_branches: 8 history_offset: 100 load_during_investigation: true commit_every_txns: 20 schema_fault: true commits_per_incident: 500 }
+}

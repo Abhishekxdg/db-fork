@@ -416,9 +416,9 @@ def test_generations_resolve_across_workers(suite):
 
 
 def test_second_rebase_keeps_picked_rows_on_fk_table(suite):
-    """On a table with a foreign key, rows a rebase's PICK wrote are not
-    seen by the next rebase's PICK once the old generation is dropped
-    (v4.2.5); the adapter rewrites them, so a second rebase keeps them."""
+    """A second rebase keeps the rows the first one replayed on a table
+    with a foreign key (the case where v4.2.5's PICK, no longer used, lost
+    them once the old generation was dropped)."""
     suite.exec(["CREATE TABLE parent (p INT PRIMARY KEY)", "INSERT INTO parent VALUES (1)",
                 "CREATE TABLE child (id INT PRIMARY KEY, p INT, v INT, "
                 "FOREIGN KEY (p) REFERENCES parent (p) ON DELETE CASCADE)",
@@ -454,13 +454,14 @@ def test_schema_diff_reports_tables_and_columns(suite):
     r = suite.exec(["ALTER TABLE t ADD COLUMN w INT", "CREATE TABLE extra (id INT PRIMARY KEY, z VARCHAR(4))"],
                    refs=["sd"])[0]
     assert r.ok, r.error
-    d = suite.schema_diff(base, "sd")
+    d = suite.diff(base, "sd")
     assert d.ok, d.error
+    d.value = d.value["schema"]
     assert d.value["tables_added"] == ["extra"] and d.value["tables_dropped"] == []
     assert d.value["columns_added"] == {"t": ["w"]} and d.value["changed"]
     assert not d.value["columns_dropped"] and not d.value["columns_changed"]
-    back = suite.schema_diff("sd", base)
-    assert back.ok and back.value["tables_dropped"] == ["extra"] and back.value["columns_dropped"] == {"t": ["w"]}
-    same = suite.schema_diff("sd", "sd")
-    assert same.ok and not same.value["changed"]
+    back = suite.diff("sd", base)
+    assert back.ok and back.value["schema"]["tables_dropped"] == ["extra"] and back.value["schema"]["columns_dropped"] == {"t": ["w"]}
+    same = suite.diff("sd", "sd")
+    assert same.ok and not same.value["schema"]["changed"]
     assert suite.delete("sd").ok

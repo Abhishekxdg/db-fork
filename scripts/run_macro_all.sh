@@ -5,14 +5,14 @@
 # Usage:
 #   ./scripts/run_macro_all.sh [--mini] [--max-runtime-sec N] [--outroot DIR] \
 #       [--no-manage-servers] [--storage-sample-interval SEC] [--measure-storage] \
-#       [--scenarios a,b,...] [--native-only] [--parallel] [backend ...]
+#       [--scenarios a,b,...] [--native-only] [--seed N] [--parallel] [--colocate-drivers] [backend ...]
 #
 #   backend ...   subset of: dolt dolt_mysql seekdb matrixone neon file_copy chronos
 #                 (default: all seven; bauplan and xata are not run by default)
 #   --scenarios   comma-separated subset of: rl_env context_mgmt multi_agent
 #                 dev_agent ops_agent data_agent (default: all six)
-#   --native-only every operation an adapter simulates runs as unsupported
-#                 (DBFORK_NATIVE_ONLY=1), to measure the engines' own primitives
+#   --native-only every operation an adapter simulates runs as unsupported and
+#                 ends its run (DBFORK_NATIVE_ONLY=1), to measure the engines' own primitives
 #   --parallel    run the backends at the same time, each going through its
 #                 scenarios in order (for one server per machine, or Neon next
 #                 to local servers); implies --no-manage-servers, so every
@@ -35,6 +35,17 @@
 # own host variable (DOLT_HOST, DOLT_MYSQL_HOST, SEEKDB_HOST, MO_HOST,
 # FILE_COPY_HOST, CHRONOS_HOST; PGSQL_HOST in .env must be changed too).
 # Remote servers are only probed, never started or stopped.
+# Co-located driver: by default every driver process runs here, so a
+# client-side library such as Chronos pays the network round trip on each
+# of its versioning statements (the deployment where the application is
+# not on the database host). --colocate-drivers runs a backend's driver on
+# the machine named by <BACKEND>_DRIVER_SSH (e.g. CHRONOS_DRIVER_SSH=
+# dbf-chronos in .env) instead, next to its server, which is Chronos's
+# best case and the layout its authors evaluate. That machine needs a copy
+# of the repo with its own .venv and .env (scripts/remote/setup_driver.sh
+# <backend>); results are rsynced back after every scenario and the log is
+# streamed here, so progress.sh works unchanged. The driver log records
+# which layout ran (START ... (driver on <host>) / colocate_drivers=...).
 # DBFORK_SERVER_SSH=user@host (or DOLT_SSH, DOLT_MYSQL_SSH, SEEKDB_SSH,
 # MO_SSH, FILE_COPY_SSH per machine) lets the storage measurements run
 # du/df there (see docs/remote_servers.md). When the servers are
@@ -75,9 +86,11 @@ fi
 
 MINI=""
 MAX_RUNTIME_SEC=14400
+SEED=""
 OUTROOT=""
 MANAGE_SERVERS=true
 PARALLEL=false
+COLOCATE_DRIVERS=false
 STORAGE_FLAGS=(--storage-sample-interval 5)
 SCENARIOS=(rl_env context_mgmt multi_agent dev_agent ops_agent data_agent)
 while [[ $# -gt 0 ]]; do
@@ -90,7 +103,9 @@ while [[ $# -gt 0 ]]; do
         --measure-storage)   STORAGE_FLAGS+=(--measure-storage); shift ;;
         --scenarios)         IFS=',' read -r -a SCENARIOS <<< "$2"; shift 2 ;;
         --native-only)       STORAGE_FLAGS+=(--native-only); shift ;;
+        --seed)              STORAGE_FLAGS+=(--seed "$2"); SEED="$2"; shift 2 ;;
         --parallel)          PARALLEL=true; MANAGE_SERVERS=false; shift ;;
+        --colocate-drivers)  COLOCATE_DRIVERS=true; shift ;;
         --*)                 echo "unknown option $1"; exit 1 ;;
         *)                   break ;;
     esac
@@ -331,18 +346,38 @@ ensure_backend() {
 # Runs
 # --------------------------------------------------------------------------
 
+# ssh target of the machine that runs a backend's driver process, if not here.
+driver_of() {
+    $COLOCATE_DRIVERS || return 0
+    local v; v="$(echo "$1" | tr '[:lower:]' '[:upper:]')_DRIVER_SSH"
+    echo "${!v:-$(envval "$v" "")}"
+}
+REMOTE_REPO="${DBFORK_REMOTE_REPO:-db-fork}"   # repo path on a driver machine, relative to its $HOME
+
 run_scenarios() {
-    local b="$1" s rc
+    local b="$1" s rc drv
+    drv="$(driver_of "$b")"
     for s in "${SCENARIOS[@]}"; do
-        log "START $s $b"
-        ./scripts/run_macrobench.sh $MINI --outdir "$OUTROOT/$b" --max-runtime-sec "$MAX_RUNTIME_SEC" \
-            "${STORAGE_FLAGS[@]}" "$s" "$b" > "$OUTROOT/logs/${s}_${b}.log" 2>&1
-        rc=$?
+        if [[ -n "$drv" ]]; then
+            log "START $s $b (driver on $drv)"
+            mkdir -p "$OUTROOT/$b"
+            ssh -o BatchMode=yes -o ServerAliveInterval=60 -o ServerAliveCountMax=10 "$drv" \
+                "export PATH=\$HOME/.local/bin:\$PATH; cd '$REMOTE_REPO' && mkdir -p '$OUTROOT/$b' && ./scripts/run_macrobench.sh $MINI --outdir '$OUTROOT/$b' \
+                 --max-runtime-sec '$MAX_RUNTIME_SEC' ${STORAGE_FLAGS[*]} '$s' '$b'" > "$OUTROOT/logs/${s}_${b}.log" 2>&1
+            rc=$?
+            rsync -az "$drv:$REMOTE_REPO/$OUTROOT/$b/" "$OUTROOT/$b/" >> "$OUTROOT/logs/${s}_${b}.log" 2>&1 \
+                || log "WARN $s $b: rsync of the results from $drv failed"
+        else
+            log "START $s $b"
+            ./scripts/run_macrobench.sh $MINI --outdir "$OUTROOT/$b" --max-runtime-sec "$MAX_RUNTIME_SEC" \
+                "${STORAGE_FLAGS[@]}" "$s" "$b" > "$OUTROOT/logs/${s}_${b}.log" 2>&1
+            rc=$?
+        fi
         log "END $s $b rc=$rc"
     done
 }
 
-log "RUN SET outroot=$OUTROOT backends=${BACKENDS[*]} mini=${MINI:-no} cap=${MAX_RUNTIME_SEC}s manage_servers=$MANAGE_SERVERS parallel=$PARALLEL"
+log "RUN SET outroot=$OUTROOT backends=${BACKENDS[*]} mini=${MINI:-no} cap=${MAX_RUNTIME_SEC}s seed=${SEED:-config} manage_servers=$MANAGE_SERVERS parallel=$PARALLEL colocate_drivers=$COLOCATE_DRIVERS"
 if $PARALLEL; then
     PIDS=()
     for b in "${BACKENDS[@]}"; do

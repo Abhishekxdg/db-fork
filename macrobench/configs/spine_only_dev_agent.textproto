@@ -1,0 +1,15 @@
+# Spine-only baseline for S4: the S4 spine (8 TPC-C clients, 10% CH
+# analytical, payments that touch c_data, seed 42) alone on main for
+# spine_only_sec seconds. No dev branches, no agent work, no spine
+# commits. Compare its spine throughput and p99 against the S4 run of the
+# same backend. dev_agent params are kept only to pass validation.
+run_id: "macro_spine_only_dev_agent_dolt"
+backend: DOLT
+database_setup { db_name: "macro_spine_only_dev_agent" cleanup: true generated {} }
+schema { base: CH_BENCH scale_factor: 1 }
+spine_only_sec: 300
+workload {
+  branch_ops { commit_interval: 2 retention_steps: 5 }
+  data_ops { statements_per_step: 6 rows_per_write: 200 write_fraction: 0.8 spine_clients: 8 analytical_fraction: 0.1 }
+  dev_agent { dev_branches: 24 concurrent_branches: 4 dev_phase_steps: 30 review_phase_steps: 60 review_modification_prob: 0.1 rebases_per_branch: 2 spine_migration_interval: 40 key_overlap: 0.3 schema_conflict_migration: 16 spine_commit_every_txns: 200 }
+}

@@ -80,7 +80,6 @@ VERBS = (
     "revert",
     "reset",
     "delete",
-    "schema_diff",
 )
 
 _VERB_OP_TYPES = {
@@ -93,7 +92,6 @@ _VERB_OP_TYPES = {
     "revert": OpType.REVERT,
     "reset": OpType.RESET,
     "delete": OpType.DELETE,
-    "schema_diff": OpType.SCHEMA_DIFF,
 }
 
 
@@ -446,12 +444,6 @@ class DBToolSuite(ABC):
             return cls.SUPPORTS_MULTI_REF_EXEC
         if verb == "exec_async":
             return cls.open_async_pool is not DBToolSuite.open_async_pool
-        if verb == "schema_diff":
-            # The base class simulates it from the catalog when the adapter
-            # names its SQL dialect; an adapter may also override the hook.
-            return (cls.SCHEMA_DIALECT is not None
-                    or cls._schema_diff_impl is not DBToolSuite._schema_diff_impl
-                    or cls._schema_at is not DBToolSuite._schema_at)
         hook = f"_{verb}_impl"
         return getattr(cls, hook, None) is not getattr(DBToolSuite, hook, None)
 
@@ -520,9 +512,13 @@ class DBToolSuite(ABC):
         raise self._unsupported("diff")
 
 
-    # Schema diff: simulated from the catalog unless an adapter overrides
-    # it. SCHEMA_DIALECT ("mysql" | "postgres") selects the catalog query
-    # the base implementation runs on each ref through exec().
+    # The schema half of diff(): "native" when the engine compares the
+    # schemas itself (the adapter overrides _schema_diff_impl with an engine
+    # call), else "simulated" from the catalog. SCHEMA_DIALECT ("mysql" |
+    # "postgres") selects the catalog query the base implementation runs on
+    # each ref through exec(). In native-only mode a simulated schema half
+    # is left out of the result (value["schema"] is None).
+    SCHEMA_DIFF_HALF: str = "simulated"
     SCHEMA_DIALECT: Optional[str] = None
     # Adapter bookkeeping tables and hidden columns to leave out.
     SCHEMA_SKIP_TABLE_PREFIXES: tuple = ("_bb_",)
@@ -547,7 +543,7 @@ class DBToolSuite(ABC):
         the dialect's query through an untimed exec()."""
         query = self._CATALOG_QUERIES.get(self.SCHEMA_DIALECT or "")
         if query is None:
-            raise self._unsupported("schema_diff", "no catalog query for this backend")
+            raise self._unsupported("diff", "no catalog query for this backend")
         res = self.exec(lambda db: db.sql(query), refs=[ref], timed=False, raise_on_error=True)[0]
         out: dict = {}
         for table, column, ctype in res.value or []:
@@ -580,8 +576,24 @@ class DBToolSuite(ABC):
         return out
 
     def _schema_diff_impl(self, ref_a: Ref, ref_b: Ref) -> dict:
-        """Schema changes from ``ref_a`` to ``ref_b`` (see _compare_schemas)."""
+        """The schema half of diff(): changes from ``ref_a`` to ``ref_b``
+        (see _compare_schemas)."""
         return self._compare_schemas(self._schema_at(ref_a), self._schema_at(ref_b))
+
+    def _diff_with_schema(self, ref_a: Ref, ref_b: Ref) -> dict:
+        """diff() = the row half (_diff_impl) plus the schema half
+        (_schema_diff_impl) under ``value["schema"]``. Native-only mode
+        keeps a simulated schema half out, so an engine whose diff covers
+        rows only answers rows only, and the checks that need the schema
+        fail rather than the verb."""
+        value = self._diff_impl(ref_a, ref_b)
+        if not isinstance(value, dict):
+            value = {"value": value}
+        if native_only() and self.SCHEMA_DIFF_HALF != "native":
+            value["schema"] = None
+        else:
+            value["schema"] = self._schema_diff_impl(ref_a, ref_b)
+        return value
     def _log_impl(self, ref: Ref, limit: int) -> list:
         """Most recent ``limit`` commits reachable from ``ref``."""
         raise self._unsupported("log")
@@ -797,25 +809,16 @@ class DBToolSuite(ABC):
     def diff(self, ref_a: RefLike, ref_b: RefLike, *, timed: bool = True,
              storage: bool = None, label: str = "",
              raise_on_error: bool = False) -> OpResult:
-        """Differences from ``ref_a`` to ``ref_b`` (value is backend-specific)."""
+        """Differences from ``ref_a`` to ``ref_b``: per-table row counts
+        (rows_added / rows_deleted / rows_modified, tables) and, under
+        value["schema"], the schema changes (tables added and dropped;
+        columns added, dropped and changed in type on tables present on
+        both sides; see _compare_schemas). value["schema"] is None when a
+        native-only run uses an engine diff that covers rows only."""
         a, fa = self._resolve(ref_a)
         b, fb = self._resolve(ref_b)
         return self._run_verb(
-            "diff", lambda: self._diff_impl(a, b), b, timed=timed,
-            storage=storage, label=label, raise_on_error=raise_on_error,
-            fallback=fa or fb,
-        )
-
-    def schema_diff(self, ref_a: RefLike, ref_b: RefLike, *, timed: bool = True,
-                    storage: bool = None, label: str = "",
-                    raise_on_error: bool = False) -> OpResult:
-        """Schema changes from ``ref_a`` to ``ref_b``: tables added and
-        dropped; columns added, dropped and changed in type on tables
-        present on both sides (value: dict, see _compare_schemas)."""
-        a, fa = self._resolve(ref_a)
-        b, fb = self._resolve(ref_b)
-        return self._run_verb(
-            "schema_diff", lambda: self._schema_diff_impl(a, b), b, timed=timed,
+            "diff", lambda: self._diff_with_schema(a, b), b, timed=timed,
             storage=storage, label=label, raise_on_error=raise_on_error,
             fallback=fa or fb,
         )

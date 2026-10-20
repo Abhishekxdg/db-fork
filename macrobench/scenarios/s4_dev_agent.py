@@ -7,7 +7,9 @@ spine (``concurrent_branches`` alive at once, ``dev_branches`` in total).
 Each implements the loyalty feature: loyalty_tier and loyalty_event tables,
 customer.c_tier, and a chunked backfill of customer rows (a share
 ``key_overlap`` of which also rewrites c_data, which Payment transactions
-on the spine rewrite too). The branch is hot for ``dev_phase_steps``, then
+on the spine rewrite too); each dev step is ``statements_per_step``
+statements split by ``write_fraction`` into backfill chunks and reads
+of the feature (tier counts, event counts, top customers of a tier). The branch is hot for ``dev_phase_steps``, then
 quiet for ``review_phase_steps`` with occasional modifications, rebases
 onto the spine once or twice (conflicts resolved in the branch's favour),
 and is deleted without merging.
@@ -24,8 +26,9 @@ it on its side (moves its column to ``c_loyalty_tier``: add, copy, drop;
 commits) and retries the rebase; a backend that replays history meets the original
 commit again, and the branch then merges the spine in instead and keeps
 integrating by merge. Either way the spine's changes must arrive with
-both columns present. Branches created afterwards fail their feature DDL on
-the existing column and are not checked for it.
+both columns present. A branch forked after that migration finds c_tier
+taken and adds ``c_loyalty_tier`` instead, as the agent would; it has no
+conflict and is checked like every other branch.
 
 Invariants: S4.1 the feature table never reaches the spine; S4.2a/b the
 spine sentinel is invisible before and visible after the first rebase;
@@ -45,7 +48,7 @@ from macrobench.scenarios.base import Scenario, Worker, register
 from macrobench.datagen.ch import DISTRICTS_PER_WAREHOUSE
 
 SPINE_SENTINEL_BASE = 100_000
-REVIEW_IDLE_SEC = 0.05
+REVIEW_IDLE_SEC = 0.5   # idle time per review step without an edit (2026-10-16, was 0.05)
 DEFAULT_SPINE_COMMIT_EVERY_TXNS = 200
 SPINE_COMMIT_PERIOD_SEC = 2.0     # checkpoint period without a spine load
 
@@ -179,13 +182,17 @@ class DevAgentScenario(Scenario):
     def _dev_branch(self, w: Worker, i: int):
         ctx, p, inv, suite, rng = self.ctx, self.params, self.ctx.invariants, w.suite, w.rng
         branch = f"dev_{i}"
-        with self._spine_lock:
-            born_after_conflict = self._schema_conflict_applied
         res = ctx.branch(suite, branch, ctx.spine, label="dev_branch")
         if not res.ok:
             ctx.note(f"dev branch {branch}: {res.status_name} {res.error}")
             ctx.tick(p.dev_phase_steps + p.review_phase_steps)
             return None
+        # The branch's feature column. An agent looks before it adds: a fork
+        # taken after the spine's conflicting migration already has c_tier
+        # (INT), so the feature goes in as c_loyalty_tier and never conflicts.
+        taken = suite.exec(["SELECT COUNT(c_tier) FROM customer WHERE 1 = 0"],
+                           refs=[branch], label="invariant")[0].ok
+        col = "c_loyalty_tier" if taken else "c_tier"
         # Spine sentinel: inserted on the spine after the branch exists.
         sentinel_id = SPINE_SENTINEL_BASE + i
         with self._spine_lock, self.quiesced():
@@ -195,7 +202,6 @@ class DevAgentScenario(Scenario):
                        refs=[ctx.spine], label="spine_sentinel")
             suite.commit(ctx.spine, f"spine sentinel {i}", label="spine_commit")
 
-        col = "c_tier"            # the branch's feature column (renamed on a schema conflict)
         by_merge = False          # after a schema conflict a replaying backend cannot rebase past
                                   # the original commit; the branch then merges the spine in instead
         rebase_steps = {p.dev_phase_steps}
@@ -213,10 +219,10 @@ class DevAgentScenario(Scenario):
         for step in range(1, p.dev_phase_steps + 1):
             ctx.check_stop()
             if step == 1:
-                w.exec(self._feature_ddl(i), branch, label="feature_ddl")
+                w.exec(self._feature_ddl(i, col), branch, label="feature_ddl")
             else:
                 w.exec(self._backfill_script(i, step, chunk, rng, col), branch, label="backfill")
-                chunk += ctx.statements_per_step
+                chunk += self._backfill_writes()
             committed = ctx.should_commit(step - 1, last_step=(step == p.dev_phase_steps))
             if committed:
                 w.commit(branch, f"dev {i} step {step}", label="dev_commit")
@@ -256,14 +262,10 @@ class DevAgentScenario(Scenario):
                     return (sc["tiers"] == 3 and sc["events"] == events_before
                             and sc["feature_col"] and sc["tiered"] == tiered_before)
                 intact = is_intact(schema_after)
-                if born_after_conflict:
-                    # Forked from a spine that already has c_tier INT: the
-                    # feature DDL failed on creation, nothing to compare.
-                    inv.not_applicable(f"S4.3 schema-conflict rebase of {branch} (rebase {rebases_done})",
-                                       "branch created after the conflicting migration")
-                elif conflict_due and col == "c_tier":
+                if conflict_due and col == "c_tier":
                     # First integration after the conflicting migration; a
-                    # branch that already moved its column is checked as usual.
+                    # branch that already moved its column, or was born with
+                    # c_loyalty_tier, is checked as usual.
                     ctx.bump_metric("schema_conflict_rebases")
                     if rb.failed:
                         inv.check(f"S4.3a schema-conflict rebase of {branch} fails cleanly",
@@ -337,12 +339,8 @@ class DevAgentScenario(Scenario):
                               f"tiers={schema_after['tiers']} events={schema_after['events']}/{events_before} "
                               f"tiered={schema_after['tiered']}/{tiered_before} migrations={schema_after['migrations']}/{spine_migrations}")
                 if rebases_done == 1:
-                    if rb.unsupported:
-                        inv.not_applicable(f"S4.2b spine sentinel visible on {branch} after rebase",
-                                           "rebase unsupported")
-                    else:
-                        inv.expect(f"S4.2b spine sentinel visible on {branch} after rebase",
-                                   sentinel_visible(), 1, f"rebase {rb.status_name}")
+                    inv.expect(f"S4.2b spine sentinel visible on {branch} after rebase",
+                               sentinel_visible(), 1, f"rebase {rb.status_name}")
             ctx.tick()
 
         # Review phase: quiet, occasional modification.
@@ -409,27 +407,40 @@ class DevAgentScenario(Scenario):
                 "tiered": count(f"SELECT COUNT(*) FROM customer WHERE {col} IN ('gold', 'silver', 'bronze')"),
                 "migrations": count("SELECT COUNT(*) FROM migration_log")}
 
-    def _feature_ddl(self, i: int):
+    def _feature_ddl(self, i: int, col: str = "c_tier"):
         def script(db):
             db.sql("CREATE TABLE loyalty_tier (tier_id INT NOT NULL, name VARCHAR(16) NOT NULL, "
                    "min_payment DECIMAL(12,2) NOT NULL, PRIMARY KEY (tier_id))")
             db.sql("CREATE TABLE loyalty_event (event_id INT NOT NULL, c_w_id INT, c_d_id INT, "
                    "c_id INT, tier_id INT, created_at TIMESTAMP, PRIMARY KEY (event_id))")
-            db.sql("ALTER TABLE customer ADD COLUMN c_tier VARCHAR(8)")
+            db.sql(f"ALTER TABLE customer ADD COLUMN {col} VARCHAR(8)")
             db.sql("INSERT INTO loyalty_tier (tier_id, name, min_payment) VALUES "
                    "(1, 'bronze', 0), (2, 'silver', 5000), (3, 'gold', 9000)")
         return script
 
+    def _backfill_writes(self) -> int:
+        """Backfill chunks per dev step: statements_per_step split by
+        write_fraction, as in S1 and S2; the rest of the step is reads."""
+        n = self.ctx.statements_per_step
+        return max(1, round(n * self.ctx.data_ops.write_fraction)) if n > 1 else 1
+
     def _backfill_script(self, i: int, step: int, chunk: int, rng, col: str = "c_tier"):
+        """One dev step: ``writes`` backfill chunks (a range update of
+        rows_per_write customers plus an event insert each) and then
+        ``reads`` queries a developer would run against the feature."""
         ctx = self.ctx
         n = ctx.statements_per_step
+        writes = self._backfill_writes()
+        reads = max(0, n - writes)
         rows = ctx.rows_per_write
         customers = ctx.scale.customers_per_district
         per_district = max(1, (customers + rows - 1) // rows)
         overlap = self.params.key_overlap
+        read_kinds = [rng.randrange(4) for _ in range(reads)]
 
         def script(db):
-            for k in range(n):
+            last = (1, 1)
+            for k in range(writes):
                 idx = chunk + k
                 w_id = 1 + (idx // (per_district * DISTRICTS_PER_WAREHOUSE)) % ctx.scale.warehouses
                 d_id = 1 + (idx // per_district) % DISTRICTS_PER_WAREHOUSE
@@ -449,5 +460,17 @@ class DevAgentScenario(Scenario):
                 db.sql("INSERT INTO loyalty_event (event_id, c_w_id, c_d_id, c_id, tier_id, created_at) "
                        "VALUES (%s, %s, %s, %s, 1, CURRENT_TIMESTAMP)",
                        (i * 1_000_000 + step * 1000 + k, w_id, d_id, lo))
-            db.sql(f"SELECT {col}, COUNT(*) FROM customer GROUP BY {col}")
+                last = (w_id, d_id)
+            w_id, d_id = last
+            for kind in read_kinds:
+                if kind == 0:
+                    db.sql(f"SELECT {col}, COUNT(*) FROM customer GROUP BY {col}")
+                elif kind == 1:
+                    db.sql("SELECT COUNT(*) FROM loyalty_event WHERE c_w_id = %s", (w_id,))
+                elif kind == 2:
+                    db.sql(f"SELECT c_id, c_ytd_payment FROM customer WHERE c_w_id = %s AND c_d_id = %s "
+                           f"AND {col} = 'gold' ORDER BY c_ytd_payment DESC LIMIT 10", (w_id, d_id))
+                else:
+                    db.sql("SELECT t.name, COUNT(e.event_id) FROM loyalty_tier t "
+                           "LEFT JOIN loyalty_event e ON e.tier_id = t.tier_id GROUP BY t.name")
         return script

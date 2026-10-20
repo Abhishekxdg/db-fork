@@ -221,6 +221,10 @@ class ResultCollector:
         # "OPTYPE" or "OPTYPE:reason". Any entry marks the workflow as not
         # fully supported on this backend.
         self.unsupported_ops: set[str] = set()
+        # Called as on_unsupported(op_name, reason) right after an
+        # UNSUPPORTED row is recorded. The macrobench installs a hook that
+        # ends the run there; None leaves the caller to inspect the result.
+        self.on_unsupported = None
 
         os.makedirs(output_dir, exist_ok=True)
 
@@ -405,7 +409,15 @@ class ResultCollector:
     # Rows
     # ------------------------------------------------------------------
 
-    def emit(
+    def emit(self, op_type: rslt.OpType, status: rslt.OpStatus = rslt.OpStatus.OK, *args, **kw) -> None:
+        """Append one Result row (see _emit). An UNSUPPORTED row then
+        reaches ``on_unsupported`` when a hook is set; the hook may raise,
+        which ends the caller's verb with the row already recorded."""
+        self._emit(op_type, status, *args, **kw)
+        if status == rslt.OpStatus.UNSUPPORTED and self.on_unsupported is not None:
+            self.on_unsupported(rslt.OpType.Name(op_type), kw.get("error_message") or "")
+
+    def _emit(
         self,
         op_type: rslt.OpType,
         status: rslt.OpStatus = rslt.OpStatus.OK,

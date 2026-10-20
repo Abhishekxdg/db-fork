@@ -1,10 +1,12 @@
 # S2 Agent context management: long-lived spine, 3 candidates per compaction.
+# One exec() per exchange (a user turn, an assistant turn, a tool call) plus a
+# context read; 100 exchanges per compaction cycle (2026-10-16, was 25 steps of 4).
 run_id: "macro_context_mgmt_dolt"
 backend: DOLT
 database_setup { db_name: "macro_context_mgmt" cleanup: true generated {} }
 schema { base: NO_BASE }
 workload {
-  branch_ops { commit_interval: 2 retention_steps: 20 }
-  data_ops { statements_per_step: 6 rows_per_write: 50 write_fraction: 0.6 }
-  context_mgmt { compaction_interval: 25 fanout: 3 compaction_cycles: 8 rejected_cycle: 3 }
+  branch_ops { commit_interval: 2 retention_steps: 80 }
+  data_ops { statements_per_step: 2 rows_per_write: 50 write_fraction: 0.5 ddl_fraction: 0.5 worker_threads: 3 }
+  context_mgmt { compaction_interval: 100 fanout: 3 compaction_cycles: 8 rejected_cycle: 3 cycles_per_rejection: 8 }
 }

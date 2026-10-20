@@ -6,8 +6,9 @@ backends (Dolt, Neon, Xata, SeekDB, MatrixOne, Bauplan, plain Postgres copies,
 is driven through one git-like API (`dblib/db_api.py`): `branch`, `commit`,
 `diff`, `log`, `merge`, `rebase`, `revert`, `reset`, `delete`, plus `exec()`
 to run a workload script on one or more branches. Each operation is timed and
-storage-measured, and an operation a backend cannot perform is recorded as
-unsupported instead of stopping the workload. Includes both macrobenchmark and
+storage-measured; an operation that errors is recorded and the workload goes
+on, while one the backend cannot perform ends the run as unsupported, naming
+the verb. Includes both macrobenchmark and
 microbenchmark workloads.
 
 ## Quick Start
@@ -117,6 +118,7 @@ both under `capabilities` and `implementation`.
 | `bauplan` | yes | yes (tags) | yes (native; row-level on conflict) | yes | yes (branch from tag) | yes | yes | | |
 | `file_copy` | yes (CREATE DATABASE clone) | yes (clone per commit + log table) | yes (SQL three-way over postgres_fdw) | yes | yes (drop + clone from the snapshot) | yes | yes | yes (postgres_fdw) | yes |
 | `chronos` | yes (interval fork, metadata only) | yes (checkpoint + log table) | yes (three-way over Chronos diffs) | yes | yes (diff-driven) | yes (deferred while children live) | yes (checkpoints) | yes (interval views) | |
+| `terminusdb` (microbench only) | yes | commit: reads the head (every write commits); diff, log: yes | yes (`apply` of the diff since the common ancestor) | rebase: yes; revert: `apply` of the inverse diff | yes | yes | yes | | |
 
 ### exec()
 
@@ -170,7 +172,7 @@ whether the sentinel-based invariance checks held.
 |----------|-----|-------|------------|
 | S1 Agentic RL environment | `rl_env` | T task branches, G rollout leaves each, forks from recorded steps | branch (from commit), commit, diff, delete |
 | S2 Agent context management | `context_mgmt` | long spine, candidate branches per compaction | branch, commit, merge (ff), revert, rebase, delete |
-| S3 Multi-agent collaboration | `multi_agent` | N agents merging into a spine that keeps changing | branch, commit, log, merge (with conflicts), delete |
+| S3 Multi-agent collaboration | `multi_agent` | N agents merging into a spine that keeps changing | branch, commit, merge (with conflicts), delete |
 | S4 Development agent | `dev_agent` | dev branches off a busy production spine, never merged; one spine migration adds a column the branches already added with another type (a schema conflict at their next rebase, which the branch resolves by moving its column and retrying; a backend that replays history merges the spine in instead) | branch, commit, rebase (with data and schema conflicts), merge (conflict recovery), delete |
 | S5 Operations agent | `ops_agent` | dense commits, bad deploy, investigation branches, PITR | branch (from commit), commit, diff, reset, delete |
 | S6 Data agent | `data_agent` | ingestion batches rebased and merged into a warehouse | branch, commit, reset, rebase, merge, delete |
@@ -251,9 +253,10 @@ workload {
 uv run python -m macrobench.runner --config macrobench/configs/ops_agent_mini.textproto --outdir run_stats
 ```
 
-A backend that lacks a verb still runs the whole scenario: the verb is
-recorded as UNSUPPORTED, `workflow_supported` is false in the e2e stats, and
-invariance checks that depend on it are reported as not applicable.
+A backend that lacks a verb does not run the scenario past it: the verb is
+recorded as UNSUPPORTED, the run stops there with every worker cancelled,
+`workflow_supported` is false and `status` is `unsupported: <VERB>: <reason>`
+in the e2e stats. Failed operations, by contrast, never stop a run.
 
 #### Storage
 
@@ -318,7 +321,7 @@ Use `scripts/run_single_thread_bench.sh` to measure single-threaded operation la
 
 | Argument | Description |
 |----------|-------------|
-| `backend` | Database backend: `dolt`, `dolt_mysql`, `seekdb`, `matrixone`, `neon`, `xata`, `file_copy`, `chronos` |
+| `backend` | Database backend: `dolt`, `dolt_mysql`, `seekdb`, `matrixone`, `neon`, `xata`, `file_copy`, `chronos`, `terminusdb` |
 | `sql_dump_path` | Path to SQL dump file (e.g., `db_setup/tpcc_schema.sql`) |
 | `num_branches` | Number of branches to create for testing |
 
@@ -332,6 +335,33 @@ Use `scripts/run_single_thread_bench.sh` to measure single-threaded operation la
 | `--range-size <n>` | Range size for RANGE_UPDATE operation (default: 200) |
 | `--num-ops <n>` | Number of operations to perform |
 | `--output-dir <dir>` | Output directory (default: `/tmp/run_stats`) |
+
+##### Operations
+
+| Group | `--operations` names |
+|-------|----------------------|
+| Data | `READ`, `INSERT`, `UPDATE`, `DELETE`, `RANGE_READ`, `RANGE_UPDATE` |
+| Branch | `BRANCH_CREATE`, `BRANCH_CONNECT`, `BRANCH_DELETE`, `BRANCH_COMMIT`, `BRANCH_DIFF`, `BRANCH_LOG`, `BRANCH_MERGE`, `BRANCH_REBASE`, `BRANCH_REVERT`, `BRANCH_RESET` |
+| Schema | the `DDL_*` operations |
+
+The branch group covers the nine verbs of the shared API (`dblib/db_api.py`)
+plus the connection switch. `BRANCH_COMMIT` to `BRANCH_RESET` each build the
+state they need untimed and record only the verb:
+
+| Operation | Untimed preparation | Timed |
+|-----------|---------------------|-------|
+| `BRANCH_COMMIT` | insert rows on the branch | `commit` |
+| `BRANCH_DIFF` | once per branch: a child with committed inserts | `diff(branch, child)` |
+| `BRANCH_LOG` | once per branch: `history_commits` commits | `log(branch, log_limit)` |
+| `BRANCH_MERGE` | a child with committed inserts; the branch commits other rows | `merge(branch, child)` |
+| `BRANCH_REBASE` | same as merge | `rebase(child, branch)` |
+| `BRANCH_REVERT` | insert rows and commit them | `revert` of that commit |
+| `BRANCH_RESET` | two commits of inserted rows | `reset` to the first |
+
+`branch_op_config` in the task config sets `changes_per_op` (rows per
+prepared side, default 1), `history_commits` and `log_limit` (default 10
+each). Merges and rebases never conflict: the two sides insert different
+keys. A verb the backend lacks is recorded as `UNSUPPORTED`.
 
 ##### Examples
 
@@ -538,6 +568,22 @@ uv run python scripts/plotting/plot_branch_latency_micro.py \
     --outdir figures/ \
     --operation combined
 ```
+
+### Microbenchmark Per-Operation Plot
+
+One figure with every operation of the microbenchmark, one bar per backend:
+
+```bash
+uv run python scripts/plotting/plot_micro_ops.py \
+    --data-dir <data_directory> [<data_directory> ...] \
+    --outdir <output_figures_dir> [--branches 16]
+```
+
+It reads every result parquet under the directories (with the summary JSON
+that names its backend) and writes `micro_ops_latency.png` and
+`micro_ops_latency.csv`: median latency with a whisker to the 95th
+percentile, on a log axis, for the six data operations and for the nine
+verbs plus the connection switch. A verb a backend lacks is marked `n/a`.
 
 ### Microbenchmark Throughput Plots
 
@@ -1147,6 +1193,184 @@ reclamation and runs `VACUUM`.
 
 ---
 
+## TerminusDB backend — `terminusdb`
+
+[TerminusDB](https://terminusdb.org) is a document/graph database with
+git-like branches. It has **no SQL interface**: data goes through a JSON
+document API, WOQL (a Datalog-style query language) and GraphQL, and every
+write request is one commit. The macrobenchmark issues SQL, so TerminusDB
+is wired for the **microbenchmark only**; `dblib/terminusdb.py` runs no
+SQL and is not in the macrobenchmark's backend list.
+
+Start a server and install the one extra dependency (a SQL parser, used to
+recognise the microbenchmark's statements):
+
+```bash
+docker run -d --name terminusdb -p 127.0.0.1:6363:6363 \
+    -e TERMINUSDB_ADMIN_PASS=root terminusdb/terminusdb-server:latest
+uv sync --extra terminusdb
+TERMINUSDB_REUSE_LOAD=1 ./scripts/run_single_thread_bench.sh terminusdb db_setup/ch-w1.sql 16 \
+    --operations READ,INSERT,BRANCH_CREATE,BRANCH_MERGE
+uv run pytest tests/test_terminusdb_live.py tests/test_tpcc_woql_live.py
+```
+
+| Variable | Meaning (default) |
+|----------|-------------------|
+| `TERMINUSDB_URL` | server (`http://127.0.0.1:6363`) |
+| `TERMINUSDB_USER`, `TERMINUSDB_PASSWORD` | credentials (`admin`, `root`) |
+| `TERMINUSDB_TEAM` | organisation that owns the database (`admin`) |
+| `TERMINUSDB_STORAGE_DIR` | host path of the server's storage directory, for storage measurements (whole server) |
+| `TERMINUSDB_CONTAINER` | alternatively, the Docker container to run `du` in |
+| `TERMINUSDB_LOAD_BATCH` | documents per request while loading (`5000`) |
+| `TERMINUSDB_REUSE_LOAD` | `1`: keep the loaded database between runs and restore it (delete the other branches, reset `main`) instead of loading the dump again |
+| `TERMINUSDB_TIMEOUT_SEC` | give up on a request after this long (wait forever) |
+
+### Data model and statements
+
+A table is a document class whose properties are the columns (all
+optional); a row is a document with the id `<table>/<pk1>_<pk2>...`. The
+loader reads the SQL dumps the other backends load (`CREATE TABLE`,
+`ALTER TABLE ... PRIMARY KEY`, `COPY ... FROM stdin`, `INSERT`) and writes
+a schema plus documents; each class keeps its column list, SQL types and
+primary key in `@metadata`. `util/db_helpers.py` reads that catalog where
+it queries `information_schema` on the SQL backends.
+
+The microbenchmark sends SQL text through `exec()`. The backend parses
+each statement once and issues the matching native call:
+
+| Statement | TerminusDB call |
+|-----------|-----------------|
+| `SELECT ... WHERE <whole primary key> = ...` | `GET` one document by id |
+| `INSERT INTO t (...) VALUES (...)` | `POST` documents |
+| `UPDATE` of every non-key column `WHERE <whole primary key>` | `PUT` (replace) one document |
+| `DELETE ... WHERE <whole primary key>` | `DELETE` one document by id |
+| `SELECT` with any other conjunctive filter, `COUNT(*)`, `LIMIT` | one WOQL query |
+| `UPDATE` / `DELETE` with any other filter | one WOQL query, one commit |
+
+An equality in a filter is a triple with the value as its object (an index
+lookup); a range bound binds the column and compares, and a row-value
+comparison `(a, b) >= (x, y)` is expanded lexicographically. Anything else
+(joins, `GROUP BY`, `ORDER BY`, expressions in `SET`, DDL, `BEGIN`) raises
+`NotSupportedError` and the `exec()` is recorded `FAILED`. The `DDL_*`
+operations are therefore not available.
+
+### Verbs
+
+| Verb | Implementation |
+|------|----------------|
+| `branch`, `delete`, `log`, `diff`, `reset`, `rebase` | one native call each |
+| `commit` | every write is already a commit, so `commit()` writes nothing: it reads the branch head and returns it as the commit id (`simulated`). The first write since the previous `commit()` is remembered from the write responses, so `revert` can undo all a `commit()` covers |
+| `merge` | TerminusDB has no merge. Composed: the source head, the common ancestor (remembered per branch pair; found from the two logs the first time) and one `apply` of the diff between them as a squash commit. `apply` refuses a conflicting diff (HTTP 409, nothing applied) and names the documents; `ours` then applies the source's other documents and `theirs` all of them. A callable policy is treated as `ours` |
+| `revert` | one log request for the parent of the first write the commit covers, then `apply` of the inverse diff |
+| connection switch | the API is stateless: a switch changes the URL of the next request and costs nothing |
+| commit refs | reads at `branch@commit` are native; writes there are refused |
+
+`exec_async` and multi-branch exec are not supported.
+
+### What the microbenchmark measured
+
+One run on TerminusDB 12.0.7 in Docker on a laptop (WSL2), `db_setup/ch-w1.sql`
+(609,078 rows in 12 tables), table `orders` (30,000 rows), 16 spine
+branches, one thread; `results/terminusdb/micro_w1/run.sh` is the driver.
+Loading the dump took about 12 minutes.
+
+| Operation | Median | p95 | n |
+|-----------|--------|-----|---|
+| Read (one row) | 6.8 ms | 8.0 ms | 1000 |
+| Insert | 43 ms | 68 ms | 1000 |
+| Update (one row) | 47 ms | 101 ms | 1000 |
+| Delete (one row) | 51 ms | 77 ms | 1000 |
+| Range read (200 rows) | 1.3 s | 1.3 s | 200 |
+| Range update (200 rows) | 1.6 s | 2.8 s | 200 |
+| Branch create | 18 ms | 21 ms | 50 |
+| Connect | < 0.01 ms | < 0.01 ms | 949 |
+| Commit | 12 ms | 19 ms | 100 |
+| Diff | 21 ms | 26 ms | 100 |
+| Log (10 entries) | 25 ms | 28 ms | 100 |
+| Merge | 121 ms | 162 ms | 100 |
+| Rebase | 21.8 s | 40.7 s | 20 |
+| Revert | 131 ms | 228 ms | 100 |
+| Reset | 20 ms | 26 ms | 100 |
+| Branch delete | 18 ms | 35 ms | 15 |
+
+* **Every write is a commit**, so the insert, update and delete latencies
+  include one. A point read is one request.
+* **Range operations scan.** A range on the primary key is a WOQL filter
+  over the property triples of the whole class; there is no ordered index
+  to seek in, so a 200-row range over 30,000 rows costs over a second.
+* **Rebase grows with the database.** It took 0.3 s on an almost empty
+  database and about 22 s on this one (two sizes measured, nothing in
+  between). Merge and revert, which use `apply`, stayed near 0.1 s.
+* **Rebase fails now and then with a bare HTTP 500** and leaves the branch
+  untouched; the same request then succeeds. The backend repeats it (up to
+  4 attempts) and counts `rebase_retries` in the summary's
+  `backend_observations`. In an isolated test 3 of 40 rebases needed it;
+  3 of the 20 here took about twice the median.
+* **Concurrent writers slow each other down.** In one small run with four
+  threads, each inserting on its own branch, an insert took about 280 ms
+  against 30 ms with one thread on the same data, and total throughput
+  fell from about 33 to 6 inserts per second. Not investigated further.
+* **One TCP connection per request.** On a kept-alive connection the
+  response body waits for a delayed ACK: a point read took 56 ms against
+  5 ms on a fresh connection. The backend sends `Connection: close`.
+
+### The macrobenchmark's workload in WOQL
+
+`macrobench/tpcc_woql.py` is `macrobench/tpcc.py` written by hand for
+TerminusDB: the five TPC-C transactions and the five CH queries, one
+document-API or WOQL request per SQL statement, in the same order.
+`tests/test_tpcc_woql_live.py` loads the same seeded data into PostgreSQL
+and TerminusDB, runs the SQL on one and the WOQL on the other, and checks
+that the transactions return the same values, leave the same table
+contents, and that the five queries return the same rows.
+
+```bash
+uv run python scripts/run_terminusdb_tpcc.py --output-dir run_stats/terminusdb_tpcc
+```
+
+seeds the CH dataset the macrobenchmark uses (seed 42, one warehouse), runs
+a TPC-C mix on a fresh branch, then each CH query, and records every
+request under the SQL statement it stands for, in the usual parquet layout.
+
+One run on the same server, at the macrobenchmark's default scale
+(608,435 rows: 100,000 items and stock rows, 30,000 customers and orders,
+299,394 order lines; seeding took 13 minutes), 200 transactions and three
+runs of each query looking back 7 days; results in
+`results/terminusdb/tpcc_woql/`:
+
+| Transaction or query | Median | p95 | n |
+|----------------------|--------|-----|---|
+| new_order (about 35 requests) | 1.2 s | 2.1 s | 96 |
+| payment (4 requests) | 158 ms | 279 ms | 80 |
+| delivery (10 districts, 7 requests each) | 11.9 s | 22.8 s | 6 |
+| order_status (3 requests) | 71 ms | 137 ms | 7 |
+| stock_level (2 requests) | 232 ms | 574 ms | 11 |
+| CH Q1 | 238.6 s | 240.8 s | 3 |
+| CH Q3 | 32.0 s | 32.1 s | 3 |
+| CH Q6 | 15.0 s | 15.0 s | 3 |
+| CH Q12 | 183.3 s | 184.2 s | 3 |
+| CH Q18 | 29.1 s | 29.1 s | 3 |
+
+All 200 transactions and all 15 query runs completed. A request that
+writes one row took 29 to 43 ms (a commit each) and a read by primary key
+8 to 16 ms, whatever the statement, so a transaction costs roughly its
+number of requests times that. The statements that are not a lookup are
+slower: `MIN(no_o_id)` over a district's 900 pending orders took 0.6 s and
+the stock-level count 0.2 s. The CH queries, which scan and group the
+order lines, took from 15 s (Q6) to 4 minutes (Q1). WOQL does not reorder a
+conjunction, so these timings depend on how each query is written; they
+are one hand-written form, checked for correctness but not tuned by a
+TerminusDB expert.
+
+This is a measure of TerminusDB running this relational workload, not of
+TerminusDB at its best: the tables are kept as flat documents with foreign
+keys as plain values, so every join is a value join, where a schema
+designed for TerminusDB would link documents. A sequence of requests is
+also not a transaction: each write commits on its own, and another client
+can interleave.
+
+---
+
 ## Environment Variables
 
 Create a `.env` file for backend-specific configuration:
@@ -1162,6 +1386,11 @@ PGSQL_HOST=127.0.0.1
 PGSQL_PORT=5434
 PGSQL_DATA_DIR=/mnt/pgbench   # volume dedicated to the server; storage = its usage minus WAL
 # The chronos backend uses the same server (PGSQL_*), one database per run.
+
+# TerminusDB server of the terminusdb backend (see its section for the rest)
+TERMINUSDB_URL=http://127.0.0.1:6363
+TERMINUSDB_USER=admin
+TERMINUSDB_PASSWORD=root
 
 # Database connection strings (if needed)
 DOLT_CONNECTION_STRING=postgresql://user:pass@localhost:5432/dbname

@@ -21,7 +21,9 @@ From then on every statement goes through a Chronos branch session.
 The backend runs Chronos with ``enable_schema_branching=True`` because the
 scenarios create tables and columns on branches. Chronos refuses its native
 merge for tables under schema branching, so merge/rebase/revert/reset are
-built on top of its native diff and bulk upsert/delete primitives here.
+built on top of its native diff and bulk upsert/delete primitives here. In
+native-only mode (``DBFORK_NATIVE_ONLY``) merge calls the engine's
+merge_apply instead, which then reports the refusal as unsupported.
 
 Environment: ``PGSQL_USER``, ``PGSQL_PASSWORD``, ``PGSQL_HOST``, ``PGSQL_PORT``
 (the same PostgreSQL server the file_copy backend uses); one database per
@@ -44,7 +46,10 @@ import psycopg
 from dotenv import load_dotenv
 
 import dblib.result_collector as rc
-from dblib.db_api import DBToolSuite, Ref, Session, UnsupportedOperation
+from dblib.db_api import DBToolSuite, Ref, Session, UnsupportedOperation, native_only
+
+# Native-only mode: merge goes to the engine's merge_apply (see IMPLEMENTATION_NOTES).
+CHRONOS_NATIVE_MERGE = native_only()
 
 try:
     from chronos_core.branching import (
@@ -94,7 +99,6 @@ ROWID_COL = "_bb_rowid"
 TEMP_PREFIX = "bbtmp_"
 _SESSION_CACHE = 16
 _CHUNK = 500
-_CONFLICT_ROW_LIMIT = 2000
 
 _LOG_DDL = f"""
 CREATE TABLE IF NOT EXISTS {LOG_TABLE} (
@@ -445,13 +449,12 @@ class ChronosToolSuite(DBToolSuite):
         "commit": "native",
         "diff": "native",
         "log": "simulated",
-        "merge": "simulated",
+        "merge": "native" if CHRONOS_NATIVE_MERGE else "simulated",
         "rebase": "simulated",
         "revert": "simulated",
         "reset": "simulated",
         "delete": "native",
         "commit_refs": "native",
-        "schema_diff": "simulated",
         "multi_ref_exec": "simulated",
     }
     IMPLEMENTATION_NOTES = {
@@ -464,9 +467,11 @@ class ChronosToolSuite(DBToolSuite):
         "log": "SELECT from the _bb_log bookkeeping table (Chronos keeps no history of commits)",
         "merge": "three-way merge in the shim: native diff(base, source) and diff(base, target) "
                  "against the fork/sync checkpoint, conflicts compared by key, changes applied "
-                 "with native upsert_rows/delete_keys, schema additions replayed as DDL. The "
-                 "native merge_apply is refused by Chronos for tables under schema branching, "
-                 "which every scenario needs.",
+                 "with native upsert_rows/delete_keys, schema additions replayed as DDL. In "
+                 "native-only mode the engine's merge_apply is called instead (and branches are "
+                 "forked from the parent branch so it has a shared fork base); Chronos refuses "
+                 "it for every table once schema branching is enabled, which every scenario "
+                 "needs, and the refusal is reported as unsupported.",
         "rebase": "the same three-way merge with the upstream as the source; the base moves to a "
                   "sync checkpoint on the upstream",
         "revert": "inverse of the native diff between the commit's checkpoint and its "
@@ -477,7 +482,6 @@ class ChronosToolSuite(DBToolSuite):
                   "GC); deleting a branch deletes its subtree in Chronos, so a branch with live "
                   "children is tombstoned and deleted once they are gone",
         "commit_refs": "checkpoints: read-only sessions on the checkpoint's interval",
-        "schema_diff": "catalog columns of each ref compared by the adapter",
         "multi_ref_exec": "temporary views over the interval tables at each ref's branch point "
                           "(the visibility predicate Chronos itself uses), the SELECT rewritten by "
                           "the session for its own branch and run on a plain connection",
@@ -1328,7 +1332,7 @@ class ChronosToolSuite(DBToolSuite):
         rows = self._pgx(f"SELECT schema_json FROM {LOG_TABLE} WHERE id = %s AND schema_json IS NOT NULL "
                          "ORDER BY (log_branch = %s) DESC LIMIT 1", (str(ref.commit), ref.branch))
         if not rows:
-            raise self._unsupported("schema_diff", f"no schema recorded at commit {ref.commit}")
+            raise self._unsupported("diff", f"no schema recorded at commit {ref.commit}")
         return self._fp_columns(json.loads(rows[0][0]))
 
     def _branch_tables(self, branch: str) -> dict:
@@ -1593,7 +1597,7 @@ class ChronosToolSuite(DBToolSuite):
             rows_out = []
             for table, pairs in conflicts.items():
                 rows = []
-                for o, t in pairs[:_CONFLICT_ROW_LIMIT]:
+                for o, t in pairs:
                     base_row = o.before or t.before or {}
                     our, their = (t.after, o.after) if swap else (o.after, t.after)
                     our_type, their_type = (_dtype(t), _dtype(o)) if swap else (_dtype(o), _dtype(t))
@@ -1641,7 +1645,13 @@ class ChronosToolSuite(DBToolSuite):
             with _GATES.hold([parent], self._check_cancel):
                 self._retry("checkpoint", lambda: self.ctx.create_checkpoint(base_cp, parent, {"kind": "fork", "child": name}))
                 try:
-                    self._retry("fork", lambda: self.ctx.create_branch_from_checkpoint(name, base_cp))
+                    if CHRONOS_NATIVE_MERGE:
+                        # The engine's merge needs the branch forked from its
+                        # parent ("no shared fork base" otherwise); the
+                        # checkpoint is still taken as the fork point record.
+                        self._retry("fork", lambda: self.ctx.create_branch(name, parent))
+                    else:
+                        self._retry("fork", lambda: self.ctx.create_branch_from_checkpoint(name, base_cp))
                 except BranchingError as e:
                     if "already exists" in str(e):
                         raise ValueError(f"Cannot create branch {name}, already exists") from e
@@ -1709,6 +1719,8 @@ class ChronosToolSuite(DBToolSuite):
             raise ValueError("cannot merge into a commit ref")
         if into.branch == source.branch:
             raise ValueError(f"Cannot merge branch '{source.branch}' into itself")
+        if CHRONOS_NATIVE_MERGE:
+            return self._native_merge(into, source, message)
         sess = self._on(into)
         src_max = int(self._find_commit(source.branch, source.commit)["seq"]) if source.commit else None
         base_cp = self._merge_base(into.branch, source.branch, b_max_seq=src_max)
@@ -1729,6 +1741,30 @@ class ChronosToolSuite(DBToolSuite):
         info["hash"], _ = self._add_row(into.branch, "merge", message or f"Merge {source} into {into.branch}",
                                         prev_branch=source.branch)
         info["fast_forward"] = info.get("ours_changes", 0) == 0 or info.get("theirs_changes", 0) == 0
+        return info
+
+    def _native_merge(self, into: Ref, source: Ref, message: str) -> dict:
+        """Native-only mode: the engine's own merge_apply (abort-on-conflict;
+        the scenario's resolver is not consulted). Chronos refuses it with
+        chronos_native_merge_unsupported for every table under schema
+        branching, which is reported as unsupported."""
+        if source.commit:
+            raise self._unsupported("merge", "the native merge takes a branch head, not a commit")
+        self._drop_sessions(into.branch)
+        self._drop_sessions(source.branch)
+        try:
+            with _GATES.hold([into.branch, source.branch], self._check_cancel):
+                res = self._retry("merge", lambda: self.ctx.merge_apply(source.branch, into.branch))
+        except Exception as e:
+            msg = str(e)
+            if "chronos_native_merge_unsupported" in msg:
+                raise self._unsupported("merge", msg.split("chronos_native_merge_unsupported:", 1)[-1].strip()
+                                        or msg) from e
+            raise
+        self._copy_log(into.branch, source.branch)
+        info = {"conflicts": 0, "fast_forward": False, "native_result": str(res)[:200]}
+        info["hash"], _ = self._add_row(into.branch, "merge", message or f"Merge {source} into {into.branch}",
+                                        prev_branch=source.branch)
         return info
 
     def _rebase_impl(self, ref: Ref, onto: Ref, on_conflict="ours") -> dict:

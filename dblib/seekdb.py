@@ -91,6 +91,8 @@ SEEKDB_DATA_DIR = _default_data_dir()
 
 # Use SeekDB's own MERGE TABLE instead of the SQL three-way merge.
 SEEKDB_NATIVE_MERGE = native_only()
+# Use SeekDB's own DIFF TABLE instead of the anti-joins between flashback reads.
+SEEKDB_NATIVE_DIFF = native_only()
 
 # OceanBase's default 10s query timeout is too short for seeding and for the
 # anti-joins behind merge/rebase/reset; one hour, in microseconds.
@@ -155,8 +157,6 @@ CREATE TABLE IF NOT EXISTS `{KEYS_TABLE}` (
 )
 """
 
-# Conflict rows handed to a resolve callable, per table.
-_CONFLICT_ROW_LIMIT = 1000
 
 # How long to retry a flashback read that fails with 1412 for a table the
 # commit recorded, in case an index build is still in progress.
@@ -286,10 +286,18 @@ class _State:
         return table in self.schema
 
     def src(self, table: str) -> str:
-        """Table expression, with the flashback clause for a snapshot."""
+        """Table expression for a FROM clause: the table itself for a branch
+        head, or a flashback read for a snapshot. The flashback read is
+        wrapped in a derived table that pins the primary key as the access
+        path: SeekDB plans a flashback read like any other query and may
+        pick a secondary index, and an index built after the snapshot makes
+        the read fail with 1412 ("table definition has changed") although
+        the rows are still readable through the primary (found 2026-10-14,
+        S1.5 on historical forks). Callers add their own alias after it."""
         expr = _qt(self.db, table)
         if self.scn:
-            expr += f" AS OF SNAPSHOT {int(self.scn)}"
+            return (f"(SELECT /*+ INDEX(fb PRIMARY) */ * FROM {expr} "
+                    f"AS OF SNAPSHOT {int(self.scn)} fb)")
         return expr
 
 
@@ -304,7 +312,7 @@ class SeekDBToolSuite(DBToolSuite):
     IMPLEMENTATION = {
         "branch": "native",
         "commit": "native",
-        "diff": "simulated",
+        "diff": "native" if SEEKDB_NATIVE_DIFF else "simulated",
         "log": "simulated",
         "merge": "native" if SEEKDB_NATIVE_MERGE else "simulated",
         "rebase": "simulated",
@@ -312,13 +320,13 @@ class SeekDBToolSuite(DBToolSuite):
         "reset": "simulated",
         "delete": "native",
         "commit_refs": "native",
-        "schema_diff": "simulated",
         "multi_ref_exec": "native",
     }
     IMPLEMENTATION_NOTES = {
         "branch": "FORK DATABASE (restored to the snapshot for a commit ref)",
         "commit": "current_scn() recorded in a _bb_commits row (flashback snapshot)",
-        "diff": "anti-joins between flashback reads",
+        "diff": ("DIFF TABLE per table (rows present on one side only, grouped by key; keyless or schema-differing tables skipped)"
+                 if SEEKDB_NATIVE_DIFF else "anti-joins between flashback reads"),
         "log": "SELECT from the _bb_commits bookkeeping table",
         "merge": ("MERGE TABLE ... STRATEGY OURS|THEIRS per table (no common ancestor)"
                   if SEEKDB_NATIVE_MERGE else "SQL three-way merge against the fork SCN"),
@@ -327,7 +335,6 @@ class SeekDBToolSuite(DBToolSuite):
         "reset": "rows restored with SQL from the flashback snapshot",
         "delete": "DROP DATABASE",
         "commit_refs": "flashback reads AS OF SNAPSHOT scn",
-        "schema_diff": "catalog columns of each ref compared by the adapter",
         "multi_ref_exec": "cross-database queries",
     }
 
@@ -593,9 +600,10 @@ class SeekDBToolSuite(DBToolSuite):
     def _snapshot_exists(self, state: _State, table: str):
         """True when the table can be read at the snapshot, False when it
         did not exist there, None when it existed (per the commit's
-        fingerprint) but its history is no longer readable: SeekDB raises
-        1412 for SCNs before an index build that followed row updates, and
-        that does not clear. Callers degrade for None."""
+        fingerprint) but its history cannot be read: SeekDB raises 1412 for
+        a flashback read planned through an index built after the snapshot
+        (``_State.src`` pins the primary key, so this is now only expected
+        while an index build is in progress). Callers degrade for None."""
         if not state.scn:
             return True
         expected = state.had_table(table)
@@ -604,7 +612,7 @@ class SeekDBToolSuite(DBToolSuite):
         deadline = time.monotonic() + (_UNREADABLE_WAIT_SEC if expected else 0)
         while True:
             try:
-                self._execute(f"SELECT 1 FROM {state.src(table)} LIMIT 1")
+                self._execute(f"SELECT 1 FROM {state.src(table)} s LIMIT 1")
                 return True
             except pymysql.MySQLError as e:
                 if not (e.args and e.args[0] == _ER_SNAPSHOT_BEFORE_TABLE):
@@ -744,6 +752,8 @@ class SeekDBToolSuite(DBToolSuite):
         ]
 
     def _diff_impl(self, ref_a: Ref, ref_b: Ref) -> dict:
+        if SEEKDB_NATIVE_DIFF:
+            return self._native_diff(ref_a, ref_b)
         a, b = self._state(ref_a), self._state(ref_b)
         tables_a = set(self._tables(a.db))
         tables_b = set(self._tables(b.db))
@@ -756,12 +766,12 @@ class SeekDBToolSuite(DBToolSuite):
                             "rows_modified": 0, "unreadable": True})
                 continue
             if in_a and not in_b:
-                n = self._execute(f"SELECT COUNT(*) FROM {a.src(table)}")[0][0]
+                n = self._execute(f"SELECT COUNT(*) FROM {a.src(table)} s")[0][0]
                 out.append({"table_name": table, "rows_added": 0, "rows_deleted": int(n),
                             "rows_modified": 0})
                 continue
             if in_b and not in_a:
-                n = self._execute(f"SELECT COUNT(*) FROM {b.src(table)}")[0][0]
+                n = self._execute(f"SELECT COUNT(*) FROM {b.src(table)} s")[0][0]
                 out.append({"table_name": table, "rows_added": int(n), "rows_deleted": 0,
                             "rows_modified": 0})
                 continue
@@ -803,25 +813,36 @@ class SeekDBToolSuite(DBToolSuite):
         but not in db are recreated."""
         here = set(self._tables(db))
         there = set(self._tables(target.db))
+        readd = []
         if target.schema is not None:
             there &= set(target.schema)
             # Upfront schema comparison: what the target had and the branch
-            # has since dropped cannot come back with its values (a
-            # re-added column or table is new to the engine; a flashback
-            # read returns NULL or nothing for it). Refuse before touching
-            # anything rather than restore NULLs or a half-reset branch.
-            lost = []
+            # has since dropped is new to the engine when it comes back,
+            # and a flashback read returns NULL for a re-added column
+            # (probed 2026-10-17). A dropped column is re-added with its
+            # recorded type and its rows come back NULL, which the
+            # scenario's checks then report (S5.4); a dropped table has no
+            # recorded definition beyond its columns and is refused.
+            lost, readd = [], []
             for table, fp in target.schema.items():
                 if table not in here:
                     if target.db == db or table not in set(self._tables(target.db)):
                         lost.append(f"table {table}")
                     continue
                 now = {col for col, _, _, _ in self._columns(db, table)}
-                lost += [f"{table}.{c}" for c in fp if c not in now]
+                types = fp if isinstance(fp, dict) else {}
+                for c in fp:
+                    if c not in now:
+                        if types.get(c):
+                            readd.append((table, c, types[c]))
+                        else:
+                            lost.append(f"{table}.{c}")
             if lost:
-                raise self._unsupported("restore to a state before a dropped column or table",
+                raise self._unsupported("restore to a state before a dropped table",
                                         "flashback versions rows under the current schema only; dropped since "
                                         f"the target and not restorable: {', '.join(lost)}")
+            for table, col, ctype in readd:
+                self._execute(f"ALTER TABLE {_qt(db, table)} ADD COLUMN {_quote(col)} {ctype} NULL")
         dropped, restored, created, skipped = [], [], [], []
         retyped: dict = {}
         for table in sorted(here | there):
@@ -861,7 +882,8 @@ class SeekDBToolSuite(DBToolSuite):
             for col, ctype in cols:
                 self._execute(f"ALTER TABLE {_qt(db, table)} MODIFY {_quote(col)} {ctype}")
         return {"restored": restored, "dropped": dropped, "created": created,
-                "not_restored": skipped}
+                "not_restored": skipped,
+                "readded_columns_null": [f"{t}.{c}" for t, c, _ in readd]}
 
     def _restore_table(self, db: str, table: str, target: _State) -> None:
         cols_here = [c[0] for c in self._columns(db, table)]
@@ -1105,7 +1127,7 @@ class SeekDBToolSuite(DBToolSuite):
             return base.src(table), "exact"
         if readable is None and base.alt is not None and self._snapshot_exists(base.alt, table):
             return base.alt.src(table), "fallback"
-        return f"(SELECT * FROM {theirs_expr} WHERE 1 = 0)", ("none" if readable is None else "absent")
+        return f"(SELECT * FROM {theirs_expr} z WHERE 1 = 0)", ("none" if readable is None else "absent")
 
     def _apply_theirs(self, ours_db, table, theirs, cols, pk, tag_t, tag_c):
         keys_t = _qt(ours_db, KEYS_TABLE)
@@ -1139,7 +1161,7 @@ class SeekDBToolSuite(DBToolSuite):
             f"LEFT JOIN {B} b ON {self._key('b', pk)} = c.k "
             f"LEFT JOIN {O} o ON {self._key('o', pk)} = c.k "
             f"LEFT JOIN {T} t ON {self._key('t', pk)} = c.k "
-            f"WHERE c.tag = %s AND c.tbl = %s LIMIT {_CONFLICT_ROW_LIMIT}", (tag_c, table))
+            f"WHERE c.tag = %s AND c.tbl = %s", (tag_c, table))
         names = [f"base_{c}" for c in cols] + [f"our_{c}" for c in cols] + [f"their_{c}" for c in cols]
         out = []
         for r in rows or []:
@@ -1271,6 +1293,70 @@ class SeekDBToolSuite(DBToolSuite):
             "merged_tables": merged,
             "skipped_tables": skipped,
             "native": True,
+        }
+
+    def _native_diff(self, ref_a: Ref, ref_b: Ref) -> dict:
+        """Native-only mode: SeekDB's ``DIFF TABLE b AGAINST a`` per
+        table, which lists every row present on one side only, tagged with
+        its side; rows are grouped by primary key into added (b only),
+        deleted (a only) and modified (both). A commit ref is read through
+        the database that materialises it (a fork restored to the commit).
+        DIFF TABLE refuses keyless tables and differing schemas; those
+        tables are skipped with a warning, as the native merge does."""
+        db_a = self._temp_db_for(ref_a) if ref_a.commit else self._db_for(ref_a.branch)
+        db_b = self._temp_db_for(ref_b) if ref_b.commit else self._db_for(ref_b.branch)
+        tables_a, tables_b = set(self._tables(db_a)), set(self._tables(db_b))
+        out = []
+        for table in sorted(tables_a | tables_b):
+            if table in tables_a and table not in tables_b:
+                n = self._execute(f"SELECT COUNT(*) FROM {_qt(db_a, table)}")[0][0]
+                out.append({"table_name": table, "rows_added": 0, "rows_deleted": int(n), "rows_modified": 0})
+                continue
+            if table in tables_b and table not in tables_a:
+                n = self._execute(f"SELECT COUNT(*) FROM {_qt(db_b, table)}")[0][0]
+                out.append({"table_name": table, "rows_added": int(n), "rows_deleted": 0, "rows_modified": 0})
+                continue
+            pk = self._pk(db_a, table)
+            reason = None if pk else "no primary key"
+            rows, cols = [], []
+            if not reason:
+                try:
+                    with self.conn.cursor() as cur:
+                        cur.execute(f"DIFF TABLE {_qt(db_b, table)} AGAINST {_qt(db_a, table)}")
+                        cols = [d[0] for d in cur.description]
+                        rows = cur.fetchall()
+                except pymysql.MySQLError as e:
+                    code = e.args[0] if e.args else None
+                    if code == _ER_SCHEMA_MISMATCH:
+                        reason = "schemas differ between the sides"
+                    elif code == _ER_NO_PRIMARY_KEY:
+                        reason = "no primary key"
+                    else:
+                        raise
+            if reason:
+                if (table, reason) not in self._merge_skip_warned:
+                    self._merge_skip_warned.add((table, reason))
+                    print(f"Warning: SeekDB DIFF TABLE skips table '{table}' ({reason})")
+                out.append({"table_name": table, "rows_added": 0, "rows_deleted": 0,
+                            "rows_modified": 0, "skipped": reason})
+                continue
+            kpos = [cols.index(c) for c in pk]
+            b_tag = f"{db_b}.{table}"
+            sides: dict = {}
+            for r in rows:
+                side = str(r[0], "utf-8") if isinstance(r[0], (bytes, bytearray)) else str(r[0])
+                key = tuple(r[i] for i in kpos)
+                sides.setdefault(key, set()).add("b" if side == b_tag else "a")
+            added = sum(1 for v in sides.values() if v == {"b"})
+            deleted = sum(1 for v in sides.values() if v == {"a"})
+            modified = sum(1 for v in sides.values() if v == {"a", "b"})
+            out.append({"table_name": table, "rows_added": added, "rows_deleted": deleted,
+                        "rows_modified": modified})
+        return {
+            "tables": out,
+            "rows_added": sum(t["rows_added"] for t in out),
+            "rows_deleted": sum(t["rows_deleted"] for t in out),
+            "rows_modified": sum(t["rows_modified"] for t in out),
         }
 
     def _native_conflicts(self, source_db: str, target_db: str, table: str):

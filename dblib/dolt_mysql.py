@@ -225,6 +225,8 @@ class DoltMySQLToolSuite(DBToolSuite):
             "rows_modified": sum(t.get("rows_modified") or 0 for t in tables),
         }
 
+    SCHEMA_DIFF_HALF = "native"   # dolt_schema_diff
+
     def _schema_diff_impl(self, ref_a: Ref, ref_b: Ref) -> dict:
         """dolt_schema_diff names the tables whose schema differs (added,
         dropped or changed); the column detail of changed tables comes from
@@ -271,22 +273,30 @@ class DoltMySQLToolSuite(DBToolSuite):
         rows = self._execute('SELECT `table` FROM dolt_conflicts;')
         return [r[0] for r in rows or []]
 
+    def _conflict_row_count(self) -> int:
+        """Conflicting rows over every table of the working set: the count
+        the other backends report as ``conflicts`` (Dolt's own number is
+        per merge or per replayed commit)."""
+        rows = self._execute("SELECT COALESCE(SUM(num_conflicts), 0) FROM dolt_conflicts;")
+        return int(rows[0][0]) if rows else 0
+
     def _schema_conflicts(self) -> list:
         rows = self._execute(
             "SELECT table_name, description FROM dolt_schema_conflicts;"
         )
         return [{"table": r[0], "description": r[1]} for r in rows or []]
 
-    def _conflict_rows(self, table: str, limit: int = 1000) -> list:
-        return self._rows_as_dicts(
-            f"SELECT * FROM dolt_conflicts_{table} LIMIT {int(limit)};"
-        )
+    def _conflict_rows(self, table: str) -> list:
+        """Every conflict row: a resolve callable must see them all, or the
+        rows it never saw keep the working set's stale version."""
+        return self._rows_as_dicts(f"SELECT * FROM dolt_conflicts_{table};")
 
     def _resolve_conflicts(self, ref: Ref, on_conflict) -> dict:
         """Resolve the data conflicts in the working set per on_conflict.
         Returns {"conflict_tables", "resolved", "resolution"}."""
         tables = self._conflict_tables()
-        info = {"conflict_tables": tables, "resolved": "", "resolution": None}
+        info = {"conflict_tables": tables, "resolved": "", "resolution": None,
+                "conflict_rows": self._conflict_row_count()}
         if not tables:
             return info
         if callable(on_conflict):
@@ -400,7 +410,7 @@ class DoltMySQLToolSuite(DBToolSuite):
     def _rebase_impl(self, ref: Ref, onto: Ref, on_conflict="ours") -> dict:
         self._on(ref)
         self._allow_conflicts()
-        info = {"conflicts": 0, "conflict_tables": [], "resolved": "",
+        info = {"conflicts": 0, "conflict_rows": 0, "conflict_tables": [], "resolved": "",
                 "up_to_date": False}
         # dolt_rebase refuses to start with uncommitted changes.
         self._execute("CALL DOLT_ADD('-A');")
@@ -436,6 +446,7 @@ class DoltMySQLToolSuite(DBToolSuite):
                     raise RuntimeError(f"schema conflict; rebase aborted: {e}")
                 resolved = self._resolve_conflicts(ref, on_conflict)
                 info["conflicts"] += 1
+                info["conflict_rows"] += resolved.get("conflict_rows", 0)
                 info["conflict_tables"] = sorted(
                     set(info["conflict_tables"]) | set(resolved["conflict_tables"])
                 )

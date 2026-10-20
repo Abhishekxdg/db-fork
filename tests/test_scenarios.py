@@ -1,8 +1,9 @@
-"""Every scenario runs end to end on the fake backend (branch, commit,
-log, diff, reset and delete only). Merge, rebase and revert come back
-UNSUPPORTED, so these runs check the "never stop the workload" contract:
-the lifecycle completes, unsupported verbs are recorded, and the
-invariants that depend on them are marked not applicable."""
+"""Every scenario runs on the fake backend (branch, commit, log, diff,
+reset and delete only). Merge, rebase and revert come back UNSUPPORTED,
+so these runs check the support contract: a scenario that needs none of
+them completes with every check passed; one that does ends at its first
+unsupported verb with UnsupportedOperationAbort, the verb recorded in the
+support summary and named in the context, and no failed check."""
 
 import pytest
 from google.protobuf import text_format
@@ -10,7 +11,8 @@ from google.protobuf import text_format
 from dblib import result_collector as rc
 from macrobench import schema, task_pb2 as tp
 from macrobench.datagen.ch import CHScale, seed_ch
-from macrobench.scenarios import InvariantRecorder, ScenarioContext, create_scenario
+from macrobench.scenarios import (InvariantRecorder, ScenarioContext, UnsupportedOperationAbort,
+                                  create_scenario)
 from tests.fake_backend import FakeSuite
 
 MINI_SCHEMA = ("schema { base: CH_BENCH scale_factor: 1 items: 60 customers_per_district: 10 "
@@ -41,7 +43,7 @@ CONFIGS = {
     "data_agent": MINI_SCHEMA + """
         workload { branch_ops { commit_interval: 1 }
                    data_ops { statements_per_step: 2 rows_per_write: 2 write_fraction: 0.8 }
-                   data_agent { batches: 2 concurrent_batches: 1 batch_rows: 4 days_back: 2 steps_per_batch: 2 reset_prob: 1.0 } }""",
+                   data_agent { batches: 2 concurrent_batches: 1 batch_rows: 4 days_back: 2 steps_per_batch: 2 resets_per_batch: 1 } }""",
 }
 
 NEEDS_MERGE = {"context_mgmt", "multi_agent", "dev_agent", "data_agent"}
@@ -70,18 +72,22 @@ def test_scenario_runs_to_completion_on_fake_backend(key):
     scenario.seed(suite)
     suite.commit("main", "seed", timed=False)
 
-    scenario.run()  # must not raise
-
-    support = collector.support_summary()
-    summary = inv.summary()
     if key in NEEDS_MERGE:
+        with pytest.raises(UnsupportedOperationAbort):
+            scenario.run()
+        support = collector.support_summary()
+        summary = inv.summary()
         assert support["workflow_supported"] is False
-        assert any(op.startswith(("MERGE", "REBASE")) for op in support["unsupported_ops"])
-        assert summary["not_applicable"] >= 1
+        assert any(op.startswith(("MERGE", "REBASE", "REVERT")) for op in support["unsupported_ops"])
+        assert ctx.unsupported_abort.split(":")[0] in ("MERGE", "REBASE", "REVERT"), ctx.unsupported_abort
+        assert ctx.stop_event.is_set()
     else:
+        scenario.run()  # must not raise
+        support = collector.support_summary()
+        summary = inv.summary()
         assert support["workflow_supported"] is True, support
-        assert summary["failed"] == 0, summary["results"]
+        assert ctx.unsupported_abort == ""
         assert summary["passed"] >= 1
+        # Every branch the scenario made was deleted again.
+        assert suite.list_branches() == ["main"], suite.list_branches()
     assert summary["failed"] == 0, [r for r in summary["results"] if r["passed"] is False]
-    # Every branch the scenario made was deleted again.
-    assert suite.list_branches() == ["main"], suite.list_branches()

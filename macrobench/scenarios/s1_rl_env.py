@@ -8,6 +8,13 @@ the group is done, a cross-branch read scores every leaf on the TPC-C
 consistency conditions, each leaf is diffed against the task commit for
 collateral change, and the task's branches are deleted.
 
+Parallelism is two-level, as in a GRPO rollout loop: ``worker_threads``
+tasks run at once (a batch of prompts), and within a task the group is
+sampled in rounds of ``rollouts_per_round`` rollouts that run concurrently
+on an inner pool, each on its own connection. Fork points for a round are
+chosen before it starts, so a round forks from earlier rounds' commits but
+not its own. Live rollout branches = worker_threads x rollouts_per_round.
+
 Sentinels (item rows at reserved ids): 100000+t is written in the task
 state and never touched; 200000+t gets a rollout-specific price on every
 path; task B must not see task A's rows.
@@ -22,11 +29,13 @@ delete-plus-add some backends report for a repair's update of a row in a
 table without a primary key; S1.5 the schema diff of a leaf against the
 commit it forked from reports exactly the DDL the rollout ran (the
 repair_audit table when the rollout started from the task commit, else
-the note_<step> columns it added; indexes are not part of a schema diff).
+the note_<step> columns it added; indexes are not part of the schema half of a diff).
 """
 
+import random
+
 from macrobench import faults
-from macrobench.scenarios.base import Scenario, Worker, register
+from macrobench.scenarios.base import Scenario, ScenarioStopped, Worker, register
 
 KEEP_SENTINEL_BASE = 100_000
 PATH_SENTINEL_BASE = 200_000
@@ -45,6 +54,10 @@ class RlEnvScenario(Scenario):
         p = self.params
         if p.tasks <= 0 or p.group_size <= 0 or p.step_budget <= 0:
             raise ValueError("rl_env needs tasks, group_size and step_budget > 0")
+        if p.group_size > 32:
+            raise ValueError("rl_env group_size must be <= 32 (a GRPO group); raise tasks instead")
+        if p.rollouts_per_round > p.group_size:
+            raise ValueError("rl_env rollouts_per_round must be <= group_size")
 
     def total_units(self) -> int:
         return self.params.tasks * (1 + self.params.group_size)
@@ -99,7 +112,11 @@ class RlEnvScenario(Scenario):
         task_ref = f"{task_branch}@{task_commit}" if task_commit else task_branch
         ctx.tick()
 
-        # 2. Rollouts. recorded = [(ref, step)] of every committed step.
+        # 2. Rollouts, in rounds. recorded = [(ref, step)] of every committed
+        # step so far; the rollouts of one round are sampled concurrently on
+        # an inner pool (GRPO samples a group in parallel from one policy
+        # snapshot), each from a fork point chosen before the round starts,
+        # so a round can fork from earlier rounds' paths but not from its own.
         recorded = [(task_ref, 0)]
         leaves = []          # (branch, final price of the path sentinel)
         steps_total = 0
@@ -108,6 +125,7 @@ class RlEnvScenario(Scenario):
         rollout = 0
         while len(leaves) < p.group_size:
             ctx.check_stop()
+            plan = []
             for _ in range(min(per_round, p.group_size - len(leaves))):
                 rollout += 1
                 fork_ref, fork_step = recorded[0]
@@ -116,43 +134,28 @@ class RlEnvScenario(Scenario):
                 if forkable and rng.random() < p.historical_fork_prob:
                     fork_ref, fork_step = rng.choice(forkable)
                     historical += 1
-                branch = f"task_{task_id}_r{rollout}"
-                res = ctx.branch(suite, branch, fork_ref, label="rollout_branch")
-                if not res.ok:
-                    ctx.note(f"[T{task_id}] rollout branch {branch}: {res.status_name} {res.error}")
-                    ctx.tick()
+                plan.append((rollout, fork_ref, fork_step))
+
+            def run_rollout(rw: Worker, item, task_id=task_id, task_ref=task_ref,
+                            fault=fault, fw=fw, fd=fd, fault_state=fault_state):
+                return self._run_rollout(rw, task_id, item, fault, fw, fd, fault_state)
+
+            results = ctx.run_workers(plan, run_rollout, threads=len(plan),
+                                      thread_base=1000 * task_id)
+            for item, r in zip(plan, results):
+                if not isinstance(r, dict):
+                    if isinstance(r, ScenarioStopped):
+                        raise r
+                    ctx.tick()      # the pool already noted the exception
                     continue
-                price = round(rollout * 1.25, 2)
-                budget = p.step_budget - fork_step
-                # Stock rows this path has updated, inherited from the fork
-                # point (the parent's rows up to that step).
-                touched = set(self._touched_steps.get((fork_ref.split("@")[0], fork_step), set()))
-                repair_at = rng.randint(1, max(1, budget)) if rng.random() < 0.5 else None
-                table_added, cols_added, leaf_ref = False, [], branch
-                for i in range(budget):
-                    ctx.check_stop()
-                    step = fork_step + i + 1
-                    script, keys, ddl = self._step_script(task_id, rollout, step, i == 0, price,
-                                                          fault, fw, fd, fault_state,
-                                                          repair=(repair_at == i + 1), rng=rng,
-                                                          create_audit=(fork_step == 0))
-                    res = w.exec(script, branch, label="rollout_step")
-                    if res.ok:
-                        touched |= keys
-                        if ddl and ddl[0] == "table":
-                            table_added = True
-                        elif ddl and ddl[0] == "column":
-                            cols_added.append(ddl[1])
-                    steps_total += 1
-                    if ctx.should_commit(i, last_step=(i == budget - 1)):
-                        c = w.commit(branch, f"rollout {rollout} step {step}", label="step_commit")
-                        if c.ok and c.value:
-                            recorded.append((f"{branch}@{c.value}", step))
-                            self._touched_steps[(branch, step)] = set(touched)
-                            leaf_ref = f"{branch}@{c.value}"
-                self._touched[branch] = len(touched)
-                self._ddl[branch] = (fork_ref, leaf_ref, table_added, cols_added)
-                leaves.append((branch, price))
+                steps_total += r["steps"]
+                recorded.extend(r["recorded"])
+                with ctx._lock:
+                    self._touched_steps.update(r["touched_steps"])
+                    self._touched[r["branch"]] = r["touched"]
+                    self._ddl[r["branch"]] = r["ddl"]
+                if r["leaf"]:
+                    leaves.append(r["leaf"])
                 ctx.tick()
 
         # 3. Score the group: cross-branch consistency read + diff per leaf.
@@ -172,24 +175,77 @@ class RlEnvScenario(Scenario):
             "mean_reward": (sum(rewards) / len(rewards)) if rewards else 0.0,
         }
 
+    def _run_rollout(self, w: Worker, task_id: int, item, fault, fw: int, fd: int,
+                     fault_state: dict) -> dict:
+        """One rollout of a task on its own worker: branch from the fork
+        point, run the remaining step budget with a commit per
+        commit_interval, and return what the task thread needs to record.
+        The rng is seeded per (task, rollout) so the path does not depend
+        on which thread runs it."""
+        ctx, p = self.ctx, self.params
+        rollout, fork_ref, fork_step = item
+        rng = random.Random(ctx.seed * 7919 + task_id * 1000 + rollout)
+        suite = w.suite
+        branch = f"task_{task_id}_r{rollout}"
+        res = ctx.branch(suite, branch, fork_ref, label="rollout_branch")
+        if not res.ok:
+            ctx.note(f"[T{task_id}] rollout branch {branch}: {res.status_name} {res.error}")
+            return {"branch": branch, "leaf": None, "steps": 0, "recorded": [],
+                    "touched_steps": {}, "touched": 0, "ddl": (fork_ref, branch, False, [])}
+        price = round(rollout * 1.25, 2)
+        budget = p.step_budget - fork_step
+        # Stock rows this path has updated, inherited from the fork point
+        # (the parent's rows up to that step).
+        with ctx._lock:
+            touched = set(self._touched_steps.get((fork_ref.split("@")[0], fork_step), set()))
+        repair_at = rng.randint(1, max(1, budget)) if rng.random() < 0.5 else None
+        table_added, cols_added, leaf_ref = False, [], branch
+        recorded, touched_steps, steps = [], {}, 0
+        for i in range(budget):
+            ctx.check_stop()
+            step = fork_step + i + 1
+            script, keys, ddl = self._step_script(task_id, rollout, step, i == 0, price,
+                                                  fault, fw, fd, fault_state,
+                                                  repair=(repair_at == i + 1), rng=rng,
+                                                  create_audit=(fork_step == 0))
+            res = w.exec(script, branch, label="rollout_step")
+            if res.ok:
+                touched |= keys
+                if ddl and ddl[0] == "table":
+                    table_added = True
+                elif ddl and ddl[0] == "column":
+                    cols_added.append(ddl[1])
+            steps += 1
+            if ctx.should_commit(i, last_step=(i == budget - 1)):
+                c = w.commit(branch, f"rollout {rollout} step {step}", label="step_commit")
+                if c.ok and c.value:
+                    recorded.append((f"{branch}@{c.value}", step))
+                    touched_steps[(branch, step)] = set(touched)
+                    leaf_ref = f"{branch}@{c.value}"
+        return {"branch": branch, "leaf": (branch, price), "steps": steps,
+                "recorded": recorded, "touched_steps": touched_steps,
+                "touched": len(touched), "ddl": (fork_ref, leaf_ref, table_added, cols_added)}
+
     # ------------------------------------------------------------------
 
     def _check_schema_diff(self, w: Worker, fork_ref: str, leaf_ref: str, branch: str,
                            table_added: bool, cols_added: list) -> None:
-        """S1.5: the schema diff from the fork point to the leaf lists
-        exactly the rollout's DDL: the repair_audit table if this rollout
-        created it (its columns are then not listed separately), otherwise
-        the note_<step> columns it added; nothing dropped or retyped."""
+        """S1.5: the schema half of a diff from the fork point to the leaf
+        lists exactly the rollout's DDL: the repair_audit table if this
+        rollout created it (its columns are then not listed separately),
+        otherwise the note_<step> columns it added; nothing dropped or
+        retyped. An engine diff that covers rows only (no schema in the
+        result) fails the check."""
         ctx, inv = self.ctx, self.ctx.invariants
         name = f"S1.5 schema diff of {branch} against its fork point reports the rollout's DDL"
-        sd = ctx.retry(lambda: w.suite.schema_diff(fork_ref, leaf_ref, label="schema_diff"))
-        if sd.unsupported:
-            inv.not_applicable(name, f"schema diff unsupported: {sd.error[:80]}")
-            return
+        sd = ctx.retry(lambda: w.suite.diff(fork_ref, leaf_ref, label="fork_diff"))
         if not sd.ok or not isinstance(sd.value, dict):
-            inv.check(name, False, f"schema diff failed: {sd.error[:100]}")
+            inv.check(name, False, f"diff failed: {sd.error[:100]}")
             return
-        v = sd.value
+        v = sd.value.get("schema")
+        if not isinstance(v, dict):
+            inv.check(name, False, "the diff reports no schema (rows only)")
+            return
         want_tables = ["repair_audit"] if table_added else []
         want_cols = [] if table_added else sorted(cols_added)
         got_cols = sorted(v.get("columns_added", {}).get("repair_audit", []))

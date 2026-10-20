@@ -7,6 +7,7 @@ from macrobench.scenarios.base import (  # noqa: F401
     Scenario,
     ScenarioContext,
     ScenarioStopped,
+    UnsupportedOperationAbort,
     Worker,
     create_scenario,
     register,
