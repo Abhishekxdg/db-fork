@@ -520,6 +520,28 @@ assert.deepEqual(classNodes(macroEl('macro-breakdowns'), 'breakdown-title').map(
         for (const m of rest.matchAll(literal)) report(file, rest, m.index, m[0], '');
     }
     assert.deepEqual(offences, [], `Color literals outside :root:\n${offences.join('\n')}`);
+    assert.doesNotMatch(arch, /--preset=full|<sys>\s+<machine>|\bProject=BranchBench(?!Leaderboard)\b|\.phase-pill/,
+        'architecture.html must match real CLI syntax, AWS tags, and CSS selectors');
+    assert.match(arch, /Chronos/, 'architecture.html must list Chronos among self-hosted engines');
+    const svgBody = arch.match(/<svg[\s\S]*?<\/svg>/)[0];
+    const rects = [...svgBody.matchAll(/<rect\b([^>]*)\/>/g)].map(([, a]) => {
+        const num = k => Number(a.match(new RegExp(`\\b${k}="([^"]+)"`))?.[1] ?? NaN);
+        return {x: num('x'), y: num('y'), w: num('width'), h: num('height')};
+    }).filter(r => Number.isFinite(r.x) && r.w < 1100);
+    const decodeEntities = s => s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCodePoint(parseInt(h, 16)));
+    const overflows = [];
+    for (const [, a, raw] of svgBody.matchAll(/<text\b([^>]*)>([\s\S]*?)<\/text>/g)) {
+        const tx = Number(a.match(/\bx="([^"]+)"/)?.[1] ?? NaN), ty = Number(a.match(/\by="([^"]+)"/)?.[1] ?? NaN);
+        const cls = a.match(/\bclass="([^"]+)"/)?.[1] ?? '';
+        const text = decodeEntities(raw.replace(/<[^>]+>/g, '').trim());
+        const candidates = rects.filter(r => tx >= r.x && tx <= r.x + r.w && ty >= r.y && ty <= r.y + r.h).sort((u, v) => (u.w * u.h) - (v.w * v.h));
+        if (!candidates.length) continue;
+        const box = candidates[0];
+        const charW = cls.includes('svg-mono') ? 6.4 : cls.includes('svg-node-title') ? 6.8 : cls.includes('svg-group-title') ? 7.2 : 5.9;
+        const estW = text.length * charW;
+        if ((tx - box.x) + estW > box.w - 6) overflows.push(`"${text}" (${Math.round((tx - box.x) + estW)}px > ${box.w}px)`);
+    }
+    assert.deepEqual(overflows, [], `SVG text overflows in architecture.html:\n${overflows.join('\n')}`);
 }
 
 

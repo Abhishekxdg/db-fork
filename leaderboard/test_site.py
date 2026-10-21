@@ -610,12 +610,27 @@ class AwsAlphaLifecycle(Board):
         elif (svc, op) == ("s3api", "create-bucket"):
             bname = tokens[tokens.index("--bucket") + 1]
             self.cloud["buckets"].add(bname)
+            self.cloud.setdefault("bucket_tags", {})[bname] = [
+                {"Key": "Project", "Value": "BranchBenchLeaderboard"},
+                {"Key": "Phase", "Value": "alpha"},
+                {"Key": "Stack", "Value": "branchbench-alpha"},
+            ]
             out = json.dumps({"Location": f"/{bname}"})
+        elif (svc, op) == ("s3api", "get-bucket-tagging"):
+            bname = tokens[tokens.index("--bucket") + 1]
+            tags = self.cloud.get("bucket_tags", {}).get(bname)
+            if tags is None:
+                rc = 1
+            else:
+                out = json.dumps({"TagSet": tags})
         elif (svc, op) == ("s3api", "list-object-versions"):
             out = json.dumps({"Versions": [{"Key": "index.html", "VersionId": "v1"}], "DeleteMarkers": []})
         elif (svc, op) == ("s3api", "delete-bucket"):
             bname = tokens[tokens.index("--bucket") + 1]
-            self.cloud["buckets"].discard(bname)
+            if bname in self.cloud.get("fail_delete_buckets", set()):
+                rc = 1
+            else:
+                self.cloud["buckets"].discard(bname)
         elif (svc, op) == ("s3", "presign"):
             out = "https://s3.amazonaws.com/presigned/index.html"
         return subprocess.CompletedProcess(cmd, rc, stdout=out, stderr="")
@@ -721,6 +736,65 @@ class AwsAlphaLifecycle(Board):
         self.assertEqual(len(ssh_rsync_calls), 4, "wait for bootstrap, rsync up, ssh worker run, rsync pull")
         self.assertTrue((self.site / "alpha" / "data.js").is_file(), "--collapse-after keeps local .site/alpha while tearing down AWS")
         self.assertFalse((self.runs / "aws_alpha_state.json").exists(), "AWS state is collapsed after the run")
+        self.assertEqual(self.cloud["sgs"], [])
+        self.assertEqual(self.cloud["buckets"], set())
+
+    def test_foreign_or_untagged_bucket_is_refused(self):
+        aws = self.aws_alpha.AwsCli(region="us-east-1", runner=self.fake_aws_runner)
+        self.cloud["buckets"].add("foreign-prod-bucket")
+        self.cloud.setdefault("bucket_tags", {})["foreign-prod-bucket"] = [
+            {"Key": "Project", "Value": "OtherApp"},
+            {"Key": "Phase", "Value": "prod"},
+        ]
+        with self.assertRaisesRegex(self.aws_alpha.AlphaError, "refusing to modify or delete pre-existing S3 bucket"):
+            self.aws_alpha.up_alpha(
+                aws=aws,
+                stack="branchbench-alpha",
+                bucket="foreign-prod-bucket",
+                runs_dir=self.runs,
+                http_getter=lambda _url: "203.0.113.9",
+            )
+        self.assertIn("foreign-prod-bucket", self.cloud["buckets"])
+
+    def test_collapse_after_runs_on_failure_and_stdin_carries_secrets(self):
+        import os
+        import subprocess
+        from unittest import mock
+
+        self.write(self.payload())
+        aws = self.aws_alpha.AwsCli(region="us-east-1", runner=self.fake_aws_runner)
+        self.aws_alpha.up_alpha(
+            aws=aws,
+            stack="branchbench-alpha",
+            runs_dir=self.runs,
+            http_getter=lambda _url: "203.0.113.9",
+        )
+        captured_calls = []
+
+        def failing_on_pull(cmd: list[str], **kwargs):
+            captured_calls.append((cmd, kwargs))
+            if len(captured_calls) == 4:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="pull failed")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with mock.patch.dict(os.environ, {"NEON_API_KEY_ORG": "super-secret-neon-key"}):
+            with self.assertRaisesRegex(self.aws_alpha.AlphaError, "failed to pull results"):
+                self.aws_alpha.run_alpha_benchmarks(
+                    aws=aws,
+                    stack="branchbench-alpha",
+                    preset="mini",
+                    lane="macro",
+                    systems="dolt",
+                    collapse_after=True,
+                    board=self.board,
+                    runs_dir=self.runs,
+                    cmd_runner=failing_on_pull,
+                )
+        ssh_cmd, ssh_kwargs = captured_calls[2]
+        self.assertIn("--lane macro", " ".join(ssh_cmd))
+        self.assertNotIn("super-secret-neon-key", " ".join(ssh_cmd), "secret must not appear in ssh argv")
+        self.assertIn("super-secret-neon-key", ssh_kwargs.get("input", ""), "secret is passed via ssh stdin")
+        self.assertFalse((self.runs / "aws_alpha_state.json").exists(), "collapse_after ran in finally despite pull failure")
         self.assertEqual(self.cloud["sgs"], [])
         self.assertEqual(self.cloud["buckets"], set())
 

@@ -77,7 +77,7 @@
 
                         <rect class="node-accent" x="752" y="52" width="336" height="86" rx="8"/>
                         <text class="node-title" x="766" y="73">Official Cloud Batch (phase=prod)</text>
-                        <text class="node-mono" x="766" y="92">aws_worker.sh --systems all --preset full</text>
+                        <text class="node-mono" x="766" y="92">aws_worker.sh --machine &lt;id&gt; --preset full</text>
                         <text class="node-sub" x="766" y="109">1 shared NVMe VM · sequential DB batch</text>
                         <text class="node-sub" x="766" y="125">No phase badge · publish.json allowlist only</text>
 
@@ -136,8 +136,8 @@
 
                         <rect class="node-card" x="588" y="352" width="242" height="88" rx="8"/>
                         <text class="node-title" x="600" y="373">6 Stateful Agent Workflows</text>
-                        <text class="node-mono" x="600" y="391">rl_env · context_mgmt · multi_agent</text>
-                        <text class="node-mono" x="600" y="408">dev_agent · ops_agent · data_agent</text>
+                        <text class="node-mono" x="600" y="391">rl_env · context · multi_agent</text>
+                        <text class="node-mono" x="600" y="408">dev_agent · ops_agent · data</text>
                         <text class="node-sub" x="600" y="425">1 isolated subprocess per scenario</text>
 
                         <path class="edge" d="M 830 396 H 846" marker-end="url(#mk-ink)"/>
@@ -145,7 +145,7 @@
                         <rect class="node-card" x="846" y="352" width="242" height="88" rx="8"/>
                         <text class="node-title" x="858" y="373">Campaign &amp; Attempt Evidence</text>
                         <text class="node-sub" x="858" y="391">9 Git-like verbs + SQL work units</text>
-                        <text class="node-mono" x="858" y="408">campaign_&lt;id&gt;.json + 6 bb_&lt;id&gt;.json</text>
+                        <text class="node-mono" x="858" y="408">campaign_&lt;id&gt; + 6 bb_&lt;id&gt;.json</text>
                         <text class="node-mono" x="858" y="425">&lt;sys&gt;/macro/YYYYMMDD/*.json</text>
 
                         <!-- Connectors Stage 3 <-> Stage 4 -->
@@ -161,12 +161,12 @@
                         <text class="lane-kicker" x="58" y="505">STAGE 4 · PLUGGABLE SYSTEM ADAPTERS (leaderboard/&lt;system&gt;/) &amp; dblib CONNECTOR API</text>
 
                         <rect class="node-code" x="32" y="516" width="516" height="58" rx="8"/>
-                        <text class="node-title-inv" x="46" y="538">Self-Hosted Engines ("hosted": "no" — Dolt, Doltgres, Postgres, Kpg)</text>
-                        <text class="node-mono-inv" x="46" y="557">Lifecycle hooks: install → start → check → CONNECTOR → stop + drop DB</text>
+                        <text class="node-title-inv" x="46" y="538">Self-Hosted (Dolt, Doltgres, SeekDB, MO, FILE_COPY, Chronos)</text>
+                        <text class="node-mono-inv" x="46" y="557">Hooks: install → start → check → CONNECTOR → delete DB → stop</text>
 
                         <rect class="node-code" x="572" y="516" width="516" height="58" rx="8"/>
-                        <text class="node-title-inv" x="586" y="538">Managed Cloud Services ("hosted": "yes" — Neon, Tiger Cloud, Xata)</text>
-                        <text class="node-mono-inv" x="586" y="557">preflight() API key check · --client-location · SQL rtt_ms probe · microbench</text>
+                        <text class="node-title-inv" x="586" y="538">Managed Cloud ("hosted": "yes" · Neon, Tiger Cloud, Xata)</text>
+                        <text class="node-mono-inv" x="586" y="557">preflight() key check · --client-location · SQL rtt_ms probe</text>
 
                         <!-- Connectors Stage 4 -> Stage 5 -->
                         <path class="edge-accent" d="M 290 586 V 614" marker-end="url(#mk-accent)"/>
@@ -198,10 +198,10 @@
 
                         <rect class="node-accent" x="732" y="648" width="356" height="106" rx="8"/>
                         <text class="node-title" x="746" y="669">Atomic Site Assembler (site.py → .site/)</text>
-                        <text class="node-mono" x="746" y="688">local → .site/local/ (+ mock + run.html + badge)</text>
-                        <text class="node-mono" x="746" y="705">alpha → .site/alpha/ (real runs + alpha badge)</text>
-                        <text class="node-mono" x="746" y="722">prod  → .site/prod/  (publish.json, no badge)</text>
-                        <text class="node-sub" x="746" y="739">Browser UI (app.js, macro.js, micro.js) renders boards</text>
+                        <text class="node-mono" x="746" y="688">local → .site/local/ (mock + wizard + badge)</text>
+                        <text class="node-mono" x="746" y="705">alpha → .site/alpha/ (real + alpha badge)</text>
+                        <text class="node-mono" x="746" y="722">prod → .site/prod/ (publish.json, no badge)</text>
+                        <text class="node-sub" x="746" y="739">Browser UI (app.js, macro.js, micro.js)</text>
                     </svg>
                 </div>
 
@@ -255,7 +255,7 @@
                         <!-- Step 4 -->
                         <rect class="node-card" x="686" y="24" width="192" height="92" rx="8"/>
                         <text class="node-title" x="700" y="47">4. Teardown &amp; Verify</text>
-                        <text class="node-mono" x="700" y="66">cleanup_database() + stop</text>
+                        <text class="node-mono" x="700" y="66">verified_cleanup() + stop</text>
                         <text class="node-sub" x="700" y="84">Verify DB deleted &amp; server</text>
                         <text class="node-sub" x="700" y="100">stopped; unlink journal file</text>
 
@@ -272,9 +272,9 @@
                         <path class="edge-bad" d="M 338 116 V 150 H 782 M 560 116 V 174 M 782 116 V 150" marker-end="url(#mk-bad)"/>
 
                         <rect class="node-bad" x="210" y="174" width="700" height="72" rx="8"/>
-                        <text class="node-bad-ink" x="226" y="197">Fail-Closed Error &amp; Teardown Path (timeout, SQL error, dirty cleanup, or SIGKILL)</text>
-                        <text class="node-mono" x="226" y="216">Executes stop hook + cleanup_database() in finally block · writes {"error": "&lt;reason&gt;"} or campaign aborted</text>
-                        <text class="node-sub" x="226" y="233">Surfaced under "Runs without a result" in UI · refused by site.py in prod if listed in publish.json</text>
+                        <text class="node-bad-ink" x="226" y="197">Fail-Closed Error &amp; Teardown Bus (timeout, SQL error, dirty cleanup, SIGINT/SIGTERM)</text>
+                        <text class="node-mono" x="226" y="216">Runs delete() + stop hook in finally · writes {"error": ...} or campaign aborted</text>
+                        <text class="node-sub" x="226" y="233">SIGKILL / power loss recovered on next run in Step 1 · refused by site.py in prod</text>
                     </svg>
                 </div>
 
@@ -332,11 +332,11 @@
                 <dl class="rule-list">
                     <div>
                         <dt>One-Command Lifecycle</dt>
-                        <dd><code>./leaderboard/aws_alpha.sh {up,run,deploy-site,status,collapse}</code> (backed by <code>python -m leaderboard.aws_alpha</code>) tags every provisioned AWS resource with <code>Project=BranchBench</code>, <code>Phase=alpha</code>, and <code>Stack=&lt;stack&gt;</code>, recording state in <code>leaderboard/.runs/aws_alpha_state.json</code>.</dd>
+                        <dd><code>./leaderboard/aws_alpha.sh {up,run,deploy-site,status,collapse}</code> (backed by <code>python -m leaderboard.aws_alpha</code>) tags every provisioned AWS resource with <code>Project=BranchBenchLeaderboard</code>, <code>Phase=alpha</code>, and <code>Stack=&lt;stack&gt;</code>, recording state in <code>leaderboard/.runs/aws_alpha_state.json</code>.</dd>
                     </div>
                     <div>
                         <dt>Provision &amp; Execute</dt>
-                        <dd><code>up</code> provisions a Spot <code>i4i.2xlarge</code> Ubuntu 24.04 runner with local NVMe formatted as XFS (<code>reflink=1</code> for Kpg copy-on-write cloning), a Caller-IP-only (<code>/32</code>) SSH Security Group, and a private S3 bucket (<code>BlockPublicAcls=true</code>). <code>run</code> syncs the repo over SSH and invokes <code>leaderboard/aws_worker.sh</code> with <code>LEADERBOARD_PHASE=alpha</code>.</dd>
+                        <dd><code>up</code> provisions a Spot <code>i4i.2xlarge</code> Ubuntu 24.04 runner with local NVMe formatted as XFS (<code>reflink=1</code> for PostgreSQL <code>FILE_COPY</code> cloning), a Caller-IP-only (<code>/32</code>) SSH Security Group, and a private S3 bucket (<code>BlockPublicAcls=true</code>) protected by bucket-tag ownership checks. <code>run</code> syncs tracked repository sources over SSH, passes hosted DB credentials via encrypted SSH <code>stdin</code>, invokes <code>leaderboard/aws_worker.sh</code>, pulls results, and runs <code>python -m leaderboard.site --phase alpha</code>.</dd>
                     </div>
                     <div>
                         <dt>Real Runs Without Mock Rows</dt>
@@ -344,7 +344,7 @@
                     </div>
                     <div>
                         <dt>Complete Collapse to Zero Cost</dt>
-                        <dd><code>./leaderboard/aws_alpha.sh collapse</code> discovers resources by both local state and AWS tags, terminates the EC2 runner, deletes any leftover EBS volumes, security groups, and key pairs, empties and deletes the S3 bucket (unless <code>--keep-bucket</code> is passed), and removes local state and PEM files.</dd>
+                        <dd><code>./leaderboard/aws_alpha.sh collapse</code> discovers resources by both local state and AWS tags, terminates the EC2 runner, deletes any leftover EBS volumes, security groups, and key pairs, verifies ownership tags before emptying and deleting the S3 bucket (unless <code>--keep-bucket</code> is passed), and removes local state and PEM files once every deletion succeeds.</dd>
                     </div>
                 </dl>
             </section>
@@ -359,7 +359,7 @@
                     </div>
                     <div>
                         <dt>Economic Single-VM Sequential Batch (<code>aws_worker.sh</code>)</dt>
-                        <dd>In official AWS production, <code>./leaderboard/aws_worker.sh --systems all --preset full --publish</code> runs all database adapters sequentially on one shared bare-NVMe instance (such as <code>i4i.2xlarge</code>) under <code>batch.lock</code> and <code>run.lock</code>. Between engines, the worker stops systemd services, runs the adapter's <code>stop</code> hook, syncs filesystems, and drops Linux page cache (<code>/proc/sys/vm/drop_caches = 3</code>) so every database gets 100% of the machine with identical hardware provenance.</dd>
+                        <dd>In official AWS production, <code>./leaderboard/aws_worker.sh --machine &lt;id&gt; --preset full</code> runs all database adapters sequentially on one shared bare-NVMe instance (such as <code>i4i.2xlarge</code>) under <code>batch.lock</code> and <code>run.lock</code>. Before and between engines, the worker checks that conflicting systemd units are inactive, runs the adapter's <code>stop</code> hook, calls <code>os.sync()</code>, and verifies host cleanliness (no live server PID, no listening port, and no leftover recovery journal) so every database gets 100% of the machine with identical hardware provenance.</dd>
                     </div>
                     <div>
                         <dt>Managed Cloud Services</dt>
@@ -400,7 +400,7 @@
                             </tr>
                             <tr>
                                 <th scope="row">Header Phase Badge</th>
-                                <td><strong>None</strong> (<code>#phase-badge</code> removed from DOM)</td>
+                                <td><strong>None</strong> (<code>.phase-badge</code> removed from DOM)</td>
                                 <td>Compact amber <code>ALPHA</code> pill badge</td>
                                 <td>Compact mint <code>LOCAL</code> pill badge</td>
                             </tr>

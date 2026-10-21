@@ -165,9 +165,17 @@ systemctl disable --now unattended-upgrades apt-daily.timer apt-daily-upgrade.ti
 
 apt-get update -y
 apt-get install -y --no-install-recommends \\
-  ca-certificates curl git jq rsync build-essential pkg-config \\
+  ca-certificates curl git jq rsync build-essential pkg-config gnupg lsb-release \\
   protobuf-compiler xfsprogs nvme-cli docker.io \\
-  mysql-client postgresql-client postgresql
+  mysql-client
+
+install -d /usr/share/postgresql-common/pgdg
+curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+codename="$(lsb_release -cs)"
+echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${codename}-pgdg main" \\
+  >/etc/apt/sources.list.d/pgdg.list
+apt-get update -y
+apt-get install -y --no-install-recommends postgresql-18 postgresql-client-18
 
 for unit in postgresql mysql mariadb; do
   systemctl disable --now "$unit" >/dev/null 2>&1 || true
@@ -451,6 +459,30 @@ def ensure_security_group(aws: AwsCli, stack: str, ssh_cidr: str, vpc_id: str = 
     return sg_id
 
 
+def verify_bucket_ownership(aws: AwsCli, stack: str, bucket: str) -> None:
+    """Refuse to overwrite, sync-delete, or destroy a pre-existing bucket unless its tags prove alpha stack ownership."""
+    try:
+        tag_resp = aws.call_json(["s3api", "get-bucket-tagging", "--bucket", bucket])
+    except AlphaError as exc:
+        raise AlphaError(
+            f"refusing to modify or delete pre-existing S3 bucket {bucket!r}: cannot verify ownership tags ({exc})"
+        ) from exc
+    tags = {
+        str(item.get("Key") or ""): str(item.get("Value") or "")
+        for item in (tag_resp.get("TagSet") or [])
+        if isinstance(item, dict)
+    }
+    if (
+        tags.get("Phase") != "alpha"
+        or tags.get("Stack") != stack
+        or tags.get("Project") not in ("BranchBenchLeaderboard", "branchbench")
+    ):
+        raise AlphaError(
+            f"refusing to modify or delete pre-existing S3 bucket {bucket!r}: "
+            f"bucket tags {tags!r} do not match Phase=alpha, Stack={stack!r}"
+        )
+
+
 def ensure_bucket(aws: AwsCli, stack: str, bucket: str, public_site: bool = False) -> str:
     if not BUCKET_RE.fullmatch(bucket):
         raise AlphaError(f"invalid S3 bucket name {bucket!r}")
@@ -462,6 +494,8 @@ def ensure_bucket(aws: AwsCli, stack: str, bucket: str, public_site: bool = Fals
                 ["--create-bucket-configuration", f"LocationConstraint={aws.region}"]
             )
         aws.call_json(create_args)
+    else:
+        verify_bucket_ownership(aws, stack, bucket)
     tagging = (
         "TagSet=["
         "{Key=Project,Value=BranchBenchLeaderboard},"
@@ -573,12 +607,42 @@ def up_alpha(
         )
 
     resolved_ami = resolve_ubuntu_ami(aws, ami_id)
+    state: dict[str, Any] = {
+        "phase": "alpha",
+        "stack": stack,
+        "region": aws.region,
+        "account_id": ident["account_id"],
+        "caller_arn": ident["arn"],
+        "instance_id": "",
+        "instance_type": instance_type,
+        "ami_id": resolved_ami,
+        "spot": spot,
+        "public_ip": "",
+        "ssh_cidr": cidr,
+        "security_group_id": "",
+        "key_name": "",
+        "key_path": "",
+        "bucket": "",
+        "public_site": public_site,
+        "machine": machine_label,
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+
     key_name, pem_path = ensure_key_pair(aws, stack, runs_dir)
+    state["key_name"] = key_name
+    state["key_path"] = str(pem_path)
+    save_state(state, runs_dir, stack)
+
     sg_id = ensure_security_group(aws, stack, cidr, vpc_id=vpc_id)
+    state["security_group_id"] = sg_id
+    save_state(state, runs_dir, stack)
+
     bucket_name = ""
     if not no_bucket:
         target_bucket = bucket.strip() or default_bucket_name(stack, ident["account_id"], aws.region)
         bucket_name = ensure_bucket(aws, stack, target_bucket, public_site=public_site)
+        state["bucket"] = bucket_name
+        save_state(state, runs_dir, stack)
 
     runs_dir.mkdir(parents=True, exist_ok=True)
     ud_path = runs_dir / f"{stack}-userdata.sh"
@@ -635,32 +699,14 @@ def up_alpha(
     if not inst_list or not inst_list[0].get("InstanceId"):
         raise AlphaError("ec2 run-instances returned no InstanceId")
     instance_id = str(inst_list[0]["InstanceId"])
+    state["instance_id"] = instance_id
+    save_state(state, runs_dir, stack)
 
     aws.call_text(["ec2", "wait", "instance-running", "--instance-ids", instance_id])
     desc = aws.call_json(["ec2", "describe-instances", "--instance-ids", instance_id])
     inst_info = ((desc.get("Reservations") or [{}])[0].get("Instances") or [{}])[0]
     public_ip = str(inst_info.get("PublicIpAddress") or "")
-
-    state = {
-        "phase": "alpha",
-        "stack": stack,
-        "region": aws.region,
-        "account_id": ident["account_id"],
-        "caller_arn": ident["arn"],
-        "instance_id": instance_id,
-        "instance_type": instance_type,
-        "ami_id": resolved_ami,
-        "spot": spot,
-        "public_ip": public_ip,
-        "ssh_cidr": cidr,
-        "security_group_id": sg_id,
-        "key_name": key_name,
-        "key_path": str(pem_path),
-        "bucket": bucket_name,
-        "public_site": public_site,
-        "machine": machine_label,
-        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-    }
+    state["public_ip"] = public_ip
     save_state(state, runs_dir, stack)
     print(
         f"alpha stack {stack!r} is UP in {aws.region}: instance={instance_id} ip={public_ip} "
@@ -698,6 +744,7 @@ def deploy_alpha_site(
         raise AlphaError(
             f"no alpha S3 bucket recorded for stack {stack!r}; pass --bucket <name> or run 'up' without --no-bucket"
         )
+    verify_bucket_ownership(aws, stack, target_bucket)
     aws.call_text(
         [
             "s3",
@@ -735,8 +782,12 @@ def deploy_alpha_site(
     if website_url:
         print(f"Public alpha URL: {website_url}", flush=True)
     elif presigned_url:
-        print(f"Presigned index.html URL (1h): {presigned_url}", flush=True)
-    print("Or preview locally with: python -m leaderboard.serve --phase alpha", flush=True)
+        print(
+            f"Presigned index.html object URL (1h, single object only; relative CSS/JS require local serve or --public-site): "
+            f"{presigned_url}",
+            flush=True,
+        )
+    print("Serve the full multi-asset alpha site locally with: python -m leaderboard.serve --phase alpha", flush=True)
     return result
 
 
@@ -779,10 +830,8 @@ def run_alpha_benchmarks(
         "--batch-deadline-min",
         f"{batch_deadline_min:g}",
     ]
-    if lane == "micro":
-        worker_cmd.append("--skip-macro")
-    elif lane == "macro":
-        worker_cmd.append("--skip-micro")
+    if lane in ("micro", "macro"):
+        worker_cmd.extend(["--lane", lane])
     if systems.strip():
         worker_cmd.extend(["--systems", systems.strip()])
     if client_location.strip():
@@ -818,76 +867,92 @@ def run_alpha_benchmarks(
     ssh_target = f"ubuntu@{public_ip}"
     ssh_rsh = f"ssh {' '.join(shlex.quote(o) for o in ssh_opts)}"
 
-    # 1. Wait for cloud-init bootstrap marker on the worker
-    wait_cmd = [
-        "ssh",
-        *ssh_opts,
-        ssh_target,
-        "for i in $(seq 1 90); do [ -f /var/lib/branchbench-alpha-ready ] && exit 0; sleep 5; done; exit 1",
-    ]
-    if cmd_runner(wait_cmd).returncode != 0:
-        raise AlphaError(f"timed out waiting for cloud-init bootstrap (/var/lib/branchbench-alpha-ready) on {ssh_target}")
+    try:
+        # 1. Wait for cloud-init bootstrap marker on the worker (with SSH connection retry)
+        wait_cmd = [
+            "ssh",
+            *ssh_opts,
+            "-o",
+            "ConnectionAttempts=10",
+            ssh_target,
+            "for i in $(seq 1 90); do [ -f /var/lib/branchbench-alpha-ready ] && exit 0; sleep 5; done; exit 1",
+        ]
+        if cmd_runner(wait_cmd).returncode != 0:
+            raise AlphaError(
+                f"timed out waiting for cloud-init bootstrap (/var/lib/branchbench-alpha-ready) on {ssh_target}"
+            )
 
-    # 2. Sync repository to worker
-    sync_up = [
-        "rsync",
-        "-az",
-        "--delete",
-        "--exclude=.git/objects/pack/*.tmp",
-        "--exclude=.venv",
-        "--exclude=leaderboard/.site",
-        "--exclude=leaderboard/.runs",
-        "-e",
-        ssh_rsh,
-        f"{ROOT}/",
-        f"{ssh_target}:~/db-fork/",
-    ]
-    if cmd_runner(sync_up).returncode != 0:
-        raise AlphaError(f"failed to rsync repository to {ssh_target}:~/db-fork/")
+        # 2. Sync repository to worker (excluding gitignored/untracked secrets and local runtime state)
+        sync_up = [
+            "rsync",
+            "-az",
+            "--delete",
+            "--filter=:- .gitignore",
+            "--exclude=.git/objects/pack/*.tmp",
+            "--exclude=.venv",
+            "--exclude=.env",
+            "--exclude=.env.*",
+            "--exclude=*.pem",
+            "--exclude=*.key",
+            "--exclude=credentials*",
+            "--exclude=run_stats",
+            "--exclude=*_stats/",
+            "--exclude=leaderboard/.site",
+            "--exclude=leaderboard/.runs",
+            "-e",
+            ssh_rsh,
+            f"{ROOT}/",
+            f"{ssh_target}:~/db-fork/",
+        ]
+        if cmd_runner(sync_up).returncode != 0:
+            raise AlphaError(f"failed to rsync repository to {ssh_target}:~/db-fork/")
 
-    # 3. Execute benchmark batch on worker
-    env_exports = [
-        f"export {k}={shlex.quote(os.environ[k])}"
-        for k in HOSTED_ENV_KEYS
-        if os.environ.get(k)
-    ]
-    remote_script = " && ".join(
-        [
+        # 3. Execute benchmark batch on worker (pass hosted DB secrets over encrypted SSH stdin, never in argv)
+        env_stdin = "".join(
+            f"export {k}={shlex.quote(os.environ[k])}\n"
+            for k in HOSTED_ENV_KEYS
+            if os.environ.get(k)
+        )
+        remote_steps = [
             'export PATH="$HOME/.local/bin:$PATH"',
-            *env_exports,
+            *(["eval \"$(cat)\""] if env_stdin else []),
             "cd ~/db-fork",
             "uv sync --frozen",
             "uv run --frozen python build_protos.py",
             shlex.join(worker_cmd),
         ]
-    )
-    run_res = cmd_runner(["ssh", *ssh_opts, ssh_target, f"bash -lc {shlex.quote(remote_script)}"])
+        remote_script = " && ".join(remote_steps)
+        ssh_run_cmd = ["ssh", *ssh_opts, ssh_target, f"bash -lc {shlex.quote(remote_script)}"]
+        if env_stdin:
+            run_res = cmd_runner(ssh_run_cmd, input=env_stdin, text=True)
+        else:
+            run_res = cmd_runner(ssh_run_cmd)
 
-    # 4. Pull results and macro records back to local leaderboard/ even if a benchmark step failed
-    pull_cmd = [
-        "rsync",
-        "-az",
-        "--include=*/",
-        "--include=*/results/***",
-        "--include=*/macro/***",
-        "--exclude=*",
-        "-e",
-        ssh_rsh,
-        f"{ssh_target}:~/db-fork/leaderboard/",
-        f"{board}/",
-    ]
-    if cmd_runner(pull_cmd).returncode != 0:
-        raise AlphaError(f"failed to pull results from {ssh_target}")
+        # 4. Pull results and macro records back to local leaderboard/ even if a benchmark step failed
+        pull_cmd = [
+            "rsync",
+            "-az",
+            "--include=*/",
+            "--include=*/results/***",
+            "--include=*/macro/***",
+            "--exclude=*",
+            "-e",
+            ssh_rsh,
+            f"{ssh_target}:~/db-fork/leaderboard/",
+            f"{board}/",
+        ]
+        if cmd_runner(pull_cmd).returncode != 0:
+            raise AlphaError(f"failed to pull results from {ssh_target}")
 
-    # 5. Build local leaderboard/.site/alpha
-    site.assemble("alpha", board)
-    if deploy_site_after and state.get("bucket"):
-        deploy_alpha_site(aws=aws, stack=stack, board=board, runs_dir=runs_dir)
+        # 5. Build local leaderboard/.site/alpha
+        site.assemble("alpha", board)
+        if deploy_site_after and state.get("bucket"):
+            deploy_alpha_site(aws=aws, stack=stack, board=board, runs_dir=runs_dir)
 
-    if collapse_after:
-        collapse_alpha(aws=aws, stack=stack, board=board, runs_dir=runs_dir, keep_local_site=True)
-
-    return run_res.returncode
+        return run_res.returncode
+    finally:
+        if collapse_after:
+            collapse_alpha(aws=aws, stack=stack, board=board, runs_dir=runs_dir, keep_local_site=True)
 
 
 def status_alpha(
@@ -943,10 +1008,11 @@ def status_alpha(
     return report
 
 
-def _empty_and_delete_bucket(aws: AwsCli, bucket: str) -> None:
+def _empty_and_delete_bucket(aws: AwsCli, bucket: str, stack: str = DEFAULT_STACK) -> bool:
     head = aws.call_text(["s3api", "head-bucket", "--bucket", bucket], check=False)
     if head.returncode != 0:
-        return
+        return True
+    verify_bucket_ownership(aws, stack, bucket)
     aws.call_text(["s3", "rm", f"s3://{bucket}", "--recursive"], check=False)
     versions = aws.call_json(["s3api", "list-object-versions", "--bucket", bucket])
     objs = [
@@ -961,7 +1027,8 @@ def _empty_and_delete_bucket(aws: AwsCli, bucket: str) -> None:
             ["s3api", "delete-objects", "--bucket", bucket, "--delete", batch],
             check=False,
         )
-    aws.call_text(["s3api", "delete-bucket", "--bucket", bucket])
+    del_res = aws.call_text(["s3api", "delete-bucket", "--bucket", bucket], check=False)
+    return del_res.returncode == 0
 
 
 def collapse_alpha(
@@ -1015,25 +1082,56 @@ def collapse_alpha(
         ]
     )
     volume_ids = [str(v["VolumeId"]) for v in (vol_resp.get("Volumes") or []) if v.get("VolumeId")]
+    deleted_volumes: list[str] = []
+    remaining_volumes: list[str] = []
     for vid in volume_ids:
-        aws.call_text(["ec2", "delete-volume", "--volume-id", vid], check=False)
+        if aws.call_text(["ec2", "delete-volume", "--volume-id", vid], check=False).returncode == 0:
+            deleted_volumes.append(vid)
+        else:
+            remaining_volumes.append(vid)
 
+    deleted_sgs: list[str] = []
+    remaining_sgs: list[str] = []
     for sg_id in discovered["security_groups"]:
-        aws.call_text(["ec2", "delete-security-group", "--group-id", sg_id], check=False)
+        if aws.call_text(["ec2", "delete-security-group", "--group-id", sg_id], check=False).returncode == 0:
+            deleted_sgs.append(sg_id)
+        else:
+            remaining_sgs.append(sg_id)
 
     key_names = list(dict.fromkeys([*discovered["key_pairs"], f"{stack}-key"]))
+    deleted_keys: list[str] = []
+    remaining_keys: list[str] = []
     for kname in key_names:
-        aws.call_text(["ec2", "delete-key-pair", "--key-name", kname], check=False)
+        if aws.call_text(["ec2", "delete-key-pair", "--key-name", kname], check=False).returncode == 0:
+            deleted_keys.append(kname)
+        else:
+            remaining_keys.append(kname)
 
     deleted_bucket = None
+    remaining_bucket = discovered["bucket"] if keep_bucket else ""
     if not keep_bucket and discovered["bucket"]:
-        _empty_and_delete_bucket(aws, discovered["bucket"])
-        deleted_bucket = discovered["bucket"]
+        if _empty_and_delete_bucket(aws, discovered["bucket"], stack=stack):
+            deleted_bucket = discovered["bucket"]
+        else:
+            remaining_bucket = discovered["bucket"]
 
-    kpath.unlink(missing_ok=True)
-    if state.get("key_path"):
-        Path(str(state["key_path"])).unlink(missing_ok=True)
-    spath.unlink(missing_ok=True)
+    if not remaining_keys:
+        kpath.unlink(missing_ok=True)
+        if state.get("key_path"):
+            Path(str(state["key_path"])).unlink(missing_ok=True)
+
+    has_remaining = bool(remaining_volumes or remaining_sgs or remaining_keys or remaining_bucket)
+    if has_remaining:
+        updated = dict(state)
+        updated["instance_id"] = ""
+        updated["public_ip"] = ""
+        updated["security_group_id"] = remaining_sgs[0] if remaining_sgs else ""
+        updated["key_name"] = remaining_keys[0] if remaining_keys else ""
+        updated["bucket"] = remaining_bucket
+        save_state(updated, runs_dir, stack)
+    else:
+        spath.unlink(missing_ok=True)
+
     if not keep_local_site and alpha_site.is_dir() and not alpha_site.is_symlink():
         shutil.rmtree(alpha_site)
 
@@ -1043,18 +1141,18 @@ def collapse_alpha(
         "stack": stack,
         "region": aws.region,
         "terminated_instances": instance_ids,
-        "deleted_volumes": volume_ids,
-        "deleted_security_groups": discovered["security_groups"],
-        "deleted_key_pairs": key_names,
+        "deleted_volumes": deleted_volumes,
+        "deleted_security_groups": deleted_sgs,
+        "deleted_key_pairs": deleted_keys,
         "deleted_bucket": deleted_bucket,
         "local_alpha_site_removed": not keep_local_site and not alpha_site.exists(),
         "state_file_removed": not spath.exists(),
-        "ongoing_aws_cost": "$0.00/hr",
+        "ongoing_aws_cost": "$0.00/hr" if not has_remaining else "partial (see remaining resources)",
     }
     print(
         f"alpha stack {stack!r} collapsed in {aws.region}: "
-        f"terminated {len(instance_ids)} instance(s), deleted {len(discovered['security_groups'])} SG(s), "
-        f"bucket={deleted_bucket or '(kept/none)'}, ongoing AWS cost=$0.00/hr",
+        f"terminated {len(instance_ids)} instance(s), deleted {len(deleted_sgs)} SG(s), "
+        f"bucket={deleted_bucket or '(kept/none)'}, ongoing AWS cost={summary['ongoing_aws_cost']}",
         flush=True,
     )
     return summary
