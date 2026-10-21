@@ -444,7 +444,7 @@ function verbTable(campaigns) {
 // operations rather than in agent steps. Operation time adds up concurrent workers' calls, so only the share compares.
 function shareChart(campaigns) {
     const card = node('figure', 'panel dotplot-panel'), keys = Object.keys(SCENARIOS);
-    card.append(node('h3', '', 'Time in branch operations'), node('p', 'panel-note', 'Share of each completed workflow\'s operation time spent in branch operations; the rest is agent steps.'));
+    card.append(node('h3', '', 'Time in branch operations'), node('p', 'panel-note', 'Share of each completed workflow\'s successful operation time (branch verbs plus EXEC, including background traffic) spent in branch operations.'));
     const rows = keys.map(key => ({label: workflow(key).name, dots: campaigns.flatMap(c => {
         const counts = statusOf(c, key) === 'verified' && opCounts(c.attempts[key]);
         if (!counts) return [];

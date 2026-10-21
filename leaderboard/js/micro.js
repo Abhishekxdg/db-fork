@@ -98,11 +98,11 @@ function microContext(measured) {
 
 // One data table per hosting group: three category scores side by side, sorted by one score from its header, and the
 // row's Details in the last column. A score is shaded and its fastest marked only where at least two systems have one.
-function summaryTable(title, ctx) {
+function summaryTable(title, ctx, suffix = 'no') {
     const {measured, scores, ranks} = ctx, rank = ranks[state.sort], by = scores[state.sort];
     const order = sortedRows(by.scored.map(s => s.e), measured.filter(e => !rank.has(e)), state.sortDesc);
     const {table, body} = dataTable('board summary', `${title}: systems ranked by ${sortName(state.sort)} score, lower is better`, [colHead('System', 'system-col'),
-        ...Object.keys(SORTS).map(key => sortHeader(sortName(key), key === state.sort, state.sortDesc, descending => { state.sort = key; state.sortDesc = descending; writeHash(boardHash()); }, `sort-${key}-no`)), colHead(node('span', 'sr-only', 'Details'), 'action-col')]);
+        ...Object.keys(SORTS).map(key => sortHeader(sortName(key), key === state.sort, state.sortDesc, descending => { state.sort = key; state.sortDesc = descending; writeHash(boardHash()); }, `sort-${key}-${suffix}`)), colHead(node('span', 'sr-only', 'Details'), 'action-col')]);
     for (const e of order) {
         const tr = body.insertRow();
         const th = systemHeader(rank.get(e), e, nameOf(e), [e.machine, e.date]); tr.append(th);
@@ -125,7 +125,7 @@ function summaryTable(title, ctx) {
     }
     return table;
 }
-function heatmap(ctx) {
+function heatmap(ctx, suffix = 'no') {
     const {measured, best} = ctx, ranked = Object.values(VIEWS).flatMap(view => view.ranked(view.rows));
     const {table, body} = dataTable('heatmap', 'Operations measured workload timings', ['Workload', ...measured.map(e => {
         const identity = node('span', 'system-identity'); identity.append(systemIcon(e), node('span', 'system-name', measured.filter(x => x.system === e.system).length > 1 ? label(e) : e.system));
@@ -137,7 +137,7 @@ function heatmap(ctx) {
         if (row === suiteRows[3] || row === loadRow) tr.className = 'workload-divider';
         const link = node('a', 'workload-link', row.label); link.href = `#dataset?operation=${row.op}`;  // a workload's name leads to its definition
         if (VIEWS.data.rows.includes(row)) {
-            const box = node('input'); box.type = 'checkbox'; box.checked = state.ticked.has(row); box.id = `row-${suiteRows.indexOf(row)}-no`;
+            const box = node('input'); box.type = 'checkbox'; box.checked = state.ticked.has(row); box.id = `row-${suiteRows.indexOf(row)}-${suffix}`;
             box.setAttribute('aria-label', `Count ${row.label} in the reads & writes score`);
             if (box.checked && countedData().length === 1) { box.disabled = true; box.title = 'The score counts at least one workload'; }
             box.addEventListener('change', () => { box.checked ? state.ticked.add(row) : state.ticked.delete(row); writeHash(boardHash()); render(); el(box.id).focus(); });
@@ -217,11 +217,11 @@ function warmupChart(ctx) {
     return card;
 }
 // One board group inside the card: its heading, the ranking table, and a note for every score that could not be computed.
-function boardGroup(title, ctx) {
+function boardGroup(title, ctx, suffix = 'no') {
     const section = node('section', 'board-group'), heading = node('div', 'group-heading');
     heading.append(node('h2', '', title), node('span', 'group-count', `${plural(ctx.measured.length, 'system')} · ranked by ${sortName(state.sort)} · lower is better`));
     if (Object.values(ctx.scores).some(s => s.scored.length >= 2)) heading.append(heatKey('Shading: darker mint is closer to the best score in its column'));
-    section.append(heading, scrolling(summaryTable(title, ctx)));
+    section.append(heading, scrolling(summaryTable(title, ctx, suffix)));
     const notes = Object.entries(ctx.scores).flatMap(([key, result]) => [
         ...result.dropped.length ? [`${SORTS[key]}: no measurements for ${result.dropped.map(r => r.label).join(', ')}.`] : [],
         ...result.incomplete.map(({e, missing}) => `${nameOf(e)} has no ${SORTS[key]} score: missing ${missing.map(r => r.label).join(', ')}.`)]);
@@ -229,9 +229,9 @@ function boardGroup(title, ctx) {
     return section;
 }
 // The evidence behind a group's ranking, below the card: the workload heatmap beside the trade-off and warm-up plots.
-function breakdown(title, ctx, named) {
+function breakdown(title, ctx, named, suffix = 'no') {
     return breakdownSection(named ? title : null, 'Workload breakdown', 'Batch totals in seconds, shaded within each row. Tick read/write workloads to choose what the reads & writes score includes.',
-        heatmap(ctx), [tradeoffChart(ctx), warmupChart(ctx)]);
+        heatmap(ctx, suffix), [tradeoffChart(ctx), warmupChart(ctx)]);
 }
 
 // A system's details: why it sits where it does, every try, the environment, then provenance behind a disclosure.
@@ -375,9 +375,10 @@ function renderMicro() {
         title: profiles.length > 1 ? `Operations (${prof})` : 'Operations',
         ctx: microContext(shown.filter(e => (e.execution_profile || 'local_single_host') === prof)),
         named: profiles.length > 1,
+        suffix: prof === 'local_single_host' ? 'no' : `no-${prof}`,
     }));
-    el('groups').replaceChildren(...groups.map(g => boardGroup(g.title, g.ctx)));
-    el('breakdowns').replaceChildren(...groups.map(g => breakdown(g.title, g.ctx, g.named)));
+    el('groups').replaceChildren(...groups.map(g => boardGroup(g.title, g.ctx, g.suffix)));
+    el('breakdowns').replaceChildren(...groups.map(g => breakdown(g.title, g.ctx, g.named, g.suffix)));
     el('excluded').replaceChildren(...excluded.length ? [excludedPanel('excluded-panel', PHASE === 'prod' ? 'Runs without a result' : 'Excluded results',
         excluded.map(x => ({label: `${x.system} / ${x.machine}`, href: x.source, reason: x.reason})), !data.length)] : []);  // with no result at all, the reasons are the news
     renderOperations(groups);

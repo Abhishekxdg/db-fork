@@ -1230,6 +1230,15 @@ assert.deepEqual(grouped.byClass('hosting-badge').map(b => b.textContent), ['Sel
 assert.equal(classNodes(grouped.el('breakdowns'), 'heatmap').length, 1);
 assert.equal(classNodes(grouped.el('breakdowns'), 'breakdown-title').length, 0, 'Unified breakdown needs no group title');
 assert.equal(classNodes(grouped.el('operation-results'), 'result-group').length, 1, 'Operation times are shown in one unified list');
+{
+    const multiProf = mount([
+        {...entry('LocalHost', 1, []), execution_profile: 'local_single_host'},
+        {...entry('SingleVM', 2, []), execution_profile: 'economic_single_vm'},
+    ]);
+    assert.equal(multiProf.byClass('summary').length, 2, 'Distinct execution profiles render in separate micro tables');
+    multiProf.document.getElementById('sort-data-no-economic_single_vm').click();
+    assert.equal(multiProf.document.activeElement.id, 'sort-data-no-economic_single_vm', 'Focus stays on the second profile group sort button');
+}
 const zeroData = [entry('Zero', 1, []), entry('One', 1, []), entry('Missing', 1, [])];
 zeroData[0].result = suite.rows.map(() => [0, 0, 0]);
 zeroData[2].result = suite.rows.map(() => [null, null, null]);
