@@ -89,6 +89,10 @@ class Classifier(unittest.TestCase):
             "timed out": (good_evidence(timed_out=True, work={"expected": 8, "succeeded": 3, "failed": 0, "skipped": 0}), "timed_out"),
             "interrupted": (good_evidence(status="interrupted"), "timed_out"),
             "stalled operation": (good_evidence(status="incomplete"), "incomplete"),
+            "unsupported stop": (good_evidence(status="unsupported: MERGE: not implemented",
+                                               work={"expected": 8, "succeeded": 2, "failed": 0, "skipped": 0}), "incomplete"),
+            "native_only": (good_evidence(native_only=True), "incomplete"),
+            "bare unsupported": (good_evidence(status="unsupported:   "), "unverified"),
             "no status": ({k: v for k, v in good_evidence().items() if k != "status"}, "unverified"),
             "no work": ({k: v for k, v in good_evidence().items() if k != "work"}, "unverified"),
             "too much work": (good_evidence(work={"expected": 8, "succeeded": 9, "failed": 0, "skipped": 0}), "unverified"),
@@ -149,6 +153,7 @@ class Classifier(unittest.TestCase):
             "metrics list": {"metrics": [1]}, "metric fallbacks string": {"metrics": {"history_ref_fallbacks": "2"}},
             "implementation verbs list": {"implementation": {"verbs": ["merge"], "notes": {}}},
             "capabilities list": {"capabilities": ["merge"]},
+            "native_only string": {"native_only": "yes"},
         }
         for name, changes in shapes.items():
             with self.subTest(name):
@@ -414,6 +419,9 @@ class Contract(unittest.TestCase):
         same_system_other_version = copy.deepcopy(base)
         same_system_other_version["version"] = "9.9.9"
         self.assertEqual(build_macro.group_key(same_system_other_version), base["group"], "the system under test is per row, not per group")
+        native_mode = copy.deepcopy(base)
+        native_mode["attempts"]["rl_env"]["evidence"]["native_only"] = True
+        self.assertNotEqual(build_macro.group_key(native_mode), base["group"])
 
     def test_inconsistent_campaigns_fail_validation_not_cherry_picked(self):
         record = self.write_campaign(CAMPAIGN, ["rl_env", "ops_agent"])
@@ -790,14 +798,32 @@ class ChildProcess(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             outdir = Path(folder)
             real_run = subprocess.run
-            with mock.patch.object(run_macro, "GRACE", 0), mock.patch.object(run_macro.subprocess, "run") as spawn:
-                spawn.side_effect = lambda args, **kw: real_run(
+            log_during_child: list[bool] = []
+
+            def run_with_check(args, **kw):
+                log_during_child.append((outdir / "runner.log").exists())
+                return real_run(
                     [sys.executable, "-c", "import sys, time; print('uri mysql://root:@h/'); sys.stdout.flush(); time.sleep(5)"], **kw)
+
+            with mock.patch.object(run_macro, "GRACE", 0), mock.patch.object(run_macro.subprocess, "run") as spawn:
+                spawn.side_effect = run_with_check
                 child = run_macro.launch_child(outdir / "config.textproto", outdir, 1)
+            self.assertEqual(log_during_child, [False], "raw child output must stays in memory until scrubbed")
             self.assertEqual(child["ended"], "killed")
             self.assertIsNone(child["exit_code"])
             self.assertIn("root:***@", child["log_tail"])
             self.assertNotIn("root:@", child["log_tail"])
+            raw_log = (outdir / "runner.log").read_text()
+            self.assertIn("root:***@", raw_log)
+            self.assertNotIn("root:@", raw_log)
+            self.assertEqual((outdir / "runner.log").stat().st_mode & 0o777, 0o600)
+
+    def test_source_digest_is_checkout_path_independent(self):
+        with mock.patch.object(run_macro, "ROOT", Path("/tmp/checkout_a")):
+            digest_a = run_macro.source_digest({"files": {"/tmp/checkout_a/uv.lock": "abc", "/tmp/checkout_a/leaderboard/run.py": "def"}})
+        with mock.patch.object(run_macro, "ROOT", Path("/home/ubuntu/checkout_b")):
+            digest_b = run_macro.source_digest({"files": {"/home/ubuntu/checkout_b/uv.lock": "abc", "/home/ubuntu/checkout_b/leaderboard/run.py": "def"}})
+        self.assertEqual(digest_a, digest_b)
 
 
 if __name__ == "__main__":

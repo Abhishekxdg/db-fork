@@ -129,6 +129,11 @@ def published(board: Path, manifest: dict[str, list[str]]) -> tuple[list[dict], 
         if problems := validate(board / rel, board):
             raise SiteError(f"{rel}: invalid: {'; '.join(problems)}; an invalid record is never published")
     micro, excluded = build.build(board, sources=set(manifest["micro"]))
+    for field in ("commit", "lock_sha256", "python"):
+        if len({e[field] for e in micro}) > 1:
+            raise SiteError(f"publish.json: micro records mix different {field} values; official micro results must share one revision and runtime")
+    if len({e["machine"] for e in micro if e.get("hosted") == "no"}) > 1:
+        raise SiteError("publish.json: self-hosted micro records mix different machine labels; official self-hosted micro results must share one machine")
     campaigns, macro_excluded = build_macro.build(board, sources=set(manifest["macro"]))
     records = {c["source"]: c for c in campaigns}
     macro = []
@@ -139,6 +144,8 @@ def published(board: Path, manifest: dict[str, list[str]]) -> tuple[list[dict], 
         if records[rel]["preset"] != "full":
             raise SiteError(f"{rel}: a {records[rel]['preset']} campaign stays on the machine that ran it and is never published")
         macro.append(records[rel])
+    if len({c["group"] for c in macro if c.get("hosted") == "no"}) > 1:
+        raise SiteError("publish.json: macro campaigns mix different comparison groups; official macro campaigns must share one comparison group")
     return micro, excluded, macro, []
 
 

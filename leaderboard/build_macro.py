@@ -42,6 +42,7 @@ def group_key(campaign: dict) -> str:
                 "source_sha256": campaign["source_sha256"], "lock_sha256": campaign["lock_sha256"],
                 "python": campaign["python"], "platform": campaign["platform"], "machine": campaign["machine"],
                 "environment": campaign["environment"],
+                "native_only": any((a.get("evidence") or {}).get("native_only") is True for a in campaign["attempts"].values()),
                 "configs": {k: a["config_sha256"] for k, a in sorted(campaign["attempts"].items()) if a["config_sha256"]}}
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:12]
 

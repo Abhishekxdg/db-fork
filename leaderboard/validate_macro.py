@@ -72,7 +72,7 @@ CAMPAIGN_FIELDS = {
 ENVIRONMENT = ("cpu", "cpus", "memory_bytes")
 # What the page may see of the child's e2e stats. Paths, logs and Parquet stay private.
 EVIDENCE_KEYS = ("run_id", "backend", "scenario", "status", "elapsed_sec", "max_runtime_sec", "timed_out",
-                 "seed", "schema", "workload", "setup", "capabilities", "implementation", "invariants",
+                 "seed", "schema", "workload", "setup", "capabilities", "implementation", "native_only", "invariants",
                  "metrics", "work", "worker_errors", "failed_verbs", "workflow_supported", "unsupported_ops",
                  "op_status_counts", "commit_ref_fallbacks", "spine_load")
 SAMPLE = 400  # scrubbed() keeps at most this many entries of any list or dict
@@ -228,6 +228,7 @@ def evidence_problems(e: dict) -> list[str]:
     need(isinstance(e.get("capabilities", {}), dict) and isinstance(e.get("implementation", {}), dict)
          and all(isinstance(e.get("implementation", {}).get(k, {}), dict) for k in ("verbs", "notes")),
          "declared implementation is malformed")
+    need("native_only" not in e or isinstance(e["native_only"], bool), "native_only is not a boolean")
     return problems
 
 
@@ -252,10 +253,13 @@ def classify(evidence: dict | None, child: dict) -> tuple[str, list[str]]:
         return "unverified", problems
     status = evidence["status"]
     failed, incomplete = [], []
+    unsupported_stop = status.startswith("unsupported:") and bool(status.split(":", 1)[1].strip())
     if status.startswith(("setup_failed", "crashed", "invariant_failed")):
         failed.append(status[:300])
     elif status == "incomplete":  # the runner's stall watchdog cancelled an operation that never finished
         incomplete.append("an operation stalled and was cancelled before it finished")
+    elif unsupported_stop:
+        incomplete.append(status[:300])
     elif status not in ("completed", "interrupted"):
         return "unverified", [f"unknown status {status[:60]!r}"]
     if problem := setup_outcome(evidence["setup"]):
@@ -269,7 +273,7 @@ def classify(evidence: dict | None, child: dict) -> tuple[str, list[str]]:
         failed.append(f"{work['failed']} of {work['expected']} work units failed")
     if work["skipped"]:
         incomplete.append(f"{work['skipped']} of {work['expected']} work units skipped")
-    if done < work["expected"] and not timed_out:
+    if done < work["expected"] and not timed_out and not unsupported_stop:
         failed.append(f"only {done} of {work['expected']} work units finished")
     if errors := evidence["worker_errors"]:
         failed.append(f"{len(errors)} worker error{'s' if len(errors) > 1 else ''}: {errors[0]['error']}"[:300])
@@ -295,6 +299,8 @@ def classify(evidence: dict | None, child: dict) -> tuple[str, list[str]]:
         incomplete.append(f"{inv['not_applicable']} check{'s' if inv['not_applicable'] > 1 else ''} not applicable: " + "; ".join(names[:3]))
     if unsupported := evidence["unsupported_ops"]:
         incomplete.append("unsupported operations: " + ", ".join(u[:60] for u in unsupported[:5]))
+    if evidence.get("native_only"):
+        incomplete.append("native_only mode disabled composed operations")
     fallbacks = evidence["commit_ref_fallbacks"] + metrics.get("history_ref_fallbacks", 0)
     if fallbacks:
         incomplete.append(f"{fallbacks} history reference{'s' if fallbacks > 1 else ''} fell back to a branch head")

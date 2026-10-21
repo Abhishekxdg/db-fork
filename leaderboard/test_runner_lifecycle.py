@@ -44,6 +44,9 @@ class Recovery(unittest.TestCase):
             with mock.patch.object(Path, "unlink", side_effect=PermissionError("cannot unlink")):
                 self.assertIsInstance(runner.clean_up("dolt", server), PermissionError)
             self.assertTrue(path.exists())
+            server.exists.return_value = True
+            self.assertIsInstance(runner.clean_up("dolt", server), runner.RunError)
+            self.assertTrue(path.exists())
 
     def test_scopes_identify_actual_targets(self):
         for key, module, host in (
@@ -196,6 +199,20 @@ class RunLifecycle(unittest.TestCase):
         self.server.delete.assert_called_once()
         self.lifecycle.assert_called_once_with(self.board / "dolt", "stop")
         self.assertFalse((self.board / "dolt" / "results").exists())
+
+    def test_sigterm_cleans_up_without_publishing(self):
+        self.measure.side_effect = lambda *_: os.kill(os.getpid(), signal.SIGTERM)
+        with self.assertRaises(KeyboardInterrupt):
+            self.bench()
+        self.server.delete.assert_called_once()
+        self.lifecycle.assert_called_once_with(self.board / "dolt", "stop")
+        self.assertFalse((self.board / "dolt" / "results").exists())
+
+    def test_native_only_env_is_rejected_before_start(self):
+        with mock.patch.dict(os.environ, {"DBFORK_NATIVE_ONLY": "1"}):
+            with self.assertRaisesRegex(runner.RunError, "DBFORK_NATIVE_ONLY"):
+                self.bench()
+        self.start_server.assert_not_called()
 
     def test_hosted_timeout_overrides_existing_pgoptions(self):
         meta = json.loads(self.meta.read_text())

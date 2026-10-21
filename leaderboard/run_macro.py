@@ -144,17 +144,27 @@ def write_journal(system: str, record: dict) -> None:
 
 
 def launch_child(config: Path, outdir: Path, deadline_sec: int) -> dict:
-    """Run main's runner with its runtime cap; kill it if it outlives the cap plus grace."""
+    """Run main's runner with its runtime cap; scrub output in memory before writing to disk."""
     log = outdir / "runner.log"
-    with log.open("w") as handle:
+    raw = ""
+    try:
+        process = subprocess.run(
+            [sys.executable, "-m", "macrobench.runner", "--config", str(config), "--outdir", str(outdir),
+             "--no-progress", "--max-runtime-sec", str(deadline_sec)],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
+            timeout=deadline_sec + GRACE)
+        raw = process.stdout or ""
+        exit_code, ended = process.returncode, "exited"
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout or b""
+        raw = out.decode(errors="replace") if isinstance(out, bytes) else out
+        exit_code, ended = None, "killed"
+    finally:
         try:
-            process = subprocess.run(
-                [sys.executable, "-m", "macrobench.runner", "--config", str(config), "--outdir", str(outdir),
-                 "--no-progress", "--max-runtime-sec", str(deadline_sec)],
-                cwd=ROOT, stdout=handle, stderr=subprocess.STDOUT, timeout=deadline_sec + GRACE)
-            exit_code, ended = process.returncode, "exited"
-        except subprocess.TimeoutExpired:
-            exit_code, ended = None, "killed"
+            with open(log, "w", opener=lambda path, flags: os.open(path, flags, 0o600)) as handle:
+                handle.write(scrub(raw))
+        except OSError:
+            pass
     return {"exit_code": exit_code, "ended": ended, "error": None, "deadline_sec": deadline_sec, "log_tail": log_tail(outdir)}
 
 
@@ -218,8 +228,14 @@ def write_json(path: Path, payload: dict) -> Path:
 
 
 def source_digest(snapshot: dict) -> str:
-    """One digest for the exact source state, committed or not."""
-    return hashlib.sha256(json.dumps(sorted(snapshot["files"].items())).encode()).hexdigest()
+    """One digest for the exact source state, committed or not, normalized relative to the repository root."""
+    root = ROOT.resolve()
+    items = sorted(
+        (Path(k).resolve().relative_to(root).as_posix()
+         if Path(k).is_absolute() and Path(k).resolve().is_relative_to(root) else Path(k).as_posix(), v)
+        for k, v in snapshot["files"].items()
+    )
+    return hashlib.sha256(json.dumps(items).encode()).hexdigest()
 
 
 def provenance(snapshot: dict, env: dict) -> dict:
@@ -247,6 +263,8 @@ def attempt(system: str, server: Connector, key: str, campaign: dict, snapshot: 
     config_file.write_text(text_format.MessageToString(cfg))
     if (leftover := verified_cleanup(system, server))["status"] != "verified":
         raise RunError(f"cannot delete what an earlier run left behind: {leftover['detail']}")
+    if hasattr(server, "capture_prev_method"):
+        server.capture_prev_method()
     write_journal(system, {"run_id": run_id, "name": run_id, "scope": server.scope()})
     started = dt.datetime.now(dt.UTC)
     deadline_sec = int(deadline_min * 60)
@@ -296,6 +314,8 @@ def run(system: str, preset: str, keys: list[str], machine: str, out: Path, dead
         raise RunError(f"machine label {machine!r} must match {MACHINE_RE.pattern}")
     if not math.isfinite(deadline_min) or deadline_min <= 0:
         raise RunError("--deadline-min must be finite and greater than zero")
+    if os.environ.get("DBFORK_NATIVE_ONLY", "").lower() in ("1", "true", "yes"):
+        raise RunError("DBFORK_NATIVE_ONLY is set; unset it so every run uses the standard benchmark mode")
     server, sysdir = load_connector(system), BOARD / system
     meta = json.loads((sysdir / "system.json").read_text())
     if meta["hosted"] == "yes":
@@ -328,45 +348,46 @@ def run(system: str, preset: str, keys: list[str], machine: str, out: Path, dead
     abort = None
     print(f"campaign {campaign['id']}: {preset} preset, {len(keys)} workflows on {meta['system']}", flush=True)
     write_json(record_path, record)  # the campaign exists before any server or database does
-    try:
+    with micro.catch_sigterm():
         try:
-            micro.start_server(sysdir)
-        finally:  # start may have launched the server and then failed its check
-            record["server"]["started_here"] = pid_file(system).exists()
-        record["version"] = server.version()
-        for key in keys:
-            _, payload = attempt(system, server, key, campaign, snapshot, env, deadline_min, out, identity, record["version"])
-            published.append(payload)
-            record["attempts"][key] = payload["attempt_id"]
-            write_json(record_path, record)
-            if payload["child"]["ended"] == "interrupted":
-                raise KeyboardInterrupt
-            if payload["cleanup"]["status"] != "verified":
-                abort = f"stopped after {SCENARIOS[key]}: cleanup {payload['cleanup']['status']}"
-                break
-    except KeyboardInterrupt:
-        abort = "interrupted"
-        raise
-    except Exception as e:
-        abort = f"{type(e).__name__}: {(scrub(str(e)).splitlines() or [''])[0][:300]}" if not isinstance(e, RunError) else str(e)
-    finally:
-        if record["server"]["started_here"]:
             try:
-                with micro.bounded(micro.STOP_TIMEOUT, "server stop"):
-                    if not micro.lifecycle(sysdir, "stop"):
-                        raise RunError(f"{system}: the server did not stop")
-                record["server"]["stop"] = "stopped"
-            except Exception as e:
-                record["server"]["stop"] = "failed"
-                abort = abort or f"server stop failed: {scrub(str(e))[:200]}"
-        else:
-            record["server"]["stop"] = "not_started"
-        record["aborted"] = abort
-        record["finished"] = dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
-        record["source"]["changed_during_run"] = micro.source_snapshot(CODE_PATHS) != snapshot
-        write_json(record_path, record)
-        if abort:
-            print(f"campaign {campaign['id']} aborted: {abort}", file=sys.stderr, flush=True)
+                micro.start_server(sysdir)
+            finally:  # start may have launched the server and then failed its check
+                record["server"]["started_here"] = pid_file(system).exists()
+            record["version"] = server.version()
+            for key in keys:
+                _, payload = attempt(system, server, key, campaign, snapshot, env, deadline_min, out, identity, record["version"])
+                published.append(payload)
+                record["attempts"][key] = payload["attempt_id"]
+                write_json(record_path, record)
+                if payload["child"]["ended"] == "interrupted":
+                    raise KeyboardInterrupt
+                if payload["cleanup"]["status"] != "verified":
+                    abort = f"stopped after {SCENARIOS[key]}: cleanup {payload['cleanup']['status']}"
+                    break
+        except KeyboardInterrupt:
+            abort = "interrupted"
+            raise
+        except Exception as e:
+            abort = f"{type(e).__name__}: {(scrub(str(e)).splitlines() or [''])[0][:300]}" if not isinstance(e, RunError) else str(e)
+        finally:
+            if record["server"]["started_here"]:
+                try:
+                    with micro.bounded(micro.STOP_TIMEOUT, "server stop"):
+                        if not micro.lifecycle(sysdir, "stop"):
+                            raise RunError(f"{system}: the server did not stop")
+                    record["server"]["stop"] = "stopped"
+                except Exception as e:
+                    record["server"]["stop"] = "failed"
+                    abort = abort or f"server stop failed: {scrub(str(e))[:200]}"
+            else:
+                record["server"]["stop"] = "not_started"
+            record["aborted"] = abort
+            record["finished"] = dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
+            record["source"]["changed_during_run"] = micro.source_snapshot(CODE_PATHS) != snapshot
+            write_json(record_path, record)
+            if abort:
+                print(f"campaign {campaign['id']} aborted: {abort}", file=sys.stderr, flush=True)
     outcomes = [p["outcome"]["status"] for p in published]
     print(f"campaign {campaign['id']}: {len(published)} of {len(keys)} attempted, "
           f"{outcomes.count('verified')} verified, {len(keys) - len(published)} not run; {record_path}", flush=True)

@@ -475,6 +475,31 @@ class Manifest(Board):
         with self.assertRaisesRegex(site.SiteError, "sources changed during the run"):
             self.assemble("prod")
 
+    def test_mixed_micro_or_macro_provenance_is_rejected(self):
+        self.write(self.payload(), system="dolt")
+        for field, value in (("commit", "f" * 40), ("lock_sha256", "e" * 64), ("python", "3.12.0")):
+            with self.subTest(field=field):
+                self.write(self.payload(system="dolt_mysql", **{field: value}), system="dolt_mysql")
+                self.publish({"micro": ["dolt/results/20260930/box.json", "dolt_mysql/results/20260930/box.json"], "macro": []})
+                with self.assertRaisesRegex(site.SiteError, f"mix different {field}"):
+                    self.assemble("prod")
+        other_machine = self.board / "dolt_mysql" / "results" / "20260930" / "other.json"
+        other_machine.write_text(json.dumps(self.payload(system="dolt_mysql", machine="other")))
+        self.publish({"micro": ["dolt/results/20260930/box.json", "dolt_mysql/results/20260930/other.json"], "macro": []})
+        with self.assertRaisesRegex(site.SiteError, "mix different machine labels"):
+            self.assemble("prod")
+        c1 = self.write_campaign(dict(FULL), "1")
+        c2_meta = {**FULL, "id": "0000f0fe"}
+        c2_attempts = {}
+        for i, key in enumerate(c2_meta["scenarios"]):
+            aid = f"bb_2000000{i}"
+            c2_attempts[key] = aid
+            self.write_macro(attempt_payload(attempt_id=aid, scenario=key, campaign=c2_meta, date="2026-10-11", python="3.12.0"), day="20261011")
+        c2 = self.write_macro(campaign_record(**c2_meta, attempts=c2_attempts, python="3.12.0"), day="20261011")
+        self.publish({"micro": [], "macro": [c1, c2]})
+        with self.assertRaisesRegex(site.SiteError, "mix different comparison groups"):
+            self.assemble("prod")
+
 
 class Cli(unittest.TestCase):
     def test_invalid_phase_fails_with_an_actionable_message(self):

@@ -138,14 +138,46 @@ def start_server(sysdir: Path) -> None:
 
 
 @contextmanager
+def catch_sigterm():
+    """Turn SIGTERM into KeyboardInterrupt so finally blocks clean up and stop the server."""
+    def handler(*_):
+        raise KeyboardInterrupt
+
+    previous = signal.signal(signal.SIGTERM, handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+@contextmanager
 def exclusive(system: str):
-    """Hold a per-system lock, so two runs never share a journal or a server."""
+    """Hold a machine-wide and per-system lock, so two runs never share a worker, a journal, or a server."""
     RUNS.mkdir(parents=True, exist_ok=True)
-    with (RUNS / f"{system}.lock").open("w") as lock:
+    with (
+        (RUNS / "batch.lock").open("a+", encoding="utf-8") as batch_fh,
+        (RUNS / "run.lock").open("a+", encoding="utf-8") as global_lock,
+        (RUNS / f"{system}.lock").open("a+", encoding="utf-8") as lock,
+    ):
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RunError(f"another run of {system} is in progress") from None
+        try:
+            fcntl.flock(global_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RunError("another benchmark run is in progress on this machine") from None
+        try:
+            fcntl.flock(batch_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            batch_fh.seek(0)
+            parts = batch_fh.read().strip().split()
+            owner_token = parts[1] if len(parts) >= 2 else ""
+            caller_token = os.environ.get("DBFORK_BATCH_TOKEN", "")
+            if not owner_token or not caller_token or not secrets.compare_digest(owner_token, caller_token):
+                raise RunError("another benchmark batch worker is in progress on this machine") from None
+        else:
+            fcntl.flock(batch_fh, fcntl.LOCK_UN)
         yield
 
 
@@ -166,6 +198,8 @@ def clean_up(system: str, server: Connector) -> Exception | None:
         if not re.fullmatch(r"bb_[0-9a-f]{8}", record["name"]):
             raise RunError("recovery journal has an invalid resource name")
         server.delete(record["name"])
+        if server.exists(record["name"]) is True:
+            raise RunError(f"{record['name']} still exists after delete; journal kept for recovery")
         journal(system).unlink()
     except Exception as e:  # the caller turns this into the run's error record
         return e
@@ -398,6 +432,8 @@ def run(system: str, machine: str, out: Path, max_batch: int | None, allow_dirty
         raise RunError(f"machine label {machine!r} must match {MACHINE_RE.pattern}")
     if not math.isfinite(deadline_min) or deadline_min <= 0:
         raise RunError("--deadline-min must be finite and greater than zero")
+    if os.environ.get("DBFORK_NATIVE_ONLY", "").lower() in ("1", "true", "yes"):
+        raise RunError("DBFORK_NATIVE_ONLY is set; unset it so every run uses the standard benchmark mode")
     server, sysdir = load_connector(system), BOARD / system
     meta_path = sysdir / "system.json"
     meta_bytes = meta_path.read_bytes()
@@ -437,40 +473,41 @@ def run(system: str, machine: str, out: Path, max_batch: int | None, allow_dirty
     run_id = secrets.token_hex(4)
     db, started = f"bb_{run_id}", dt.datetime.now(dt.UTC)
     failure: Exception | None = None
-    try:
-        deadline = time.monotonic() + deadline_min * 60
-        with bounded(deadline_min * 60, "run"):
-            start_server(sysdir)
-            if leftover := clean_up(system, server):
-                raise RunError(f"cannot delete what an earlier run left behind: {leftover}")
-            # Private, scoped, and durable before any create; a killed run remains recoverable.
-            with open(journal(system), "x", opener=lambda path, flags: os.open(path, flags, 0o600)) as record:
-                json.dump({"run_id": run_id, "name": db, "scope": server.scope()}, record)
-                record.flush()
-                os.fsync(record.fileno())
-            t0 = time.perf_counter()
-            info = server.provision(db)
-            provision_time = time.perf_counter() - t0
-            t0 = time.perf_counter()
-            server.load(info, db, dump)
-            load_time = time.perf_counter() - t0
-            version, rtt_ms, cells = measure(server, info, db, suite, max_batch, deadline)
-    except Exception as e:  # recorded below as the run's error, after cleanup
-        failure = e
-    finally:
+    with catch_sigterm():
         try:
-            with bounded(VENDOR_TIMEOUT, "cleanup"):
-                cleanup_failure = clean_up(system, server)
-                failure = failure or cleanup_failure
-        except Exception as e:
-            failure = failure or e
+            deadline = time.monotonic() + deadline_min * 60
+            with bounded(deadline_min * 60, "run"):
+                start_server(sysdir)
+                if leftover := clean_up(system, server):
+                    raise RunError(f"cannot delete what an earlier run left behind: {leftover}")
+                # Private, scoped, and durable before any create; a killed run remains recoverable.
+                with open(journal(system), "x", opener=lambda path, flags: os.open(path, flags, 0o600)) as record:
+                    json.dump({"run_id": run_id, "name": db, "scope": server.scope()}, record)
+                    record.flush()
+                    os.fsync(record.fileno())
+                t0 = time.perf_counter()
+                info = server.provision(db)
+                provision_time = time.perf_counter() - t0
+                t0 = time.perf_counter()
+                server.load(info, db, dump)
+                load_time = time.perf_counter() - t0
+                version, rtt_ms, cells = measure(server, info, db, suite, max_batch, deadline)
+        except Exception as e:  # recorded below as the run's error, after cleanup
+            failure = e
         finally:
             try:
-                with bounded(STOP_TIMEOUT, "server stop"):
-                    if not lifecycle(sysdir, "stop"):
-                        raise RunError(f"{system}: the server did not stop")
+                with bounded(VENDOR_TIMEOUT, "cleanup"):
+                    cleanup_failure = clean_up(system, server)
+                    failure = failure or cleanup_failure
             except Exception as e:
                 failure = failure or e
+            finally:
+                try:
+                    with bounded(STOP_TIMEOUT, "server stop"):
+                        if not lifecycle(sysdir, "stop"):
+                            raise RunError(f"{system}: the server did not stop")
+                except Exception as e:
+                    failure = failure or e
 
     if failure is None:
         try:
