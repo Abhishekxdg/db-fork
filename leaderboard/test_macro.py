@@ -894,6 +894,9 @@ class ChildProcess(unittest.TestCase):
             }
             e2e.update(collector.support_summary())
             (outdir / f"{run_id}_e2e_stats.json").write_text(json.dumps(e2e))
+            (outdir / f"{run_id}_runtime.json").write_text(
+                json.dumps({"expected": expected, "succeeded": expected, "failed": 0, "skipped": 0, "worker_errors": []})
+            )
             (outdir / "runner.log").write_text("[rl_env] Task 0 rollout 0 done\n")
 
             raw_before = json.loads((outdir / f"{run_id}_e2e_stats.json").read_text())
@@ -910,7 +913,65 @@ class ChildProcess(unittest.TestCase):
             self.assertIn("worker_time", evidence)
             self.assertGreater(evidence["worker_time"]["total_sec"], 0.0)
             self.assertEqual(evidence["storage"]["points"]["after_setup"], 1024 * 1024)
+            self.assertEqual(evidence["storage"]["points"]["before_cleanup"], 1024 * 1024)
+            self.assertNotIn("after_cleanup", evidence["storage"]["points"])
             self.assertEqual(evidence["backend_observations"], {"isolation": "clean snapshot visibility"})
+
+            # 1. Missing Parquet or zero recorded successes must be unverified, never fabricated as 8/8 succeeded.
+            (outdir / f"{run_id}_runtime.json").write_text(
+                json.dumps({"expected": expected, "succeeded": 0, "failed": 0, "skipped": 0, "worker_errors": []})
+            )
+            (outdir / f"{run_id}.parquet").unlink()
+            ev_missing, _ = run_macro.read_evidence(outdir, run_id)
+            st_missing, _ = validate_macro.classify(ev_missing, CHILD)
+            self.assertEqual(st_missing, "unverified")
+
+            # 2. Corrupt Parquet must be unverified.
+            (outdir / f"{run_id}_runtime.json").write_text(
+                json.dumps({"expected": expected, "succeeded": expected, "failed": 0, "skipped": 0, "worker_errors": []})
+            )
+            (outdir / f"{run_id}.parquet").write_bytes(b"corrupt-parquet-bytes")
+            ev_corrupt, _ = run_macro.read_evidence(outdir, run_id)
+            st_corrupt, _ = validate_macro.classify(ev_corrupt, CHILD)
+            self.assertEqual(st_corrupt, "unverified")
+
+            # 3. Contradictory JSON vs Parquet (JSON reports failed MERGE, Parquet has only OK BRANCH) -> unverified.
+            c_mismatch = ResultCollector(run_id=run_id, output_dir=str(outdir))
+            c_mismatch.set_context(table_name="macrobench", table_schema="rl_env", initial_db_size=0, seed=42)
+            c_mismatch.emit(rslt.OpType.BRANCH, status=rslt.OpStatus.OK, latency=0.01, start_time=1.0, end_time=1.01)
+            c_mismatch.write_to_parquet(append=False)
+            e2e_mismatch = dict(e2e)
+            e2e_mismatch["op_status_counts"] = {
+                "BRANCH": {"ok": 1, "unsupported": 0, "failed": 0},
+                "MERGE": {"ok": 0, "unsupported": 0, "failed": 1},
+            }
+            e2e_mismatch["failed_operations"] = 1
+            (outdir / f"{run_id}_e2e_stats.json").write_text(json.dumps(e2e_mismatch))
+            ev_mismatch, _ = run_macro.read_evidence(outdir, run_id)
+            st_mismatch, _ = validate_macro.classify(ev_mismatch, CHILD)
+            self.assertEqual(st_mismatch, "unverified")
+
+            # 4. Unrelated API_RETRY_WAIT must NOT hide an unrecovered MERGE failure.
+            c_unrec = ResultCollector(run_id=run_id, output_dir=str(outdir))
+            c_unrec.set_context(table_name="macrobench", table_schema="rl_env", initial_db_size=0, seed=42)
+            c_unrec.emit(rslt.OpType.API_RETRY_WAIT, status=rslt.OpStatus.OK, latency=0.1, label="another_op", start_time=1.0, end_time=1.1)
+            c_unrec.emit(
+                rslt.OpType.MERGE,
+                status=rslt.OpStatus.FAILED,
+                latency=0.02,
+                label="unrecovered_merge",
+                error_message="server closed the connection",
+                start_time=1.1,
+                end_time=1.12,
+            )
+            c_unrec.write_to_parquet(append=False)
+            e2e_unrec = dict(e2e)
+            e2e_unrec.update(c_unrec.support_summary())
+            (outdir / f"{run_id}_e2e_stats.json").write_text(json.dumps(e2e_unrec))
+            ev_unrec, _ = run_macro.read_evidence(outdir, run_id)
+            st_unrec, _ = validate_macro.classify(ev_unrec, CHILD)
+            self.assertEqual(st_unrec, "failed")
+            self.assertEqual(ev_unrec["failed_verbs"]["unexpected"], {"MERGE": 1})
 
     def test_paper_diagnostics_fields_are_preserved_and_validated(self):
         from leaderboard import validate_macro
@@ -934,6 +995,59 @@ class ChildProcess(unittest.TestCase):
         self.assertIn("worker_time is malformed", validate_macro.evidence_problems(bad_wt))
         bad_stalls = good_evidence(stalls="not-a-list")
         self.assertIn("stalls is not a list of objects", validate_macro.evidence_problems(bad_stalls))
+
+    def test_native_only_and_hosted_campaigns_validate_and_build(self):
+        board = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, board)
+        for system in ("dolt_mysql", "neon"):
+            (board / system).mkdir()
+            shutil.copy(BOARD / system / "system.json", board / system)
+
+        # 1. Native-only campaign on dolt_mysql validates and builds as verified.
+        native_camp = {**CAMPAIGN, "id": "1111aaaa", "native_only": True}
+        attempts_map = {}
+        for idx, scen in enumerate(SCENARIOS):
+            aid = f"bb_1111000{idx}"
+            attempts_map[scen] = aid
+            ev = evidence_summary(good_evidence(run_id=aid, scenario=scen, native_only=True))
+            ap = attempt_payload(attempt_id=aid, scenario=scen, campaign=native_camp, evidence=ev)
+            p = board / "dolt_mysql" / "macro" / "20261010" / f"{aid}.json"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(ap))
+            self.assertEqual(validate(p, board), [])
+        cp = board / "dolt_mysql" / "macro" / "20261010" / "campaign_1111aaaa.json"
+        cp.write_text(json.dumps(campaign_record(**native_camp, attempts=attempts_map)))
+        self.assertEqual(validate_campaign(cp, board), [])
+
+        # 2. Hosted campaign on neon (server.stop == 'not_started') validates and builds.
+        neon_meta = json.loads((BOARD / "neon" / "system.json").read_text())
+        hosted_camp = {**CAMPAIGN, "id": "2222bbbb"}
+        hosted_attempts = {}
+        for idx, scen in enumerate(SCENARIOS):
+            aid = f"bb_2222000{idx}"
+            hosted_attempts[scen] = aid
+            ev = evidence_summary(good_evidence(run_id=aid, scenario=scen, backend="NEON"))
+            ap = attempt_payload(attempt_id=aid, scenario=scen, campaign=hosted_camp, evidence=ev, **neon_meta)
+            p = board / "neon" / "macro" / "20261010" / f"{aid}.json"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(ap))
+            self.assertEqual(validate(p, board), [])
+        hcp = board / "neon" / "macro" / "20261010" / "campaign_2222bbbb.json"
+        hcp.write_text(
+            json.dumps(
+                campaign_record(
+                    **hosted_camp,
+                    system=neon_meta["system"],
+                    server={"started_here": False, "stop": "not_started"},
+                    attempts=hosted_attempts,
+                )
+            )
+        )
+        self.assertEqual(validate_campaign(hcp, board), [])
+
+        built, excluded = build_macro.build(board)
+        self.assertEqual(excluded, [])
+        self.assertEqual({c["campaign_id"] for c in built}, {"1111aaaa", "2222bbbb"})
 
 
 if __name__ == "__main__":

@@ -58,7 +58,11 @@ def failed_checks(campaign: dict) -> list[str]:
         reasons.append(f"campaign aborted: {campaign['aborted']}")
     if not campaign["finished"]:
         reasons.append("campaign did not finish")
-    if campaign["server"]["stop"] != "stopped":
+    is_hosted = campaign.get("hosted") == "yes"
+    if is_hosted:
+        if campaign["server"]["started_here"] or campaign["server"]["stop"] != "not_started":
+            reasons.append(f"server stop {campaign['server']['stop'].replace('_', ' ')}")
+    elif campaign["server"]["stop"] != "stopped":
         reasons.append(f"server stop {campaign['server']['stop'].replace('_', ' ')}")
     reasons += campaign["conflicts"]
     if set(campaign["scenarios"]) != set(SCENARIOS):
@@ -103,7 +107,7 @@ def build(board: Path = BOARD, sources: set[str] | None = None) -> tuple[list[di
         meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
         campaigns[(path.parts[-4], data["id"])] = {
             "campaign_id": data["id"], "system": data["system"], "folder": path.parts[-4], "machine": data["machine"],
-            "hosted": meta.get("hosted", "no"),
+            "hosted": meta.get("hosted", "no"), "native_only": bool(data.get("native_only", False)),
             "preset": data["preset"], "scenarios": data["scenarios"], "started": data["started"], "finished": data["finished"],
             "aborted": data["aborted"], "server": data["server"], "source": source, "expected": data["attempts"],
             "version": data["version"], "dirty": data["source"]["dirty"], "changed_during_run": data["source"]["changed_during_run"],
@@ -149,7 +153,7 @@ def build(board: Path = BOARD, sources: set[str] | None = None) -> tuple[list[di
         if campaign["expected"].get(key) != data["attempt_id"]:
             campaign["conflicts"].append(f"{SCENARIOS[key]}: attempt {data['attempt_id']} is not the one the campaign record names")
         recorded = {"id": campaign["campaign_id"], **{k: campaign[k] for k in ("preset", "scenarios", "machine", "started")}}
-        if {k: c.get(k) for k in recorded} != recorded:
+        if {k: c.get(k) for k in recorded} != recorded or bool(c.get("native_only", False)) != campaign["native_only"]:
             campaign["conflicts"].append(f"{SCENARIOS[key]}: campaign metadata differs from the campaign record")
         for field in ("commit", "source_sha256"):
             if data["source"][field] != campaign[field]:

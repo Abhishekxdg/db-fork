@@ -233,20 +233,49 @@ def evidence_problems(e: dict) -> list[str]:
     need("native_only" not in e or isinstance(e["native_only"], bool), "native_only is not a boolean")
     need("stop_reason" not in e or isinstance(e["stop_reason"], str), "stop_reason is not a string")
     need("op_stall_sec" not in e or seconds(e["op_stall_sec"]), "op_stall_sec is not a non-negative finite number")
-    need("stalls" not in e or (isinstance(e["stalls"], list) and all(isinstance(s, dict) for s in e["stalls"])),
-         "stalls is not a list of objects")
+    stalls = e.get("stalls")
+    need(stalls is None or (isinstance(stalls, list) and all(
+        isinstance(s, dict) and isinstance(s.get("op", ""), str)
+        and all(k not in s or seconds(s[k]) for k in ("elapsed_sec", "duration_sec"))
+        and ("thread_id" not in s or type(s["thread_id"]) is int)
+        and ("outcome" not in s or isinstance(s["outcome"], str))
+        for s in stalls)), "stalls is not a list of objects")
     need("backend_observations" not in e or isinstance(e["backend_observations"], (dict, list)),
          "backend_observations is not an object")
     for s_key in ("storage_before_bytes", "storage_after_bytes", "storage_delta_bytes"):
         need(s_key not in e or type(e[s_key]) is int, f"{s_key} is not an integer")
-    need("storage" not in e or isinstance(e["storage"], dict), "storage is not an object")
+    storage = e.get("storage")
+    def _valid_storage(st: dict) -> bool:
+        if not isinstance(st, dict):
+            return False
+        if "scope" in st and not isinstance(st["scope"], str):
+            return False
+        if "points" in st:
+            pts = st["points"]
+            if not isinstance(pts, dict) or not all(isinstance(k, str) and (v is None or type(v) is int) for k, v in pts.items()):
+                return False
+        if "gc" in st:
+            gc = st["gc"]
+            if not isinstance(gc, dict) or not isinstance(gc.get("status", ""), str) or ("latency_sec" in gc and not seconds(gc["latency_sec"])):
+                return False
+        if "samples" in st:
+            if not isinstance(st["samples"], list) or not all(isinstance(x, (dict, list)) for x in st["samples"]):
+                return False
+        if "samples_total_count" in st and not counter(st["samples_total_count"]):
+            return False
+        for k, v in st.items():
+            if k in ("after_setup", "after_workflow", "after_gc", "before_cleanup", "after_cleanup") and not (v is None or type(v) is int):
+                return False
+        return True
+    need(storage is None or _valid_storage(storage), "storage is not an object")
     wt = e.get("worker_time")
-    need(wt is None or (isinstance(wt, dict) and all(seconds(wt.get(k)) for k in ("branch_sec", "data_sec", "total_sec", "spine_sec") if k in wt)),
+    need(wt is None or (isinstance(wt, dict) and all(seconds(wt.get(k)) for k in ("branch_sec", "data_sec", "total_sec"))
+         and ("spine_sec" not in wt or seconds(wt["spine_sec"]))),
          "worker_time is malformed")
     return problems
 
 
-def classify(evidence: dict | None, child: dict) -> tuple[str, list[str]]:
+def classify(evidence: dict | None, child: dict, *, allow_native_only: bool = False) -> tuple[str, list[str]]:
     """The attempt's outcome from the evidence the child left and how the child
     ended, never from its exit code alone.
 
@@ -313,7 +342,7 @@ def classify(evidence: dict | None, child: dict) -> tuple[str, list[str]]:
         incomplete.append(f"{inv['not_applicable']} check{'s' if inv['not_applicable'] > 1 else ''} not applicable: " + "; ".join(names[:3]))
     if unsupported := evidence["unsupported_ops"]:
         incomplete.append("unsupported operations: " + ", ".join(u[:60] for u in unsupported[:5]))
-    if evidence.get("native_only"):
+    if evidence.get("native_only") and not allow_native_only:
         incomplete.append("native_only mode disabled composed operations")
     fallbacks = evidence["commit_ref_fallbacks"] + metrics.get("history_ref_fallbacks", 0)
     if fallbacks:
@@ -331,7 +360,8 @@ def classify(evidence: dict | None, child: dict) -> tuple[str, list[str]]:
 
 def expected_outcome(data: dict) -> dict:
     """The outcome block an attempt file must carry, recomputed from its evidence and child."""
-    status, reasons = classify(data["evidence"], data["child"])
+    allow_native = bool(isinstance(data.get("campaign"), dict) and data["campaign"].get("native_only") is True)
+    status, reasons = classify(data["evidence"], data["child"], allow_native_only=allow_native)
     elapsed, setup = timings(data["evidence"])
     return {"status": status, "reasons": reasons, "elapsed_sec": elapsed, "setup_sec": setup,
             "completion_sec": elapsed if status == "verified" else None}
@@ -358,11 +388,13 @@ def load(path: Path, board: Path, fields: dict) -> tuple[list[str], dict | None,
         return problems + ["not a JSON object"], None, None, []
     problems += [f"{where} looks like a credential" for where in credentials(data)]
     problems += [f"{where} is not a finite number" for where in non_finite(data)]
+    optional = {"native_only": bool} if fields is CAMPAIGN_FIELDS else {}
     if missing := sorted(fields.keys() - data.keys()):
         problems.append(f"missing keys: {missing}")
-    if unexpected := sorted(data.keys() - fields.keys()):
+    if unexpected := sorted(data.keys() - fields.keys() - optional.keys()):
         problems.append(f"unexpected keys: {unexpected}")
-    problems += [f"{k} must be {getattr(t, '__name__', 'string or null')}" for k, t in fields.items()
+    all_fields = {**fields, **optional}
+    problems += [f"{k} must be {getattr(t, '__name__', 'string or null')}" for k, t in all_fields.items()
                  if k in data and not (isinstance(data[k], t) if isinstance(t, tuple) else has_type(data[k], t))]
     if not problems and (data["schema_version"] != MACRO_SCHEMA_VERSION or data["suite"] != MACRO_SUITE):
         problems.append(f"not schema {MACRO_SCHEMA_VERSION} of suite {MACRO_SUITE}")
@@ -374,7 +406,8 @@ def campaign_problems(c, data: dict, scenario: str | None) -> list[str]:
     if (not isinstance(c, dict) or not isinstance(c.get("id"), str) or not CAMPAIGN_RE.fullmatch(c["id"])
             or not isinstance(c.get("preset"), str) or c["preset"] not in PRESETS or not strings(c.get("scenarios")) or not c["scenarios"]
             or len(set(c["scenarios"])) != len(c["scenarios"]) or any(s not in SCENARIOS for s in c["scenarios"])
-            or c.get("machine") != data["machine"] or not isinstance(c.get("started"), str)):
+            or c.get("machine") != data["machine"] or not isinstance(c.get("started"), str)
+            or ("native_only" in c and type(c["native_only"]) is not bool)):
         return ["campaign must hold id, preset, distinct known scenarios, machine and started"]
     if scenario is not None and scenario not in c["scenarios"]:
         return ["the attempt's scenario is not in its campaign"]
@@ -455,6 +488,8 @@ def validate(path: Path, board: Path = BOARD) -> list[str]:
             problems.append("evidence does not belong to this attempt")
         if data["evidence"].get("scenario") != data["scenario"]:
             problems.append("evidence describes another scenario")
+        if "native_only" in c and bool(data["evidence"].get("native_only", False)) != c["native_only"]:
+            problems.append("evidence native_only does not match campaign native_only")
     if problems:
         return problems
     expected = expected_outcome(data)

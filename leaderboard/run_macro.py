@@ -92,6 +92,8 @@ def effective_config(base: Path, backend: int, run_id: str) -> tuple[tp.MacroBen
     cfg.database_setup.db_name = run_id
     cfg.database_setup.cleanup = False
     cfg.database_setup.generated.SetInParent()
+    if not cfg.invariants.disabled:
+        cfg.invariants.fail_fast = True
     identity = tp.MacroBenchConfig()
     identity.CopyFrom(cfg)
     identity.run_id, identity.backend, identity.database_setup.db_name = "", 0, ""
@@ -207,85 +209,50 @@ def enrich_e2e_stats(raw: dict, outdir: Path, run_id: str, runtime: dict | None 
     """Bridge upstream macrobench.runner output (<run_id>_e2e_stats.json + <run_id>.parquet)
     into the validator's full evidence contract without mutating synthetic unit-test fixtures."""
     parquet_path = outdir / f"{run_id}.parquet"
+    runtime_path = outdir / f"{run_id}_runtime.json"
     validator_keys = ("work", "worker_errors", "failed_verbs", "commit_ref_fallbacks")
-    upstream_keys = ("op_stall_sec", "stalls", "storage", "storage_before_bytes")
-    is_upstream = (
-        runtime is not None
-        or parquet_path.is_file()
-        or any(k in raw for k in upstream_keys)
-        or all(k not in raw for k in validator_keys)
+    raw_counts = raw.get("op_status_counts")
+    has_ok_seconds = isinstance(raw_counts, dict) and all(
+        isinstance(v, dict) and "ok_seconds" in v for v in raw_counts.values()
     )
-    if not is_upstream:
+    if (
+        all(k in raw for k in validator_keys)
+        and has_ok_seconds
+        and runtime is None
+        and not parquet_path.is_file()
+        and not runtime_path.is_file()
+    ):
         return raw
 
     out = dict(raw)
+    if runtime is None and runtime_path.is_file():
+        try:
+            loaded_rt = json.loads(runtime_path.read_text())
+            if isinstance(loaded_rt, dict):
+                runtime = loaded_rt
+        except (OSError, ValueError):
+            runtime = None
+
+    if isinstance(out.get("storage"), dict):
+        st_copy = dict(out["storage"])
+        if isinstance(st_copy.get("points"), dict):
+            pts = dict(st_copy["points"])
+            if "after_cleanup" in pts and "before_cleanup" not in pts:
+                pts["before_cleanup"] = pts.pop("after_cleanup")
+            st_copy["points"] = pts
+        if isinstance(st_copy.get("samples"), list) and len(st_copy["samples"]) > 400:
+            samples = st_copy["samples"]
+            st_copy["samples_total_count"] = len(samples)
+            step = (len(samples) - 1) / 399.0
+            st_copy["samples"] = [samples[round(i * step)] for i in range(400)]
+        out["storage"] = st_copy
+
+    status_str = str(out.get("status") or "")
+    setup_prob = setup_outcome(out.get("setup") if isinstance(out.get("setup"), dict) else {})
+    is_setup_failed = setup_prob is not None or status_str.startswith("setup_failed")
+
     metrics = dict(out["metrics"]) if isinstance(out.get("metrics"), dict) else {}
     out["metrics"] = metrics
-
-    ok_latency: dict[str, float] = {}
-    fallback_count = 0
-    branch_sec = 0.0
-    data_sec = 0.0
-    spine_sec = 0.0
-    parquet_rows: list[tuple[str, str, float, str, str, bool]] = []
-    has_retry_wait = False
-
-    if parquet_path.is_file():
-        try:
-            table = pq.read_table(
-                parquet_path,
-                columns=["op_name", "status", "latency", "label", "error_message", "commit_ref_fallback"],
-            )
-            cols = table.to_pydict()
-            n_rows = len(cols.get("op_name", []))
-            for i in range(n_rows):
-                op = str(cols["op_name"][i] or "")
-                st = str(cols["status"][i] or "")
-                lat_raw = cols["latency"][i]
-                lat = float(lat_raw) if isinstance(lat_raw, (int, float)) and math.isfinite(lat_raw) and lat_raw >= 0 else 0.0
-                lbl = str(cols["label"][i] or "")
-                err = str(cols["error_message"][i] or "")
-                fb = bool(cols["commit_ref_fallback"][i])
-                parquet_rows.append((op, st, lat, lbl, err, fb))
-                if op == "API_RETRY_WAIT":
-                    has_retry_wait = True
-                if fb:
-                    fallback_count += 1
-                if st == "OK":
-                    ok_latency[op] = ok_latency.get(op, 0.0) + lat
-                if lbl in ("spine", "spine_update") and op == "EXEC":
-                    spine_sec += lat
-                elif lbl not in SPINE_LABELS and op != "EXEC":
-                    if op in BRANCH_VERBS:
-                        branch_sec += lat
-                    else:
-                        data_sec += lat
-        except Exception:
-            pass
-
-    counts = out.get("op_status_counts")
-    if isinstance(counts, dict):
-        new_counts = {}
-        for op, entry in counts.items():
-            if isinstance(entry, dict):
-                e_copy = dict(entry)
-                if "ok_seconds" not in e_copy:
-                    e_copy["ok_seconds"] = round(ok_latency.get(op, 0.0), 6)
-                new_counts[op] = e_copy
-            else:
-                new_counts[op] = entry
-        out["op_status_counts"] = new_counts
-
-    if "commit_ref_fallbacks" not in out:
-        out["commit_ref_fallbacks"] = int(fallback_count)
-
-    if "worker_time" not in out and parquet_rows:
-        out["worker_time"] = {
-            "branch_sec": round(branch_sec, 6),
-            "data_sec": round(data_sec, 6),
-            "total_sec": round(branch_sec + data_sec, 6),
-            "spine_sec": round(spine_sec, 6),
-        }
 
     spine_load = out.get("spine_load")
     spine_attempted = 0
@@ -297,56 +264,206 @@ def enrich_e2e_stats(raw: dict, outdir: Path, run_id: str, runtime: dict | None 
         f_val = spine_load.get("failures")
         if type(f_val) is int and f_val >= 0:
             spine_failed = f_val
-    if parquet_rows:
-        pq_spine_exec = [r for r in parquet_rows if r[3] in ("spine", "spine_update") and r[0] == "EXEC"]
-        if pq_spine_exec:
-            spine_attempted = max(spine_attempted, len(pq_spine_exec))
-            spine_failed = max(spine_failed, sum(1 for r in pq_spine_exec if r[1] == "FAILED"))
+
+    schema_resolved = bool(
+        metrics.get("schema_conflict_resolved_by_rebase", 0) > 0
+        or metrics.get("schema_conflict_resolved_by_merge", 0) > 0
+    ) and metrics.get("rebase_failed", 0) == 0
+
+    ok_latency: dict[str, float] = {}
+    pq_counts: dict[str, dict[str, int]] = {}
+    fallback_count = 0
+    branch_sec = 0.0
+    data_sec = 0.0
+    spine_sec = 0.0
+    pq_spine_attempted = 0
+    pq_spine_failed = 0
+    total_pq_rows = 0
+    total_pq_failed = 0
+    expected_failed: dict[str, int] = {}
+    unexpected_failed: dict[str, int] = {}
+    if spine_failed > 0:
+        expected_failed["spine"] = int(spine_failed)
+    pending_retries: dict[int, list[dict]] = {}
+    parquet_ok = False
+
+    if parquet_path.is_file():
+        try:
+            pf = pq.ParquetFile(parquet_path)
+            avail = set(pf.schema_arrow.names)
+            want_cols = [
+                c
+                for c in (
+                    "thread_id",
+                    "op_name",
+                    "status",
+                    "ref",
+                    "label",
+                    "latency",
+                    "error_message",
+                    "commit_ref_fallback",
+                )
+                if c in avail
+            ]
+            if {"op_name", "status", "latency"}.issubset(avail):
+                for batch in pf.iter_batches(batch_size=8192, columns=want_cols):
+                    cols = batch.to_pydict()
+                    n_rows = len(cols.get("op_name", []))
+                    t_col = cols.get("thread_id") or [0] * n_rows
+                    op_col = cols.get("op_name") or [""] * n_rows
+                    st_col = cols.get("status") or [""] * n_rows
+                    ref_col = cols.get("ref") or [""] * n_rows
+                    lbl_col = cols.get("label") or [""] * n_rows
+                    lat_col = cols.get("latency") or [0.0] * n_rows
+                    err_col = cols.get("error_message") or [""] * n_rows
+                    fb_col = cols.get("commit_ref_fallback") or [False] * n_rows
+                    for i in range(n_rows):
+                        total_pq_rows += 1
+                        tid = int(t_col[i]) if t_col[i] is not None else 0
+                        op = str(op_col[i] or "")
+                        st = str(st_col[i] or "")
+                        ref = str(ref_col[i] or "")
+                        lbl = str(lbl_col[i] or "")
+                        lat_raw = lat_col[i]
+                        lat = (
+                            float(lat_raw)
+                            if isinstance(lat_raw, (int, float)) and math.isfinite(lat_raw) and lat_raw >= 0
+                            else 0.0
+                        )
+                        err = str(err_col[i] or "")
+                        fb = bool(fb_col[i])
+
+                        c_entry = pq_counts.setdefault(op, {"ok": 0, "unsupported": 0, "failed": 0})
+                        if st == "OK":
+                            c_entry["ok"] += 1
+                            ok_latency[op] = ok_latency.get(op, 0.0) + lat
+                        elif st == "UNSUPPORTED":
+                            c_entry["unsupported"] += 1
+                        else:
+                            c_entry["failed"] += 1
+                            total_pq_failed += 1
+
+                        if fb:
+                            fallback_count += 1
+
+                        if lbl in ("spine", "spine_update") and op == "EXEC":
+                            spine_sec += lat
+                            pq_spine_attempted += 1
+                            if st == "FAILED":
+                                pq_spine_failed += 1
+                        elif lbl not in SPINE_LABELS and op != "EXEC" and op != "API_RETRY_WAIT":
+                            if op in BRANCH_VERBS:
+                                branch_sec += lat
+                            else:
+                                data_sec += lat
+
+                        if op == "API_RETRY_WAIT":
+                            for item in pending_retries.get(tid, ()):
+                                if not lbl or not item["label"] or item["label"] == lbl:
+                                    item["waited"] = True
+                            continue
+
+                        if st == "OK" and op in (*BRANCH_VERBS, "EXEC"):
+                            q = pending_retries.get(tid)
+                            if q:
+                                for idx, item in enumerate(q):
+                                    if (
+                                        item["waited"]
+                                        and item["op"] == op
+                                        and (not item["label"] or not lbl or item["label"] == lbl)
+                                        and (not item["ref"] or not ref or item["ref"] == ref)
+                                    ):
+                                        q.pop(idx)
+                                        expected_failed["retry"] = expected_failed.get("retry", 0) + 1
+                                        break
+                            continue
+
+                        if st == "FAILED" and op in (*BRANCH_VERBS, "EXEC"):
+                            if lbl in ("spine", "spine_update"):
+                                if op == "EXEC":
+                                    expected_failed["spine"] = max(expected_failed.get("spine", 0), pq_spine_failed)
+                                continue
+                            if lbl == "invariant":
+                                expected_failed["invariant"] = expected_failed.get("invariant", 0) + 1
+                                continue
+                            if op == "REBASE" and "schema conflict" in err.lower() and schema_resolved:
+                                expected_failed["schema_conflict_rebase"] = (
+                                    expected_failed.get("schema_conflict_rebase", 0) + 1
+                                )
+                                continue
+                            if is_retryable_error(err):
+                                pending_retries.setdefault(tid, []).append(
+                                    {"op": op, "ref": ref, "label": lbl, "waited": False}
+                                )
+                                continue
+                            key = lbl if (op == "EXEC" and lbl) else op
+                            unexpected_failed[key] = unexpected_failed.get(key, 0) + 1
+
+                for q in pending_retries.values():
+                    for item in q:
+                        key = item["label"] if (item["op"] == "EXEC" and item["label"]) else item["op"]
+                        unexpected_failed[key] = unexpected_failed.get(key, 0) + 1
+                parquet_ok = True
+        except Exception:
+            parquet_ok = False
+
+    counts = out.get("op_status_counts")
+    if parquet_ok and isinstance(counts, dict):
+        for op, entry in counts.items():
+            if not isinstance(entry, dict):
+                parquet_ok = False
+                break
+            pq_c = pq_counts.get(op, {"ok": 0, "unsupported": 0, "failed": 0})
+            for k in ("ok", "unsupported", "failed"):
+                if type(entry.get(k)) is int and entry[k] != pq_c.get(k, 0):
+                    parquet_ok = False
+                    break
+            if not parquet_ok:
+                break
+        for op, pq_c in pq_counts.items():
+            if op not in counts and sum(pq_c.values()) > 0:
+                parquet_ok = False
+                break
+        if type(out.get("failed_operations")) is int and out["failed_operations"] != total_pq_failed:
+            parquet_ok = False
+    elif not is_setup_failed:
+        parquet_ok = False
+
+    if not parquet_ok and not (is_setup_failed and not counts):
+        for k in ("work", "failed_verbs", "commit_ref_fallbacks"):
+            out.pop(k, None)
+        return out
+
+    if isinstance(counts, dict):
+        new_counts = {}
+        for op, entry in counts.items():
+            if isinstance(entry, dict):
+                e_copy = dict(entry)
+                e_copy["ok_seconds"] = round(ok_latency.get(op, 0.0), 6)
+                new_counts[op] = e_copy
+            else:
+                new_counts[op] = entry
+        out["op_status_counts"] = new_counts
+
+    out["commit_ref_fallbacks"] = int(fallback_count)
+
+    if "worker_time" not in out and total_pq_rows > 0:
+        out["worker_time"] = {
+            "branch_sec": round(branch_sec, 6),
+            "data_sec": round(data_sec, 6),
+            "total_sec": round(branch_sec + data_sec, 6),
+            "spine_sec": round(spine_sec, 6),
+        }
+
+    spine_attempted = max(spine_attempted, pq_spine_attempted)
+    spine_failed = max(spine_failed, pq_spine_failed)
     if spine_attempted > 0 or spine_failed > 0:
         metrics.setdefault("spine_attempted", int(spine_attempted))
         metrics.setdefault("spine_failed", int(spine_failed))
+    if spine_failed > 0:
+        expected_failed["spine"] = int(spine_failed)
 
     if "failed_verbs" not in out:
-        expected_failed: dict[str, int] = {}
-        unexpected_failed: dict[str, int] = {}
-        if spine_failed > 0:
-            expected_failed["spine"] = int(spine_failed)
-        schema_resolved = bool(
-            metrics.get("schema_conflict_resolved_by_rebase", 0) > 0
-            or metrics.get("schema_conflict_resolved_by_merge", 0) > 0
-        ) and metrics.get("rebase_failed", 0) == 0
-        if parquet_rows:
-            for op, st, _lat, lbl, err, _fb in parquet_rows:
-                if st != "FAILED" or op not in (*BRANCH_VERBS, "EXEC"):
-                    continue
-                if lbl in ("spine", "spine_update"):
-                    if op == "EXEC":
-                        expected_failed["spine"] = max(expected_failed.get("spine", 0), 1)
-                    continue
-                if lbl == "invariant":
-                    expected_failed["invariant"] = expected_failed.get("invariant", 0) + 1
-                    continue
-                if op == "REBASE" and "schema conflict" in err.lower() and schema_resolved:
-                    expected_failed["schema_conflict_rebase"] = expected_failed.get("schema_conflict_rebase", 0) + 1
-                    continue
-                if has_retry_wait and is_retryable_error(err):
-                    expected_failed["retry"] = expected_failed.get("retry", 0) + 1
-                    continue
-                key = lbl if (op == "EXEC" and lbl) else op
-                unexpected_failed[key] = unexpected_failed.get(key, 0) + 1
-        elif isinstance(counts, dict):
-            for op, entry in counts.items():
-                if op not in (*BRANCH_VERBS, "EXEC") or not isinstance(entry, dict):
-                    continue
-                f_cnt = entry.get("failed", 0)
-                if type(f_cnt) is not int or f_cnt <= 0:
-                    continue
-                if op == "EXEC":
-                    f_cnt = max(0, f_cnt - expected_failed.get("spine", 0))
-                if op == "REBASE" and schema_resolved:
-                    f_cnt = max(0, f_cnt - int(metrics.get("schema_conflict_rebases", 0) or 0))
-                if f_cnt > 0:
-                    unexpected_failed[op] = unexpected_failed.get(op, 0) + f_cnt
         out["failed_verbs"] = {"expected": expected_failed, "unexpected": unexpected_failed}
 
     if "worker_errors" not in out:
@@ -365,50 +482,20 @@ def enrich_e2e_stats(raw: dict, outdir: Path, run_id: str, runtime: dict | None 
 
     if "work" not in out:
         scenario_key = str(out.get("scenario") or "")
-        expected = (
-            int(runtime["expected"])
-            if runtime and type(runtime.get("expected")) is int and runtime["expected"] > 0
-            else expected_work_units(scenario_key, out.get("workload"), outdir / "config.textproto")
-        )
-        status = str(out.get("status") or "")
-        setup_prob = setup_outcome(out.get("setup") if isinstance(out.get("setup"), dict) else {})
-        if setup_prob is not None or status.startswith("setup_failed"):
-            succeeded, failed, skipped = 0, 0, 0
-        elif runtime and any(runtime.get(k, 0) > 0 for k in ("succeeded", "failed", "skipped")):
+        if runtime is not None and type(runtime.get("expected")) is int and runtime["expected"] > 0:
+            expected = int(runtime["expected"])
             succeeded = min(expected, max(0, int(runtime.get("succeeded", 0))))
             failed = min(expected - succeeded, max(0, int(runtime.get("failed", 0))))
             skipped = min(expected - succeeded - failed, max(0, int(runtime.get("skipped", 0))))
-            if status == "completed" and not out.get("timed_out") and not out.get("unsupported_ops") and succeeded + failed + skipped == 0:
-                succeeded = expected
-        else:
-            w_err_cnt = len(out.get("worker_errors") or [])
-            unexp_cnt = sum((out.get("failed_verbs") or {}).get("unexpected", {}).values())
-            unsup_cnt = len(out.get("unsupported_ops") or [])
-            if status.startswith("unsupported:") or unsup_cnt > 0:
-                if status == "completed":
-                    skipped = min(expected, max(1, unsup_cnt))
-                    succeeded = max(0, expected - skipped)
-                    failed = 0
-                else:
-                    succeeded = 0
-                    failed = 0
-                    skipped = min(expected, max(1, unsup_cnt))
-            elif out.get("timed_out") or status == "interrupted":
-                succeeded = max(0, expected // 2) if parquet_rows else 0
-                failed = min(expected - succeeded, w_err_cnt)
-                skipped = 0
-            elif status == "completed" and w_err_cnt == 0 and unexp_cnt == 0:
-                succeeded, failed, skipped = expected, 0, 0
-            else:
-                failed = min(expected, max(1, w_err_cnt or unexp_cnt or 1))
-                succeeded = max(0, expected - failed)
-                skipped = 0
-        out["work"] = {
-            "expected": int(expected),
-            "succeeded": int(succeeded),
-            "failed": int(failed),
-            "skipped": int(skipped),
-        }
+            out["work"] = {
+                "expected": int(expected),
+                "succeeded": int(succeeded),
+                "failed": int(failed),
+                "skipped": int(skipped),
+            }
+        elif is_setup_failed:
+            expected = expected_work_units(scenario_key, out.get("workload"), outdir / "config.textproto")
+            out["work"] = {"expected": int(expected), "succeeded": 0, "failed": 0, "skipped": 0}
 
     return out
 
@@ -494,6 +581,10 @@ def run_child_runner(argv: list[str]) -> int:
         rc = int(e.code) if isinstance(e.code, int) else (1 if e.code else 0)
     finally:
         if run_id:
+            try:
+                (outdir / f"{run_id}_runtime.json").write_text(json.dumps(runtime, indent=2, default=str) + "\n")
+            except Exception:
+                pass
             e2e_path = outdir / f"{run_id}_e2e_stats.json"
             if e2e_path.is_file():
                 try:
@@ -647,7 +738,7 @@ def attempt(system: str, server: Connector, key: str, campaign: dict, snapshot: 
         else:  # it ran, but its result cannot be read
             evidence, problems = None, [f"the child's result could not be read: {type(e).__name__}: {scrub(str(e))[:200]}"]
     cleanup = verified_cleanup(system, server)
-    status, reasons = classify(evidence, child)
+    status, reasons = classify(evidence, child, allow_native_only=bool(campaign.get("native_only", False)))
     elapsed, setup = timings(evidence)
     payload = {
         "schema_version": MACRO_SCHEMA_VERSION,
@@ -666,7 +757,7 @@ def attempt(system: str, server: Connector, key: str, campaign: dict, snapshot: 
         "evidence": evidence,
         **provenance(snapshot, env),
         "config": {"preset": campaign["preset"], "base_config_sha256": sha256(base), "config_sha256": workload_digest(effective),
-                   "effective": effective, **({"native_only": True} if child_env and child_env.get("DBFORK_NATIVE_ONLY") == "1" else {})},
+                   "effective": effective},
     }
     path = write_json(out / system / "macro" / started.strftime("%Y%m%d") / f"{run_id}.json", payload)
     print(f"{SCENARIOS[key]}: {status} ({'; '.join(payload['outcome']['reasons']) or 'all required work verified'}); "
@@ -717,8 +808,6 @@ def run(system: str, preset: str, keys: list[str], machine: str, out: Path, dead
               "attempts": {}, "version": None, **provenance(snapshot, env)}
     record_path = out / system / "macro" / started.strftime("%Y%m%d") / f"campaign_{campaign['id']}.json"
     identity = {k: meta[k] for k in ("system", "proprietary", "hosted", "tuned", "tags")}
-    if native_only and "native_only" not in identity["tags"]:
-        identity["tags"] = list(identity["tags"]) + ["native_only"]
     child_env = None
     if native_only:
         child_env = dict(os.environ)

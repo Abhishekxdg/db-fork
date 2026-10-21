@@ -343,7 +343,7 @@ function attemptBody(a) {
     if (sb.children.length) opParts.push(scrolling(sql));
     if (Array.isArray(e.unsupported_ops) ? e.unsupported_ops.length : e.unsupported_ops != null) opParts.push(node('p', 'notice', `Unsupported: ${Array.isArray(e.unsupported_ops) ? e.unsupported_ops.map(String).join(', ') : `${JSON.stringify(e.unsupported_ops)} (not a list; kept as recorded)`}`));
     if (e.worker_time && typeof e.worker_time === 'object') opParts.push(metaGrid([['Branch verb time', timeOf(e.worker_time.branch_sec)], ['Data step time', timeOf(e.worker_time.data_sec)], ['Total worker time', timeOf(e.worker_time.total_sec)], ['Background spine time', typeof e.worker_time.spine_sec === 'number' ? seconds(e.worker_time.spine_sec) : null]]));
-    if (e.storage && typeof e.storage === 'object') { const sp = e.storage.points && typeof e.storage.points === 'object' ? e.storage.points : e.storage; opParts.push(metaGrid([['Storage after setup', gib(sp.after_setup, 2)], ['Storage after workflow', gib(sp.after_workflow, 2)], ['Storage after GC', gib(sp.after_gc, 2)], ['Storage after cleanup', gib(sp.after_cleanup, 2)], ['Retained delta', typeof e.storage_delta_bytes === 'number' ? gib(e.storage_delta_bytes, 2) : null]])); }
+    if (e.storage && typeof e.storage === 'object') { const sp = e.storage.points && typeof e.storage.points === 'object' ? e.storage.points : e.storage, gc = e.storage.gc && typeof e.storage.gc === 'object' ? e.storage.gc.status : null; opParts.push(metaGrid([['Storage scope', typeof e.storage.scope === 'string' ? e.storage.scope : null], ['Storage after setup', gib(sp.after_setup, 2)], ['Storage after workflow', gib(sp.after_workflow, 2)], ['Storage after GC', gib(sp.after_gc, 2)], ['GC status', typeof gc === 'string' ? gc : null], ['Storage before cleanup', gib(sp.before_cleanup, 2)], ['Storage after cleanup', gib(sp.after_cleanup, 2)], ['Retained delta', typeof e.storage_delta_bytes === 'number' ? gib(e.storage_delta_bytes, 2) : null]])); }
     if (Array.isArray(e.stalls) && e.stalls.length) for (const s of e.stalls) if (s && typeof s === 'object') { const dur = s.elapsed_sec ?? s.duration_sec; opParts.push(node('p', 'notice', `Stall: ${s.op || 'op'} took ${typeof dur === 'number' ? seconds(dur) : dur}${typeof e.op_stall_sec === 'number' ? ` (threshold ${seconds(e.op_stall_sec)})` : ''}`)); }
     if (Array.isArray(e.backend_observations) && e.backend_observations.length) for (const obs of e.backend_observations) if (typeof obs === 'string') opParts.push(node('p', 'fine', `Observation: ${obs}`));
     if (e.backend_observations && typeof e.backend_observations === 'object' && !Array.isArray(e.backend_observations)) for (const [k, v] of Object.entries(e.backend_observations)) opParts.push(node('p', 'fine', `Observation (${k}): ${v}`));
@@ -404,9 +404,10 @@ function shareChart(campaigns) {
     const card = node('figure', 'panel dotplot-panel'), keys = Object.keys(SCENARIOS);
     card.append(node('h3', '', 'Time in branch operations'), node('p', 'panel-note', 'Share of each completed workflow\'s operation time spent in branch operations; the rest is agent steps.'));
     const rows = keys.map(key => ({label: workflow(key).name, dots: campaigns.flatMap(c => {
-        const counts = statusOf(c, key) === 'verified' && opCounts(c.attempts[key]);
-        if (!counts) return [];
-        const branch = VERBS.reduce((sum, verb) => sum + (counts[verb.toUpperCase()]?.ok_seconds ?? 0), 0), total = branch + (counts.EXEC?.ok_seconds ?? 0);
+        const a = c.attempts[key], wt = a?.evidence?.worker_time, validWt = wt && typeof wt.branch_sec === 'number' && typeof wt.total_sec === 'number' && wt.total_sec > 0;
+        const counts = statusOf(c, key) === 'verified' && opCounts(a);
+        if (!counts && (statusOf(c, key) !== 'verified' || !validWt)) return [];
+        const branch = validWt ? wt.branch_sec : VERBS.reduce((sum, verb) => sum + (counts[verb.toUpperCase()]?.ok_seconds ?? 0), 0), total = validWt ? wt.total_sec : branch + (counts.EXEC?.ok_seconds ?? 0);
         return total ? [{e: c, value: branch / total, title: `${c.system} · ${workflow(key).name}: ${Math.round(branch / total * 100)}% in branch operations, ${seconds(branch)} of ${seconds(total)}`}] : [];
     })}));
     const shares = rows.flatMap(r => r.dots.map(d => d.value)), percent = v => `${Math.round(v * 100)}%`;
