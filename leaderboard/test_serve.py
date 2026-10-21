@@ -187,7 +187,7 @@ class Launcher(unittest.TestCase):
             self.assertEqual(request("/api/run", reviewed)[0], 503)
 
     def test_local_serves_the_development_site_and_prod_only_the_published_site(self):
-        for phase in ("local", "prod"):
+        for phase in ("local", "alpha", "prod"):
             with self.subTest(phase=phase), Served(phase) as served:
                 request, board = served.request, served.board
                 self.assertEqual(request("/")[0], 200)
@@ -195,13 +195,15 @@ class Launcher(unittest.TestCase):
                 self.assertEqual(request("/index.html")[0], 200); self.assertEqual(request("/styles.css")[0], 200)
                 self.assertEqual(request("/macro-data.js")[0], 200)
                 local = phase == "local"
-                self.assertEqual(request("/run.html")[0], 200 if local else 404, "the wizard exists only in development")
-                self.assertEqual(request("/README.md")[0], 200 if local else 404)
+                non_prod = phase != "prod"
+                self.assertEqual(request("/run.html")[0], 200 if local else 404, "the wizard exists only in local development")
+                self.assertEqual(request("/architecture.html")[0], 200 if non_prod else 404)
+                self.assertEqual(request("/README.md")[0], 200 if non_prod else 404)
                 self.assertEqual(request("/mock/tiger.json")[0], 404, "a mock file is not a record and is never served")
-                self.assertEqual(request(f"/{board.smoke}")[0], 200 if local else 404, "a smoke campaign is never served by production")
-                self.assertEqual(request(f"/{board.smoke_attempt}")[0], 200 if local else 404)
-                self.assertEqual(request(f"/{board.unpublished}")[0], 200 if local else 404, "a valid result the manifest does not name is not downloadable")
-                self.assertEqual(request(f"/{board.published}")[0], 200, "the published record is downloadable in both phases")
+                self.assertEqual(request(f"/{board.smoke}")[0], 200 if non_prod else 404, "a smoke campaign is never served by production")
+                self.assertEqual(request(f"/{board.smoke_attempt}")[0], 200 if non_prod else 404)
+                self.assertEqual(request(f"/{board.unpublished}")[0], 200 if non_prod else 404, "a valid result the manifest does not name is not downloadable in production")
+                self.assertEqual(request(f"/{board.published}")[0], 200, "the published record is downloadable in all phases")
                 self.assertEqual(request(f"/{board.published_campaign}")[0], 200)
                 self.assertEqual(request(f"/{board.published_attempt}")[0], 200)
                 for rel in site.WORKFLOW_DIAGRAMS:
@@ -216,7 +218,7 @@ class Launcher(unittest.TestCase):
                     self.assertEqual(request(path)[0], 404, f"{path}: only the six named maps are routes, even if a file is dropped into the output")
                     self.assertEqual(request(path, method="HEAD")[0], 404, path)
                 for path, config in (("/api/preview", {"systems": ["dolt"], "machine": "box", "location": ""}), ("/api/run", {"systems": ["dolt"], "machine": "box", "location": "", "script": "x"})):
-                    self.assertEqual(request(path, config)[0], 200 if local and path == "/api/preview" else 400 if local else 404, "no launcher route in production")
+                    self.assertEqual(request(path, config)[0], 200 if local and path == "/api/preview" else 400 if local else 404, "no launcher route outside local")
                 served.launch.assert_not_called()
                 for path in ("/.runs/dolt.journal.json", "/.runs/macro/bb_00000000/runner.log", "/dolt/macro/20261010/notes.json", "/dolt/macro/20261010/bb_00000000.parquet",
                              "/serve.py", "/site.py", "/publish.json", "/../.env", "/%2e%2e/.env", "/dolt/macro/20261010/campaign_x.json", "/.site/local/index.html",

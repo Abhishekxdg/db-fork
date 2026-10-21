@@ -369,7 +369,7 @@ function renderMicro() {
     const groups = shown.length ? [{title: 'Operations', ctx: microContext(shown)}] : [];
     el('groups').replaceChildren(...groups.map(g => boardGroup(g.title, g.ctx)));
     el('breakdowns').replaceChildren(...groups.map(g => breakdown(g.title, g.ctx, false)));
-    el('excluded').replaceChildren(...excluded.length ? [excludedPanel('excluded-panel', PROD ? 'Runs without a result' : 'Excluded results',
+    el('excluded').replaceChildren(...excluded.length ? [excludedPanel('excluded-panel', PHASE === 'prod' ? 'Runs without a result' : 'Excluded results',
         excluded.map(x => ({label: `${x.system} / ${x.machine}`, href: x.source, reason: x.reason})), !data.length)] : []);  // with no result at all, the reasons are the news
     renderOperations(groups);
 }

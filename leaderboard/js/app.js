@@ -1,6 +1,7 @@
 /* Boot, state, routing and render. The phase is build configuration written into data.js; nothing in the URL can change it. */
-const PROD = (typeof site === 'undefined' ? 'prod' : site.phase) !== 'local';
-const DOCS = PROD ? 'https://github.com/elaineang/db-fork/blob/main/leaderboard/README.md' : 'README.md';
+const PHASE = typeof site === 'undefined' ? 'prod' : site.phase;
+const PROD = PHASE !== 'local';
+const DOCS = PHASE === 'prod' ? 'https://github.com/elaineang/db-fork/blob/main/leaderboard/README.md' : 'README.md';
 const allOn = values => Object.fromEntries(values.map(v => [v, true]));
 // The page opens on the agent workflows whenever their data is built. Each suite keeps its own selections.
 const state = {

@@ -238,7 +238,7 @@ function renderMacro() {
         : [macroTable({group: '', rows: []}, keys, node('span', 'empty-cell', chosen.length ? 'No matches. Adjust or reset the filters.' : 'No published results yet. Results appear here once a validated run is published.'))]);
     el('macro-breakdowns').replaceChildren(...macroGroupsShown.map(g => macroBreakdown(g, false)));
     el('macro-excluded').replaceChildren(...MACRO.excluded.length ? [excludedPanel('macro-excluded-panel', 'Runs not on the board',
-        MACRO.excluded.map(x => ({label: `${x.system} / ${x.source.split('/').at(-1)}`, href: PROD ? null : x.source, reason: x.reason})))] : []);  // production never links a file it does not serve
+        MACRO.excluded.map(x => ({label: `${x.system} / ${x.source.split('/').at(-1)}`, href: PHASE === 'prod' ? null : x.source, reason: x.reason})))] : []);  // production never links a file it does not serve
     renderExplainer(keys);
 }
 // A row's details, all in one place: its rank, each workflow against the fastest with that workflow's evidence behind

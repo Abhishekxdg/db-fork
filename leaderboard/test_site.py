@@ -25,10 +25,12 @@ class Phase(unittest.TestCase):
     def test_default_env_cli_and_invalid(self):
         self.assertEqual(site.phase(env={}), "prod", "production is the default")
         self.assertEqual(site.phase(env={"LEADERBOARD_PHASE": "local"}), "local")
+        self.assertEqual(site.phase(env={"LEADERBOARD_PHASE": "alpha"}), "alpha")
         self.assertEqual(site.phase("local", env={"LEADERBOARD_PHASE": "prod"}), "local", "the CLI wins over the environment")
+        self.assertEqual(site.phase("alpha", env={"LEADERBOARD_PHASE": "local"}), "alpha", "the CLI wins over the environment")
         self.assertEqual(site.phase(None, env={"LEADERBOARD_PHASE": ""}), "prod", "an empty variable is the default")
-        for bad in ("production", "dev", "LOCAL", "staging"):
-            with self.subTest(bad=bad), self.assertRaisesRegex(site.SiteError, "must be prod or local, not"):
+        for bad in ("production", "dev", "LOCAL", "ALPHA", "staging"):
+            with self.subTest(bad=bad), self.assertRaisesRegex(site.SiteError, "must be prod, alpha or local, not"):
                 site.phase(env={"LEADERBOARD_PHASE": bad})
         with self.assertRaisesRegex(site.SiteError, "'staging'"):
             site.phase("staging")
@@ -142,6 +144,17 @@ class Local(Board):
         self.assertEqual(self.files(prod), sorted(["data.js", "index.html", "macro-data.js", "styles.css", *site.SCRIPTS, *site.WORKFLOW_DIAGRAMS]), "no wizard, README, mock or raw record")
         self.assertEqual(sorted(p.name for p in self.site.iterdir()), ["local", "prod"], "the two phases are isolated directories")
         self.assertTrue((local / "run.html").exists(), "building prod did not touch local")
+        alpha = self.assemble("alpha")
+        alpha_data = self.read(alpha)
+        self.assertEqual(alpha_data["site"], {"phase": "alpha"})
+        self.assertEqual([(e["system"], "source" in e) for e in alpha_data["data"]], [("Doltgres", True)], "alpha carries real validated runs without mock rows")
+        self.assertEqual([c["preset"] for c in alpha_data["macroCampaigns"]], ["mini"], "alpha carries validated mini and full campaigns without requiring publish.json")
+        self.assertNotIn("run.html", self.files(alpha), "alpha omits the macOS-only Terminal launcher")
+        self.assertIn("architecture.html", self.files(alpha))
+        self.assertIn("README.md", self.files(alpha))
+        self.assertIn("dolt/results/20260930/box.json", self.files(alpha))
+        self.assertIn("dolt_mysql/macro/20261010/bb_10000000.json", self.files(alpha))
+        self.assertEqual(sorted(p.name for p in self.site.iterdir()), ["alpha", "local", "prod"], "all three phases are isolated directories")
 
     def test_generated_directory_is_ignored_by_git(self):
         self.assertIn(".site/", (BOARD / ".gitignore").read_text().split())
@@ -159,7 +172,7 @@ class Local(Board):
         (self.board / "workflow-diagrams" / "draft.png").write_bytes(b"\x89PNG stray")
         (self.board / "workflow-diagrams" / "rl_env.svg").write_text("<svg/>")
         self.write(self.payload())
-        for phase in ("prod", "local"):
+        for phase in ("prod", "alpha", "local"):
             target = self.assemble(phase)
             files = self.files(target)
             for rel in site.WORKFLOW_DIAGRAMS:
@@ -254,7 +267,7 @@ class Local(Board):
         self.write(self.payload())
         self.publish({"micro": ["dolt/results/20260930/box.json"], "macro": []})
         meta = self.board / "dolt" / "system.json"; meta.unlink(); meta.symlink_to(BOARD / "dolt" / "system.json")
-        for phase in ("prod", "local"):
+        for phase in ("prod", "alpha", "local"):
             with self.assertRaisesRegex(site.SiteError, "dolt/system.json is a symlink"):
                 self.assemble(phase)
         self.assertFalse(self.site.exists() and any(self.site.iterdir()))
@@ -507,10 +520,209 @@ class Cli(unittest.TestCase):
         env = {**os.environ, "LEADERBOARD_PHASE": "staging"}
         process = subprocess.run([sys.executable, "-m", "leaderboard.site"], capture_output=True, text=True, env=env, cwd=BOARD.parent)
         self.assertEqual(process.returncode, 2)
-        self.assertIn("must be prod or local, not 'staging'", process.stderr)
+        self.assertIn("must be prod, alpha or local, not 'staging'", process.stderr)
         process = subprocess.run([sys.executable, "-m", "leaderboard.site", "--phase", "dev"], capture_output=True, text=True, cwd=BOARD.parent)
         self.assertEqual(process.returncode, 2)
         self.assertIn("invalid choice", process.stderr)
+
+
+class AwsAlphaLifecycle(Board):
+    """Verify the collapsible personal-AWS alpha lifecycle (up, deploy-site, status, run, collapse)."""
+
+    def setUp(self):
+        super().setUp()
+        from leaderboard import aws_alpha
+        self.aws_alpha = aws_alpha
+        self.runs = self.board / ".runs"
+        self.calls: list[list[str]] = []
+        self.cloud = {
+            "instances": [],
+            "volumes": [{"VolumeId": "vol-0alpha1", "State": "available"}],
+            "sgs": [],
+            "keys": [],
+            "buckets": set(),
+        }
+
+    def fake_aws_runner(self, cmd: list[str], **_kwargs):
+        import subprocess
+        self.calls.append(cmd)
+        # Strip 'aws', '--region <r>', '--profile <p>', '--output <o>'
+        tokens = []
+        i = 1
+        while i < len(cmd):
+            if cmd[i] in ("--region", "--profile", "--output"):
+                i += 2
+            else:
+                tokens.append(cmd[i])
+                i += 1
+        svc, op = tokens[0], tokens[1]
+        out = ""
+        rc = 0
+        if (svc, op) == ("sts", "get-caller-identity"):
+            out = json.dumps({"Account": "123456789012", "Arn": "arn:aws:iam::123456789012:user/dev"})
+        elif (svc, op) == ("ssm", "get-parameter"):
+            out = "ami-0ubuntu2404amd64"
+        elif (svc, op) == ("ec2", "describe-instances"):
+            out = json.dumps({"Reservations": [{"Instances": list(self.cloud["instances"])}]})
+        elif (svc, op) == ("ec2", "describe-volumes"):
+            out = json.dumps({"Volumes": list(self.cloud["volumes"])})
+        elif (svc, op) == ("ec2", "describe-security-groups"):
+            out = json.dumps({"SecurityGroups": list(self.cloud["sgs"])})
+        elif (svc, op) == ("ec2", "describe-key-pairs"):
+            out = json.dumps({"KeyPairs": list(self.cloud["keys"])})
+        elif (svc, op) == ("ec2", "create-key-pair"):
+            kname = tokens[tokens.index("--key-name") + 1]
+            self.cloud["keys"].append({"KeyName": kname})
+            out = json.dumps({"KeyName": kname, "KeyMaterial": "-----BEGIN OPENSSH PRIVATE KEY-----\nalpha\n"})
+        elif (svc, op) == ("ec2", "create-security-group"):
+            gname = tokens[tokens.index("--group-name") + 1]
+            gid = "sg-0alpha123"
+            self.cloud["sgs"].append({"GroupId": gid, "GroupName": gname})
+            out = json.dumps({"GroupId": gid})
+        elif (svc, op) == ("ec2", "run-instances"):
+            iid = "i-0alpha999"
+            itype = tokens[tokens.index("--instance-type") + 1]
+            self.cloud["instances"].append(
+                {
+                    "InstanceId": iid,
+                    "State": {"Name": "running"},
+                    "InstanceType": itype,
+                    "PublicIpAddress": "198.51.100.42",
+                }
+            )
+            out = json.dumps({"Instances": [{"InstanceId": iid}]})
+        elif (svc, op) == ("ec2", "terminate-instances"):
+            for inst in self.cloud["instances"]:
+                inst["State"] = {"Name": "terminated"}
+            out = "terminated"
+        elif (svc, op) == ("ec2", "delete-volume"):
+            vid = tokens[tokens.index("--volume-id") + 1]
+            self.cloud["volumes"] = [v for v in self.cloud["volumes"] if v["VolumeId"] != vid]
+        elif (svc, op) == ("ec2", "delete-security-group"):
+            gid = tokens[tokens.index("--group-id") + 1]
+            self.cloud["sgs"] = [g for g in self.cloud["sgs"] if g["GroupId"] != gid]
+        elif (svc, op) == ("ec2", "delete-key-pair"):
+            kname = tokens[tokens.index("--key-name") + 1]
+            self.cloud["keys"] = [k for k in self.cloud["keys"] if k["KeyName"] != kname]
+        elif (svc, op) == ("s3api", "head-bucket"):
+            bname = tokens[tokens.index("--bucket") + 1]
+            rc = 0 if bname in self.cloud["buckets"] else 1
+        elif (svc, op) == ("s3api", "create-bucket"):
+            bname = tokens[tokens.index("--bucket") + 1]
+            self.cloud["buckets"].add(bname)
+            out = json.dumps({"Location": f"/{bname}"})
+        elif (svc, op) == ("s3api", "list-object-versions"):
+            out = json.dumps({"Versions": [{"Key": "index.html", "VersionId": "v1"}], "DeleteMarkers": []})
+        elif (svc, op) == ("s3api", "delete-bucket"):
+            bname = tokens[tokens.index("--bucket") + 1]
+            self.cloud["buckets"].discard(bname)
+        elif (svc, op) == ("s3", "presign"):
+            out = "https://s3.amazonaws.com/presigned/index.html"
+        return subprocess.CompletedProcess(cmd, rc, stdout=out, stderr="")
+
+    def test_up_deploy_status_and_collapse_tear_down_all_resources(self):
+        self.write(self.payload())
+        aws = self.aws_alpha.AwsCli(region="us-east-1", runner=self.fake_aws_runner)
+        state = self.aws_alpha.up_alpha(
+            aws=aws,
+            stack="branchbench-alpha",
+            instance_type="i4i.2xlarge",
+            spot=True,
+            runs_dir=self.runs,
+            http_getter=lambda _url: "203.0.113.9\n",
+        )
+        self.assertEqual(state["phase"], "alpha")
+        self.assertEqual(state["instance_id"], "i-0alpha999")
+        self.assertEqual(state["ssh_cidr"], "203.0.113.9/32")
+        self.assertEqual(state["bucket"], "branchbench-alpha-123456789012-us-east-1")
+        self.assertTrue((self.runs / "aws_alpha_state.json").is_file())
+        self.assertTrue((self.runs / "branchbench-alpha.pem").is_file())
+
+        # Duplicate `up` while active refuses to leak a second instance
+        with self.assertRaisesRegex(self.aws_alpha.AlphaError, "already has an EC2 instance"):
+            self.aws_alpha.up_alpha(
+                aws=aws,
+                stack="branchbench-alpha",
+                runs_dir=self.runs,
+                http_getter=lambda _url: "203.0.113.9",
+            )
+
+        deployed = self.aws_alpha.deploy_alpha_site(
+            aws=aws,
+            stack="branchbench-alpha",
+            board=self.board,
+            runs_dir=self.runs,
+        )
+        self.assertTrue((self.site / "alpha" / "index.html").is_file())
+        self.assertEqual(deployed["bucket"], "branchbench-alpha-123456789012-us-east-1")
+
+        active_status = self.aws_alpha.status_alpha(
+            aws=aws,
+            stack="branchbench-alpha",
+            board=self.board,
+            runs_dir=self.runs,
+        )
+        self.assertFalse(active_status["collapsed"])
+
+        # Even if state file is lost before collapse, tag discovery still tears everything down
+        (self.runs / "aws_alpha_state.json").unlink()
+        # Re-save bucket in state or test tag discovery for EC2/EBS/SG/Key + state bucket
+        self.aws_alpha.save_state({"bucket": state["bucket"]}, self.runs, "branchbench-alpha")
+        collapsed = self.aws_alpha.collapse_alpha(
+            aws=aws,
+            stack="branchbench-alpha",
+            board=self.board,
+            runs_dir=self.runs,
+        )
+        self.assertEqual(collapsed["terminated_instances"], ["i-0alpha999"])
+        self.assertEqual(collapsed["deleted_volumes"], ["vol-0alpha1"])
+        self.assertEqual(collapsed["deleted_security_groups"], ["sg-0alpha123"])
+        self.assertEqual(collapsed["deleted_bucket"], "branchbench-alpha-123456789012-us-east-1")
+        self.assertEqual(collapsed["ongoing_aws_cost"], "$0.00/hr")
+        self.assertFalse((self.site / "alpha").exists())
+        self.assertFalse((self.runs / "aws_alpha_state.json").exists())
+        self.assertFalse((self.runs / "branchbench-alpha.pem").exists())
+
+        final_status = self.aws_alpha.status_alpha(
+            aws=aws,
+            stack="branchbench-alpha",
+            board=self.board,
+            runs_dir=self.runs,
+        )
+        self.assertTrue(final_status["collapsed"])
+
+    def test_run_with_collapse_after_pulls_results_builds_alpha_site_and_collapses_aws(self):
+        import subprocess
+        self.write(self.payload())
+        aws = self.aws_alpha.AwsCli(region="us-east-1", runner=self.fake_aws_runner)
+        self.aws_alpha.up_alpha(
+            aws=aws,
+            stack="branchbench-alpha",
+            runs_dir=self.runs,
+            http_getter=lambda _url: "203.0.113.9",
+        )
+        ssh_rsync_calls = []
+
+        def fake_cmd_runner(cmd: list[str], **_kwargs):
+            ssh_rsync_calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        rc = self.aws_alpha.run_alpha_benchmarks(
+            aws=aws,
+            stack="branchbench-alpha",
+            preset="mini",
+            systems="dolt dolt_mysql",
+            collapse_after=True,
+            board=self.board,
+            runs_dir=self.runs,
+            cmd_runner=fake_cmd_runner,
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(ssh_rsync_calls), 4, "wait for bootstrap, rsync up, ssh worker run, rsync pull")
+        self.assertTrue((self.site / "alpha" / "data.js").is_file(), "--collapse-after keeps local .site/alpha while tearing down AWS")
+        self.assertFalse((self.runs / "aws_alpha_state.json").exists(), "AWS state is collapsed after the run")
+        self.assertEqual(self.cloud["sgs"], [])
+        self.assertEqual(self.cloud["buckets"], set())
 
 
 if __name__ == "__main__":

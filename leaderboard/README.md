@@ -189,7 +189,39 @@ Managed cloud database folders (`"hosted": "yes"`, such as `leaderboard/neon/`, 
 
 ---
 
-## Running on AWS (Economic 1-VM Model)
+## Running on AWS (Economic 1-VM Model & Collapsible `alpha` Phase)
+
+The site assembler (`python -m leaderboard.site`) and local preview server (`python -m leaderboard.serve`) support three isolated website phases under `leaderboard/.site/<phase>`:
+
+- **`local`** (`--phase local`): Local developer preview (`leaderboard/.site/local`). Includes all validated micro and macro results on disk, illustrative mock rows (`leaderboard/mock.py`), the macOS Terminal launcher (`run.html`), `architecture.html`, and `README.md`.
+- **`alpha`** (`--phase alpha`): Personal AWS development & staging phase (`leaderboard/.site/alpha`). Includes all validated real micro and macro runs on disk (including `mini` smoke campaigns without requiring `publish.json`), `architecture.html`, `README.md`, and all raw records, while excluding mock rows and the macOS-only `run.html` wizard.
+- **`prod`** (`--phase prod`, default): Official production release (`leaderboard/.site/prod`). Publishes only the records listed in `leaderboard/publish.json` (`full` macro campaigns and comparable micro results).
+
+### Collapsible Personal AWS Deployment (`alpha` Phase)
+
+Use `./leaderboard/aws_alpha.sh` (`python -m leaderboard.aws_alpha`) to provision, benchmark, deploy, inspect, and **completely collapse** a personal AWS `alpha` environment in your own AWS account (`Project=BranchBenchLeaderboard, Phase=alpha, Stack=branchbench-alpha`):
+
+```bash
+# 1. Provision 1 Ubuntu 24.04 EC2 worker (i4i.2xlarge or c6i.2xlarge, optional --spot) + S3 alpha bucket
+./leaderboard/aws_alpha.sh up --region us-east-1 --instance-type i4i.2xlarge --spot
+
+# 2. Sync repo to the alpha EC2 worker, run benchmarks, pull results back, and sync .site/alpha to S3
+./leaderboard/aws_alpha.sh run --preset mini --systems "dolt dolt_mysql matrixone seekdb file_copy"
+
+# 3. Preview .site/alpha locally or re-sync to the alpha S3 bucket at any time
+uv run --frozen python -m leaderboard.serve --phase alpha
+./leaderboard/aws_alpha.sh deploy-site
+
+# 4. Check active AWS alpha resources and billing status
+./leaderboard/aws_alpha.sh status
+
+# 5. Collapse the entire alpha environment after testing (returns ongoing AWS cost to $0.00/hr)
+./leaderboard/aws_alpha.sh collapse
+```
+
+Running `./leaderboard/aws_alpha.sh collapse` (or `down` / `destroy`) terminates the EC2 worker (waiting for `instance-terminated`), deletes any leftover tagged EBS volumes, deletes the alpha security group and EC2 key pair, empties and deletes the alpha S3 bucket (unless `--keep-bucket` is passed), and removes `leaderboard/.site/alpha` and `leaderboard/.runs/aws_alpha_state.json`. You can also pass `--collapse-after` to `./leaderboard/aws_alpha.sh run` to tear down all AWS resources automatically as soon as results are pulled back.
+
+### Production Release (`prod` Phase on 1 Reusable VM)
 
 To produce official comparable leaderboard results on a single reusable EC2 worker VM (stopped between releases so you pay only for EBS storage when idle, plus On-Demand compute at `~$0.68/hr` on `i4i.2xlarge` or `~$0.34/hr` on `c6i.2xlarge` while a batch is actively running):
 

@@ -749,7 +749,7 @@ assert.equal(many.observers.intersection.length, 0, 'Nothing is animated for an 
 assert.equal(headRow(boards(many)[0]).length, 11, 'Nine workflow columns between system and completion');
 assert.equal(classNodes(many.elements.get('macro-groups'), 'done-count')[0].textContent, '9 / 9');
 
-// Production: the same page with no developer affordances.
+// Production and alpha: the same page with no developer wizard affordances; alpha still links bundled README and excluded records.
 const prod = mount(data, [], macroData, '#agent-workflows', 'prod');
 assert.equal(prod.elements.get('nav-run').removed, true, 'The run wizard is not in the production page');
 assert.equal(prod.elements.get('doc-nav').href, 'https://github.com/elaineang/db-fork/blob/main/leaderboard/README.md');
@@ -760,6 +760,11 @@ assert.equal(prod.run('window.location.hash'), '#agent-workflows?workflow=data_a
 assert.equal(descendants(prod.elements.get('macro-excluded')).find(e => e.tag === 'a'), undefined, 'Production never links a file it does not serve');
 assert.equal(mount(data, [], macroData, '', 'prod').run('state.suite'), 'macro', 'Production opens on the agent workflows');
 assert.equal(mount(data, [], macroData, '#microbench', 'prod').run('state.suite'), 'micro', 'The microbench stays reachable');
+const alpha = mount(data, [], macroData, '#agent-workflows', 'alpha');
+assert.equal(alpha.elements.get('nav-run').removed, true, 'The macOS run wizard is not in the alpha AWS page');
+assert.equal(alpha.elements.get('doc-nav').href, 'README.md', 'Alpha serves its bundled README');
+assert.equal(descendants(alpha.elements.get('macro-excluded')).find(e => e.tag === 'a').href, 'dolt/macro/20261010/campaign_deadbeef.json', 'Alpha links bundled excluded records');
+assert.equal(mount(data, [], macroData, '', 'alpha').run('state.suite'), 'macro', 'Alpha opens on the agent workflows');
 const prodEmpty = mount([], [{system: 'Old', machine: 'box', source: 'dolt/results/20261001/box.json', reason: 'server did not start'}], {suite: macroData.suite, campaigns: [], excluded: []}, '', 'prod');
 assert.equal(emptyRow(prodEmpty).textContent, 'No published results yet. Results appear here once a validated run is published.');
 prodEmpty.document.getElementById('tab-micro').click();

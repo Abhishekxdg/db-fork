@@ -2,8 +2,9 @@
 
 From the repository root:
     python -m leaderboard.site                  # production: only publish.json's official records
+    python -m leaderboard.site --phase alpha    # personal AWS staging: all validated runs, no mock rows or wizard
     python -m leaderboard.site --phase local    # development: everything the builders find here
-    LEADERBOARD_PHASE=local python -m leaderboard.site
+    LEADERBOARD_PHASE=alpha python -m leaderboard.site
 
 The phase is website configuration, never measurement provenance: it decides which
 records the generated site carries, and nothing a browser sends can change it.
@@ -11,12 +12,15 @@ records the generated site carries, and nothing a browser sends can change it.
 prod  carries the micro results and the Full campaigns that publish.json names, the
       raw JSON of those records, index.html, styles.css, the page scripts and the six
       workflow diagram PNGs. No mock, quick, unvalidated or unselected record, no wizard, no README.
+alpha carries what build() and build_macro.build() find (every validated micro result
+      and macro campaign on disk, including mini smoke campaigns), architecture.html,
+      the README and all raw records, without mock rows or the local macOS wizard.
 local carries what build() and build_macro.build() find: the newest micro result per
       system and machine (an invalid or failed newest file is listed as excluded), every
       campaign that passes validation, the wizard and the README, plus the rows of
       leaderboard.mock, the one module that knows about mock data.
 
-Both phases use the same page and the same ingestion; this module only selects and
+All phases use the same page and the same ingestion; this module only selects and
 copies. Output goes only to <board>/.site/<phase>: it is prepared in a staging
 directory next to it and swapped in whole, so a failed build leaves the previous
 output in place, and no symlink is ever followed on the way in or out.
@@ -37,11 +41,15 @@ from leaderboard import build, build_macro, mock
 from leaderboard.validate import BOARD, MACHINE_RE, validate
 from leaderboard.validate_macro import MACRO_SUITE, OUTCOMES, SCENARIOS, VERBS
 
-PHASES = ("prod", "local")
+PHASES = ("prod", "alpha", "local")
 SITE = BOARD / ".site"
 # The page script, in load order: plain scripts share one global scope and, unlike ES modules, still run from a file:// preview.
 SCRIPTS = tuple(f"js/{name}.js" for name in ("dom", "details", "scenes", "micro", "macro", "app"))
-PAGES = {"prod": ("index.html", "styles.css", *SCRIPTS), "local": ("index.html", "run.html", "architecture.html", "styles.css", "README.md", *SCRIPTS)}
+PAGES = {
+    "prod": ("index.html", "styles.css", *SCRIPTS),
+    "alpha": ("index.html", "architecture.html", "styles.css", "README.md", *SCRIPTS),
+    "local": ("index.html", "run.html", "architecture.html", "styles.css", "README.md", *SCRIPTS),
+}
 # The six agent-workflow process maps, rendered from workflow-diagrams/source.html, which itself is a build input and is never published.
 WORKFLOW_DIAGRAMS = tuple(f"workflow-diagrams/{key}.png" for key in ("rl_env", "context_mgmt", "multi_agent", "dev_agent", "ops_agent", "data_agent"))
 MICRO_RE = re.compile(r"[a-z0-9_]+/results/\d{8}/" + MACHINE_RE.pattern + r"\.json")
@@ -57,8 +65,9 @@ def phase(value: str | None = None, env: dict = os.environ) -> str:
     """The phase from the CLI value, else $LEADERBOARD_PHASE, else prod."""
     chosen = value or env.get("LEADERBOARD_PHASE") or "prod"
     if chosen not in PHASES:
-        raise SiteError(f"LEADERBOARD_PHASE (or --phase) must be prod or local, not {chosen!r}: "
+        raise SiteError(f"LEADERBOARD_PHASE (or --phase) must be prod, alpha or local, not {chosen!r}: "
                         "prod publishes only the official records in leaderboard/publish.json; "
+                        "alpha stages every validated run on this machine without mock rows or the local wizard; "
                         "local builds the development preview from everything on this machine")
     return chosen
 
@@ -157,10 +166,10 @@ def everything(board: Path) -> tuple[list[dict], list[dict], list[dict], list[di
 
 def raw_files(entries: list[dict], excluded: list[dict], campaigns: list[dict], macro_excluded: list[dict], phase: str) -> set[str]:
     """The record files the page links to: in prod only validated records and error
-    records, in local every file the builders saw."""
+    records, in alpha and local every file the builders saw."""
     files = {e["source"] for e in entries} | {x["source"] for x in excluded} | {c["source"] for c in campaigns}
     files |= {a["source"] for c in campaigns for a in c["attempts"].values()}
-    if phase == "local":
+    if phase != "prod":
         files |= {x["source"] for x in macro_excluded}
     return files
 
@@ -228,7 +237,7 @@ def assemble(phase: str, board: Path = BOARD) -> Path:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Assemble the static leaderboard site for one phase.")
-    parser.add_argument("--phase", choices=PHASES, help="prod (default) or local; $LEADERBOARD_PHASE otherwise")
+    parser.add_argument("--phase", choices=PHASES, help="prod (default), alpha or local; $LEADERBOARD_PHASE otherwise")
     args = parser.parse_args(argv)
     try:
         chosen = phase(args.phase)
