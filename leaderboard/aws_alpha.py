@@ -56,6 +56,9 @@ HOSTED_ENV_KEYS = (
     "TIGER_PROJECT_ID",
     "XATA_API_KEY",
     "XATA_ORGANIZATION_ID",
+    "MO_ARCHIVE_URL",
+    "SEEKDB_ARCHIVE_URL",
+    "CHRONOS_PIP_SPEC",
 )
 
 
@@ -161,6 +164,14 @@ def bootstrap_user_data() -> str:
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
+cat >/etc/sudoers.d/branchbench-shutdown <<'EOF'
+ubuntu ALL=(root) NOPASSWD: /sbin/shutdown, /usr/sbin/shutdown
+EOF
+chmod 0440 /etc/sudoers.d/branchbench-shutdown
+
+# Arm dead-man auto-poweroff timer (6 hours) before network/package operations
+/sbin/shutdown -P +360 >/dev/null 2>&1
+
 systemctl disable --now unattended-upgrades apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
 
 apt-get update -y
@@ -183,14 +194,6 @@ done
 
 usermod -aG docker ubuntu || true
 systemctl enable --now docker
-
-cat >/etc/sudoers.d/branchbench-shutdown <<'EOF'
-ubuntu ALL=(root) NOPASSWD: /sbin/shutdown, /usr/sbin/shutdown
-EOF
-chmod 0440 /etc/sudoers.d/branchbench-shutdown
-
-# Dead-man auto-poweroff timer (6 hours) in case the operator disconnects after 'up'
-/sbin/shutdown -P +360 >/dev/null 2>&1 || true
 
 mkdir -p /mnt/nvme
 ROOT_DISK="$(lsblk -no PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null | head -n1 || true)"
@@ -371,21 +374,24 @@ def discover_stack_resources(aws: AwsCli, stack: str, state: dict[str, Any]) -> 
     if state_key and state_key not in keys:
         keys.append(state_key)
 
-    bucket = str(state.get("bucket") or "")
-    if not bucket:
-        try:
-            b_resp = aws.call_json(["s3api", "list-buckets"])
-            for b_item in b_resp.get("Buckets") or []:
-                b_name = str((b_item or {}).get("Name") or "")
-                if b_name.startswith(f"{stack}-"):
-                    try:
-                        verify_bucket_ownership(aws, stack, b_name)
-                        bucket = b_name
-                        break
-                    except AlphaError:
-                        continue
-        except AlphaError:
-            pass
+    buckets: list[str] = []
+    state_bucket = str(state.get("bucket") or "")
+    if state_bucket:
+        buckets.append(state_bucket)
+    try:
+        b_resp = aws.call_json(["s3api", "list-buckets"])
+        for b_item in b_resp.get("Buckets") or []:
+            b_name = str((b_item or {}).get("Name") or "")
+            if not b_name or b_name in buckets:
+                continue
+            try:
+                verify_bucket_ownership(aws, stack, b_name)
+                buckets.append(b_name)
+            except AlphaError:
+                continue
+    except AlphaError:
+        pass
+    bucket = buckets[0] if buckets else ""
     return {
         "stack": stack,
         "region": aws.region,
@@ -394,6 +400,7 @@ def discover_stack_resources(aws: AwsCli, stack: str, state: dict[str, Any]) -> 
         "security_groups": sgs,
         "key_pairs": keys,
         "bucket": bucket,
+        "buckets": buckets,
     }
 
 
@@ -477,15 +484,21 @@ def ensure_security_group(aws: AwsCli, stack: str, ssh_cidr: str, vpc_id: str = 
 
 
 def _classify_head_bucket(aws: AwsCli, bucket: str) -> str:
-    """Return 'exists' if head-bucket succeeds, 'missing' on 404/NoSuchBucket, or raise AlphaError on 403/other errors."""
+    """Return 'exists' if head-bucket succeeds, 'missing' on explicit 404/NoSuchBucket, or raise AlphaError."""
     head = aws.call_text(["s3api", "head-bucket", "--bucket", bucket], check=False)
     if head.returncode == 0:
         return "exists"
     detail = (head.stderr or head.stdout or "").strip()
     low = detail.lower()
-    if not detail or "404" in low or "not found" in low or "nosuchbucket" in low:
+    if (
+        head.returncode != 255
+        and detail
+        and "could not connect" not in low
+        and "unable to locate credentials" not in low
+        and re.search(r"\((?:404|nosuchbucket)\)|\bhttp\s+status\s+code:\s*404\b|\bnot\s+found\b", low)
+    ):
         return "missing"
-    raise AlphaError(f"aws s3api head-bucket failed for {bucket!r}: {detail}")
+    raise AlphaError(f"aws s3api head-bucket failed for {bucket!r}: {detail or f'exit {head.returncode}'}")
 
 
 def verify_bucket_ownership(aws: AwsCli, stack: str, bucket: str) -> None:
@@ -834,7 +847,7 @@ def deploy_alpha_site(
 
 
 def write_sync_filelist(runs_dir: Path, stack: str, root: Path = ROOT) -> Path:
-    """Write an explicit allowlist of git-tracked files and safe git object/ref metadata (never untracked files or .git/config)."""
+    """Write an explicit allowlist of git-tracked regular files and safe git object/ref regular files (never untracked files or .git/config)."""
     runs_dir.mkdir(parents=True, exist_ok=True)
     filelist_path = runs_dir / f"{stack}-sync-files.txt"
     tracked: list[str] = []
@@ -845,28 +858,39 @@ def write_sync_filelist(runs_dir: Path, stack: str, root: Path = ROOT) -> Path:
             text=True,
             check=True,
         )
-        for line in res.stdout.splitlines():
-            rel = line.strip()
-            if not rel:
-                continue
-            if (
-                rel == ".env"
-                or rel.startswith(".env.")
-                or rel.endswith((".pem", ".key"))
-                or rel.startswith("leaderboard/.site/")
-                or rel.startswith("leaderboard/.runs/")
-            ):
-                continue
-            if (root / rel).exists():
-                tracked.append(rel)
-    except Exception:
-        tracked = ["leaderboard", "microbench", "macrobench", "dblib", "util", "pyproject.toml", "uv.lock", "build_protos.py"]
-    for git_rel in (".git/HEAD", ".git/packed-refs", ".git/refs", ".git/objects"):
-        if (root / git_rel).exists():
-            tracked.append(git_rel)
+    except Exception as exc:
+        raise AlphaError(f"cannot enumerate git-tracked files in {root}: {exc}") from exc
+    for line in res.stdout.splitlines():
+        rel = line.strip()
+        if not rel:
+            continue
+        if (
+            rel == ".env"
+            or rel.startswith(".env.")
+            or rel.endswith((".pem", ".key"))
+            or rel.startswith("leaderboard/.site/")
+            or rel.startswith("leaderboard/.runs/")
+        ):
+            continue
+        candidate = root / rel
+        if candidate.is_file() and not candidate.is_symlink():
+            tracked.append(rel)
+    for git_file in (".git/HEAD", ".git/packed-refs"):
+        gf_path = root / git_file
+        if gf_path.is_file() and not gf_path.is_symlink():
+            tracked.append(git_file)
+    for git_dir in (".git/refs", ".git/objects"):
+        gd_path = root / git_dir
+        if gd_path.is_dir() and not gd_path.is_symlink():
+            for child in sorted(gd_path.rglob("*")):
+                if child.is_file() and not child.is_symlink() and not child.name.endswith(".tmp"):
+                    tracked.append(child.relative_to(root).as_posix())
     dataset_rel = "leaderboard/data/tpcc_10w.sql"
-    if (root / dataset_rel).is_file() and dataset_rel not in tracked:
+    dataset_path = root / dataset_rel
+    if dataset_path.is_file() and not dataset_path.is_symlink() and dataset_rel not in tracked:
         tracked.append(dataset_rel)
+    if not tracked:
+        raise AlphaError(f"git ls-files returned no syncable files in {root}")
     filelist_path.write_text("\n".join(dict.fromkeys(tracked)) + "\n", encoding="utf-8")
     return filelist_path
 
@@ -881,6 +905,7 @@ def run_alpha_benchmarks(
     client_location: str = "",
     machine: str = "",
     batch_deadline_min: float = 720.0,
+    profile_mode: str = "economic",
     deploy_site_after: bool = True,
     collapse_after: bool = False,
     board: Path = BOARD,
@@ -892,6 +917,10 @@ def run_alpha_benchmarks(
         raise AlphaError(f"--preset must be mini or full, got {preset!r}")
     if lane not in ("all", "micro", "macro"):
         raise AlphaError(f"--lane must be all, micro, or macro, got {lane!r}")
+    if profile_mode not in ("economic", "paper"):
+        raise AlphaError(f"--profile-mode must be economic or paper, got {profile_mode!r}")
+    if profile_mode == "paper" and preset != "full":
+        raise AlphaError("--profile-mode paper requires --preset full")
     state = load_state(runs_dir, stack)
     public_ip = str(state.get("public_ip") or "")
     key_path = str(state.get("key_path") or key_file_path(runs_dir, stack))
@@ -910,6 +939,8 @@ def run_alpha_benchmarks(
         "--batch-deadline-min",
         f"{batch_deadline_min:g}",
     ]
+    if profile_mode != "economic":
+        worker_cmd.extend(["--profile-mode", profile_mode])
     if lane in ("micro", "macro"):
         worker_cmd.extend(["--lane", lane])
     if systems.strip():
@@ -923,6 +954,7 @@ def run_alpha_benchmarks(
             "dry_run": True,
             "phase": "alpha",
             "stack": stack,
+            "profile_mode": profile_mode,
             "public_ip": public_ip or "<from-state>",
             "remote_cmd": shlex.join(worker_cmd),
             "deploy_site_after": deploy_site_after,
@@ -946,42 +978,30 @@ def run_alpha_benchmarks(
     ]
     ssh_target = f"ubuntu@{public_ip}"
     ssh_rsh = f"ssh {' '.join(shlex.quote(o) for o in ssh_opts)}"
+    collapse_failed = False
 
     try:
-        # 1. Wait for cloud-init bootstrap marker on the worker (with SSH connection retry)
+        # 1. Wait for cloud-init bootstrap marker on the worker and reset ~/db-fork cleanly
         wait_cmd = [
             "ssh",
             *ssh_opts,
             "-o",
             "ConnectionAttempts=10",
             ssh_target,
-            "for i in $(seq 1 90); do [ -f /var/lib/branchbench-alpha-ready ] && exit 0; sleep 5; done; exit 1",
+            "for i in $(seq 1 90); do [ -f /var/lib/branchbench-alpha-ready ] && rm -rf ~/db-fork && mkdir -p ~/db-fork && exit 0; sleep 5; done; exit 1",
         ]
         if cmd_runner(wait_cmd).returncode != 0:
             raise AlphaError(
                 f"timed out waiting for cloud-init bootstrap (/var/lib/branchbench-alpha-ready) on {ssh_target}"
             )
 
-        # 2. Sync only git-tracked files and safe .git metadata (never untracked files or .git/config)
+        # 2. Sync only git-tracked regular files and safe .git metadata (portable across GNU rsync and macOS openrsync)
         filelist_path = write_sync_filelist(runs_dir, stack, ROOT)
         try:
             sync_up = [
                 "rsync",
                 "-az",
-                "--recursive",
-                "--delete",
-                "--delete-missing-args",
                 f"--files-from={filelist_path}",
-                "--exclude=.git/objects/pack/*.tmp",
-                "--exclude=.git/config",
-                "--exclude=.venv",
-                "--exclude=.env",
-                "--exclude=.env.*",
-                "--exclude=*.pem",
-                "--exclude=*.key",
-                "--exclude=credentials*",
-                "--exclude=leaderboard/.site",
-                "--exclude=leaderboard/.runs",
                 "-e",
                 ssh_rsh,
                 f"{ROOT}/",
@@ -992,6 +1012,15 @@ def run_alpha_benchmarks(
         finally:
             filelist_path.unlink(missing_ok=True)
 
+        # 2b. If local ~/mo/matrixone or ~/seekdb exists on the operator machine (linux x86_64 binaries), sync them
+        selected_tokens = set(systems.replace(",", " ").split()) if systems.strip() else {"matrixone", "seekdb"}
+        mo_local = Path.home() / "mo" / "matrixone"
+        if "matrixone" in selected_tokens and (mo_local / "mo-service").is_file():
+            cmd_runner(["rsync", "-az", "-e", ssh_rsh, f"{mo_local}/", f"{ssh_target}:~/mo/matrixone/"])
+        seekdb_local = Path.home() / "seekdb"
+        if "seekdb" in selected_tokens and (seekdb_local / "bin" / "seekdb").is_file():
+            cmd_runner(["rsync", "-az", "-e", ssh_rsh, f"{seekdb_local}/", f"{ssh_target}:~/seekdb/"])
+
         # 3. Execute benchmark batch on worker (pass hosted DB secrets over encrypted SSH stdin, never in argv)
         env_stdin = "".join(
             f"export {k}={shlex.quote(os.environ[k])}\n"
@@ -1001,7 +1030,7 @@ def run_alpha_benchmarks(
         deadman_min = max(15, int(batch_deadline_min) + 15)
         remote_steps = [
             'export PATH="$HOME/.local/bin:$PATH"',
-            f"sudo -n /sbin/shutdown -P +{deadman_min} >/dev/null 2>&1 || true",
+            f"sudo -n /sbin/shutdown -P +{deadman_min} >/dev/null 2>&1",
             *(["eval \"$(cat)\""] if env_stdin else []),
             "cd ~/db-fork",
             "(uv sync --frozen --extra chronos || uv sync --frozen)",
@@ -1037,10 +1066,13 @@ def run_alpha_benchmarks(
         if deploy_site_after and state.get("bucket"):
             deploy_alpha_site(aws=aws, stack=stack, board=board, runs_dir=runs_dir)
 
-        return run_res.returncode
+        rc = run_res.returncode
     finally:
         if collapse_after:
-            collapse_alpha(aws=aws, stack=stack, board=board, runs_dir=runs_dir, keep_local_site=True)
+            col_res = collapse_alpha(aws=aws, stack=stack, board=board, runs_dir=runs_dir, keep_local_site=True)
+            if not col_res.get("collapsed", True):
+                collapse_failed = True
+    return 1 if collapse_failed and rc == 0 else rc
 
 
 def status_alpha(
@@ -1066,9 +1098,9 @@ def status_alpha(
         return info
 
     discovered = discover_stack_resources(aws, stack, state)
-    bucket_exists = False
-    if discovered["bucket"]:
-        bucket_exists = _classify_head_bucket(aws, discovered["bucket"]) == "exists"
+    candidate_buckets = discovered.get("buckets") or ([discovered["bucket"]] if discovered.get("bucket") else [])
+    existing_buckets = [b for b in candidate_buckets if _classify_head_bucket(aws, b) == "exists"]
+    bucket_exists = bool(existing_buckets)
     active_compute = any(
         i["state"] in ("pending", "running", "stopping", "stopped") for i in discovered["instances"]
     )
@@ -1080,7 +1112,8 @@ def status_alpha(
         "volumes": discovered["volumes"],
         "security_groups": discovered["security_groups"],
         "key_pairs": discovered["key_pairs"],
-        "bucket": discovered["bucket"] if bucket_exists else None,
+        "bucket": existing_buckets[0] if existing_buckets else None,
+        "buckets": existing_buckets,
         "local_alpha_site": str(alpha_site) if alpha_site.is_dir() else None,
         "state_file": str(state_file_path(runs_dir, stack)) if state_file_path(runs_dir, stack).is_file() else None,
         "collapsed": not (
@@ -1206,20 +1239,24 @@ def collapse_alpha(
         else:
             remaining_keys.append(kname)
 
-    deleted_bucket = None
-    remaining_bucket = discovered["bucket"] if keep_bucket else ""
-    if not keep_bucket and discovered["bucket"]:
-        if _empty_and_delete_bucket(aws, discovered["bucket"], stack=stack):
-            deleted_bucket = discovered["bucket"]
-        else:
-            remaining_bucket = discovered["bucket"]
+    candidate_buckets = discovered.get("buckets") or ([discovered["bucket"]] if discovered.get("bucket") else [])
+    deleted_buckets: list[str] = []
+    remaining_buckets: list[str] = list(candidate_buckets) if keep_bucket else []
+    if not keep_bucket:
+        for b_name in candidate_buckets:
+            if _empty_and_delete_bucket(aws, b_name, stack=stack):
+                deleted_buckets.append(b_name)
+            else:
+                remaining_buckets.append(b_name)
+    deleted_bucket = deleted_buckets[0] if deleted_buckets else None
+    remaining_bucket = remaining_buckets[0] if remaining_buckets else ""
 
     if not remaining_keys:
         kpath.unlink(missing_ok=True)
         if state.get("key_path"):
             Path(str(state["key_path"])).unlink(missing_ok=True)
 
-    has_remaining = bool(remaining_volumes or remaining_sgs or remaining_keys or remaining_bucket)
+    has_remaining = bool(remaining_volumes or remaining_sgs or remaining_keys or remaining_buckets)
     if has_remaining:
         updated = dict(state)
         updated["instance_id"] = ""
@@ -1245,10 +1282,12 @@ def collapse_alpha(
         "deleted_security_groups": deleted_sgs,
         "deleted_key_pairs": deleted_keys,
         "deleted_bucket": deleted_bucket,
+        "deleted_buckets": deleted_buckets,
         "remaining_volumes": remaining_volumes,
         "remaining_security_groups": remaining_sgs,
         "remaining_key_pairs": remaining_keys,
         "remaining_bucket": remaining_bucket or None,
+        "remaining_buckets": remaining_buckets,
         "local_alpha_site_removed": not keep_local_site and not alpha_site.exists(),
         "state_file_removed": not spath.exists(),
         "ongoing_aws_cost": "$0.00/hr" if not has_remaining else "partial (see remaining resources)",
@@ -1299,6 +1338,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--client-location", default="", help="Client location label when benchmarking hosted systems")
     run_p.add_argument("--machine", default="", help="Override machine label")
     run_p.add_argument("--batch-deadline-min", type=float, default=720.0, help="Batch wall-clock timeout in minutes")
+    run_p.add_argument("--profile-mode", choices=("economic", "paper"), default="economic", help="Execution profile: 'economic' (default 1-VM sequential) or 'paper'")
     run_p.add_argument("--no-deploy-site", action="store_true", help="Build .site/alpha locally without syncing to S3")
     run_p.add_argument("--collapse-after", action="store_true", help="Automatically collapse all AWS resources after pulling results")
 
@@ -1351,6 +1391,7 @@ def main(argv: list[str] | None = None) -> int:
                 client_location=args.client_location,
                 machine=args.machine,
                 batch_deadline_min=args.batch_deadline_min,
+                profile_mode=args.profile_mode,
                 deploy_site_after=not args.no_deploy_site,
                 collapse_after=args.collapse_after,
             )

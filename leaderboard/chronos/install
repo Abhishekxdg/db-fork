@@ -9,9 +9,9 @@ py="${PYTHON:-python3}"
 
 check_chronos() {
     if command -v uv >/dev/null 2>&1 && [ -f "$repo_root/pyproject.toml" ]; then
-        (cd "$repo_root" && uv run --frozen python -c "import chronos; from chronos import ChronosManager, ChronosConnectionPool") >/dev/null 2>&1 && return 0
+        (cd "$repo_root" && uv run --frozen python -c "from chronos_core.branching import ChronosBranchContext") >/dev/null 2>&1 && return 0
     fi
-    "$py" -c "import chronos; from chronos import ChronosManager, ChronosConnectionPool" >/dev/null 2>&1
+    "$py" -c "from chronos_core.branching import ChronosBranchContext" >/dev/null 2>&1
 }
 
 if check_chronos; then

@@ -613,7 +613,14 @@ class AwsAlphaLifecycle(Board):
                     stdout="",
                     stderr="An error occurred (403) when calling the HeadBucket operation: Forbidden",
                 )
-            rc = 0 if bname in self.cloud["buckets"] else 1
+            if bname not in self.cloud["buckets"]:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    1,
+                    stdout="",
+                    stderr="An error occurred (404) when calling the HeadBucket operation: Not Found",
+                )
+            rc = 0
         elif (svc, op) == ("s3api", "list-buckets"):
             out = json.dumps({"Buckets": [{"Name": b} for b in sorted(self.cloud["buckets"])]})
         elif (svc, op) == ("s3api", "create-bucket"):
@@ -807,6 +814,7 @@ class AwsAlphaLifecycle(Board):
         self.assertEqual(self.cloud["buckets"], set())
 
     def test_head_bucket_403_fails_closed_and_partial_collapse_retains_state_and_Sync_excludes_untracked(self):
+        import subprocess
         aws = self.aws_alpha.AwsCli(region="us-east-1", runner=self.fake_aws_runner)
         self.cloud.setdefault("forbidden_buckets", set()).add("forbidden-bucket")
         with self.assertRaisesRegex(self.aws_alpha.AlphaError, "403|Forbidden"):
@@ -836,13 +844,44 @@ class AwsAlphaLifecycle(Board):
         self.assertEqual(partial["remaining_bucket"], state["bucket"])
         self.assertTrue((self.runs / "aws_alpha_state.json").is_file(), "state file retained when bucket delete fails")
 
-        # write_sync_filelist never includes untracked files or .git/config
+        # write_sync_filelist never includes untracked files, .git/config, or directories
         untracked = self.board / "untracked_secret_notes.txt"
         untracked.write_text("TOP_SECRET")
         flist = self.aws_alpha.write_sync_filelist(self.runs, "branchbench-alpha", self.aws_alpha.ROOT)
         lines = set(flist.read_text().splitlines())
         self.assertNotIn(".git/config", lines)
+        self.assertNotIn(".git/refs", lines)
+        self.assertNotIn(".git/objects", lines)
         self.assertFalse(any("untracked_secret_notes.txt" in ln for ln in lines))
+        self.assertTrue(all((self.aws_alpha.ROOT / ln).is_file() for ln in lines))
+
+        # _classify_head_bucket fails closed on empty stderr, network error (rc=255), or bucket named *404* with 403
+        for bad_rc, bad_err in ((2, ""), (255, "Could not connect to the endpoint URL: https://s3.us-east-1.amazonaws.com/not-found")):
+            bad_aws = self.aws_alpha.AwsCli(
+                region="us-east-1",
+                runner=lambda c, r=bad_rc, e=bad_err, **_kw: subprocess.CompletedProcess(c, r, stdout="", stderr=e),
+            )
+            with self.assertRaises(self.aws_alpha.AlphaError):
+                self.aws_alpha._classify_head_bucket(bad_aws, "my-404-bucket")
+
+        # Custom bucket name (not starting with stack prefix) is still discovered by tags when state file is missing
+        self.cloud["fail_delete_buckets"].clear()
+        self.cloud["buckets"].add("custom-alpha-site-bucket")
+        self.cloud.setdefault("bucket_tags", {})["custom-alpha-site-bucket"] = [
+            {"Key": "Project", "Value": "BranchBenchLeaderboard"},
+            {"Key": "Phase", "Value": "alpha"},
+            {"Key": "Stack", "Value": "branchbench-alpha"},
+        ]
+        (self.runs / "aws_alpha_state.json").unlink(missing_ok=True)
+        col_all = self.aws_alpha.collapse_alpha(
+            aws=aws,
+            stack="branchbench-alpha",
+            board=self.board,
+            runs_dir=self.runs,
+        )
+        self.assertTrue(col_all["collapsed"])
+        self.assertIn("custom-alpha-site-bucket", col_all["deleted_buckets"])
+        self.assertEqual(self.cloud["buckets"], set())
 
 
 if __name__ == "__main__":

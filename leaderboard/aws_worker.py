@@ -659,6 +659,7 @@ def run_batch(
     data_mount: str = "",
     batch_deadline_min: float = DEFAULT_BATCH_DEADLINE_MIN,
     poweroff: bool = False,
+    profile_mode: str = "economic",
     board: Path = BOARD,
     runs_dir: Path = RUNS,
     step_runner: Callable[[list[str], float, dict[str, str]], tuple[int, bool, bool]] = execute_step,
@@ -676,6 +677,12 @@ def run_batch(
         return 2
     if lane not in ("all", "micro", "macro"):
         print(f"error: --lane must be all, micro, or macro, got {lane!r}", file=sys.stderr)
+        return 2
+    if profile_mode not in ("economic", "paper"):
+        print(f"error: --profile-mode must be economic or paper, got {profile_mode!r}", file=sys.stderr)
+        return 2
+    if profile_mode == "paper" and preset != "full":
+        print("error: --profile-mode paper requires --preset full (scale>=10)", file=sys.stderr)
         return 2
     if not (math.isfinite(batch_deadline_min) and batch_deadline_min > 0):
         print("error: --batch-deadline-min must be a finite positive number", file=sys.stderr)
@@ -733,6 +740,7 @@ def run_batch(
                 env = dict(os.environ)
                 env.pop("DBFORK_NATIVE_ONLY", None)
                 env["DBFORK_BATCH_TOKEN"] = batch_token
+                env["DBFORK_EXECUTION_PROFILE"] = profile_mode
 
                 try:
                     with catch_sigterm():
@@ -958,6 +966,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Power off the VM (sudo -n shutdown -h now) when the batch completes",
     )
     parser.add_argument(
+        "--profile-mode",
+        default=os.environ.get("DBFORK_EXECUTION_PROFILE", "economic"),
+        choices=("economic", "paper"),
+        help="Execution profile: 'economic' (default 1-VM sequential) or 'paper' (paper scale>=10 contract)",
+    )
+    parser.add_argument(
         "--out",
         type=Path,
         default=BOARD,
@@ -979,6 +993,7 @@ def main(argv: list[str] | None = None) -> int:
         data_mount=args.data_mount,
         batch_deadline_min=args.batch_deadline_min,
         poweroff=args.poweroff,
+        profile_mode=args.profile_mode,
         board=board,
         runs_dir=RUNS,
     )
