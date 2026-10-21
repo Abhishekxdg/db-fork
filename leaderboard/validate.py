@@ -87,8 +87,14 @@ def validate(path: Path, board: Path = BOARD) -> list[str]:
     problems += [f"{where} looks like a credential" for where in credentials(data)]
 
     if "error" in data:
-        if set(data) != {"error"} or not isinstance(data["error"], str) or not data["error"].strip():
+        if (
+            not (set(data) <= {"error", "execution_profile"} and "error" in data)
+            or not isinstance(data["error"], str)
+            or not data["error"].strip()
+        ):
             problems.append("an error file holds only a non-empty error string")
+        if "execution_profile" in data and data["execution_profile"] not in EXECUTION_PROFILES:
+            problems.append(f"execution_profile must be one of {EXECUTION_PROFILES}")
         return problems
 
     fields = FIELDS | HOSTED_FIELDS if data.get("hosted") == "yes" else FIELDS

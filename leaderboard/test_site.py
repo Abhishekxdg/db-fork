@@ -748,7 +748,7 @@ class AwsAlphaLifecycle(Board):
             cmd_runner=fake_cmd_runner,
         )
         self.assertEqual(rc, 0)
-        self.assertEqual(len(ssh_rsync_calls), 4, "wait for bootstrap, rsync up, ssh worker run, rsync pull")
+        self.assertEqual(len(ssh_rsync_calls), 5, "wait for bootstrap, rsync up, ssh worker run, rsync pull, ssh lease release")
         self.assertTrue((self.site / "alpha" / "data.js").is_file(), "--collapse-after keeps local .site/alpha while tearing down AWS")
         self.assertFalse((self.runs / "aws_alpha_state.json").exists(), "AWS state is collapsed after the run")
         self.assertEqual(self.cloud["sgs"], [])
@@ -982,32 +982,117 @@ class AwsAlphaLifecycle(Board):
             )
             self.assertEqual(self.cloud["instances"][0]["State"]["Name"], "running")
 
-        # 3b. Activation script preserves original results on cp failure and restores ~/db-fork on final rename failure
+        # 3b. Activation script uses portable lock_fd (no external flock binary required), preserves run.lock inode,
+        # rejects when run.lock is held (exit 42), preserves original results on backup cp failure (exit 1),
+        # and restores ~/db-fork on checkout update failure (exit 1)
+        import fcntl
+
         fake_home = self.board / "fake_home"
         old_repo = fake_home / "db-fork"
-        (old_repo / "leaderboard" / ".runs").mkdir(parents=True, exist_ok=True)
-        (old_repo / "leaderboard" / ".runs" / "file_copy.prev_method").write_text("reflink\n")
+        runs_sub = old_repo / "leaderboard" / ".runs"
+        runs_sub.mkdir(parents=True, exist_ok=True)
+        run_lock_file = runs_sub / "run.lock"
+        run_lock_file.write_text("")
+        orig_lock_inode = run_lock_file.stat().st_ino
+        (runs_sub / "file_copy.prev_method").write_text("reflink\n")
         (old_repo / "leaderboard" / "dolt" / "results" / "20261020").mkdir(parents=True, exist_ok=True)
         sole_result = old_repo / "leaderboard" / "dolt" / "results" / "20261020" / "box.json"
         sole_result.write_text('{"ok": true}\n')
         staged_repo = fake_home / "db-fork.sync.t1"
         shutil.copytree(dst_repo, staged_repo)
-        # Make destination results dir read-only so cp -a into staged_repo fails
-        ro_target = staged_repo / "leaderboard" / "dolt"
-        ro_target.mkdir(parents=True, exist_ok=True)
-        ro_target.chmod(0o500)
-        try:
-            act_res = subprocess.run(
+
+        # Holding run.lock causes build_activate_sync_script to exit 42 without replacing run.lock inode
+        with run_lock_file.open("a+") as lfh:
+            fcntl.flock(lfh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked_res = subprocess.run(
                 ["bash", "-c", self.aws_alpha.build_activate_sync_script("~/db-fork.sync.t1")],
                 env={**os.environ, "HOME": str(fake_home)},
                 capture_output=True,
                 text=True,
             )
-            self.assertNotEqual(act_res.returncode, 0)
-            self.assertTrue(sole_result.is_file(), "sole old result in ~/db-fork survives failed preservation copy")
-            self.assertTrue((old_repo / "leaderboard" / ".runs" / "file_copy.prev_method").is_file())
+        self.assertEqual(locked_res.returncode, 42)
+        self.assertEqual(run_lock_file.stat().st_ino, orig_lock_inode)
+
+        # Injected backup copy failure: unreadable result file causes cp -a to fail with exit 1 (not 42), keeping sole_result intact
+        sole_result.chmod(0o000)
+        try:
+            cp_fail_res = subprocess.run(
+                ["bash", "-c", self.aws_alpha.build_activate_sync_script("~/db-fork.sync.t1")],
+                env={**os.environ, "HOME": str(fake_home)},
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(cp_fail_res.returncode, 1, f"expected exit 1 on cp failure, got {cp_fail_res.returncode}: {cp_fail_res.stderr}")
+            self.assertTrue((runs_sub / "file_copy.prev_method").is_file())
+            self.assertEqual(run_lock_file.stat().st_ino, orig_lock_inode)
         finally:
-            ro_target.chmod(0o700)
+            sole_result.chmod(0o644)
+        self.assertTrue(sole_result.is_file(), "sole old result in ~/db-fork survives failed preservation copy")
+
+        # Injected final checkout update failure: read-only subdirectory with an untracked file blocks rsync --delete with exit 1
+        ro_sub = old_repo / "microbench" / "locked_subdir"
+        ro_sub.mkdir(parents=True, exist_ok=True)
+        (ro_sub / "f.txt").write_text("x")
+        ro_sub.chmod(0o500)
+        try:
+            up_fail_res = subprocess.run(
+                ["bash", "-c", self.aws_alpha.build_activate_sync_script("~/db-fork.sync.t1")],
+                env={**os.environ, "HOME": str(fake_home)},
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(up_fail_res.returncode, 1)
+            self.assertTrue(sole_result.is_file())
+            self.assertTrue((runs_sub / "file_copy.prev_method").is_file())
+            self.assertEqual(run_lock_file.stat().st_ino, orig_lock_inode)
+        finally:
+            ro_sub.chmod(0o755)
+            shutil.rmtree(ro_sub, ignore_errors=True)
+
+        # Successful activation updates ~/db-fork in-place while preserving sole_result, file_copy.prev_method, and run.lock inode
+        ok_res = subprocess.run(
+            ["bash", "-c", self.aws_alpha.build_activate_sync_script("~/db-fork.sync.t1")],
+            env={**os.environ, "HOME": str(fake_home)},
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(ok_res.returncode, 0, ok_res.stderr)
+        self.assertTrue(sole_result.is_file())
+        self.assertTrue((runs_sub / "file_copy.prev_method").is_file())
+        self.assertEqual(run_lock_file.stat().st_ino, orig_lock_inode)
+
+        # 3c. Upload failure releases the remote lease in finally; newer micro error record supersedes older economic_single_vm success
+        upload_calls = []
+
+        def fail_on_rsync_up(cmd: list[str], **_kw):
+            upload_calls.append(cmd)
+            if len(upload_calls) == 2:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="rsync failed")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with self.assertRaisesRegex(self.aws_alpha.AlphaError, "failed to rsync"):
+            self.aws_alpha.run_alpha_benchmarks(
+                aws=aws,
+                stack="branchbench-alpha",
+                systems="dolt",
+                board=self.board,
+                runs_dir=self.runs,
+                cmd_runner=fail_on_rsync_up,
+            )
+        self.assertEqual(len(upload_calls), 3, "wait_cmd, failed sync_up, and finally lease release ssh")
+        self.assertIn("alpha.owner", " ".join(upload_calls[2]))
+
+        # Newer error record (with or without execution_profile) supersedes older economic_single_vm success
+        from leaderboard import build as micro_build
+
+        self.write({**self.payload(), "execution_profile": "economic_single_vm"}, day_dir="20260930")
+        err_path = self.board / "dolt" / "results" / "20261001" / "box.json"
+        err_path.parent.mkdir(parents=True, exist_ok=True)
+        err_path.write_text(json.dumps({"error": "RunError: failed"}))
+        entries_after_err, excluded_after_err = micro_build.build(self.board)
+        self.assertEqual(entries_after_err, [], "newer error record must supersede older economic_single_vm success")
+        self.assertEqual(len(excluded_after_err), 1)
+        err_path.unlink()
 
         # 4. Bucket tag inspection failure (get-bucket-tagging rc=1) causes collapse_alpha to report collapsed=False
         self.cloud["buckets"].add("branchbench-alpha-unreadable-tags")

@@ -150,15 +150,52 @@ def catch_sigterm():
         signal.signal(signal.SIGTERM, previous)
 
 
+def check_alpha_lease(runs_dir: Path = RUNS) -> None:
+    """Reject direct or batch runs when an active remote alpha sync/run session owns the worker under another token."""
+    owner_candidates = [runs_dir / "alpha.owner"]
+    if runs_dir.parent.parent.name == "db-fork":
+        owner_candidates.append(runs_dir.parent.parent.parent / "db-fork.alpha.owner")
+    caller_token = os.environ.get("DBFORK_ALPHA_TOKEN", "")
+    now_ts = time.time()
+    for owner_path in owner_candidates:
+        try:
+            if not owner_path.is_file():
+                continue
+            raw = owner_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not raw or ":" not in raw:
+            continue
+        owner_token, ts_str = raw.split(":", 1)
+        try:
+            owner_ts = float(ts_str.strip())
+        except ValueError:
+            owner_ts = now_ts
+        if now_ts - owner_ts < 21600:
+            if not owner_token or not caller_token or not secrets.compare_digest(owner_token, caller_token):
+                raise RunError("another alpha sync/benchmark session owns this worker")
+
+
 @contextmanager
 def exclusive(system: str):
     """Hold a machine-wide and per-system lock, so two runs never share a worker, a journal, or a server."""
     RUNS.mkdir(parents=True, exist_ok=True)
+    check_alpha_lease(RUNS)
     with (
+        (RUNS / "alpha.lock").open("a+", encoding="utf-8") as alpha_fh,
         (RUNS / "batch.lock").open("a+", encoding="utf-8") as batch_fh,
         (RUNS / "run.lock").open("a+", encoding="utf-8") as global_lock,
         (RUNS / f"{system}.lock").open("a+", encoding="utf-8") as lock,
     ):
+        try:
+            fcntl.flock(alpha_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            check_alpha_lease(RUNS)
+            if not os.environ.get("DBFORK_ALPHA_TOKEN"):
+                raise RunError("another alpha sync/benchmark session is in progress on this machine") from None
+        else:
+            fcntl.flock(alpha_fh, fcntl.LOCK_UN)
+        check_alpha_lease(RUNS)
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -518,7 +555,16 @@ def run(system: str, machine: str, out: Path, max_batch: int | None, allow_dirty
 
     if failure:
         detail = (scrub(str(failure)).splitlines() or [""])[0][:300]
-        publish(out, system, machine, started.date(), {"error": f"{type(failure).__name__}: {detail}"})
+        publish(
+            out,
+            system,
+            machine,
+            started.date(),
+            {
+                "error": f"{type(failure).__name__}: {detail}",
+                "execution_profile": os.environ.get("DBFORK_EXECUTION_PROFILE") or "local_single_host",
+            },
+        )
         raise RunError(f"{system} failed: {detail}") from failure
     payload = {
         "schema_version": SCHEMA_VERSION,

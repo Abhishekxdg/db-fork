@@ -10,23 +10,36 @@ import json
 import sys
 from pathlib import Path
 
-from leaderboard.validate import BOARD, validate
+from leaderboard.validate import BOARD, EXECUTION_PROFILES, validate
 
 
 def newest(board: Path, sources: set[str] | None = None) -> list[Path]:
     """For each system, machine, and execution profile, the file in the newest date directory,
-    among every result file or only the given board-relative sources."""
+    among every result file or only the given board-relative sources. If a newer file has no
+    valid execution_profile (e.g. a legacy error or unreadable record), it supersedes all older
+    profiles for that system and machine (fail-closed)."""
     found: dict[tuple[str, str, str], Path] = {}
     for path in sorted(board.glob("*/results/*/*.json")):  # YYYYMMDD directories sort by date
         if sources is None or path.relative_to(board).as_posix() in sources:
-            profile = "local_single_host"
+            sys_name, machine_stem = path.parts[-4], path.stem
+            profile: str | None = None
             try:
                 raw = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(raw, dict) and isinstance(raw.get("execution_profile"), str):
-                    profile = raw["execution_profile"]
+                if isinstance(raw, dict):
+                    ep = raw.get("execution_profile")
+                    if isinstance(ep, str) and ep in EXECUTION_PROFILES:
+                        profile = ep
+                    elif "error" not in raw and "result" in raw and "suite" in raw:
+                        profile = "local_single_host"
             except Exception:
-                pass
-            found[path.parts[-4], path.stem, profile] = path
+                profile = None
+            if profile is None:
+                for key in [k for k in found if k[0] == sys_name and k[1] == machine_stem]:
+                    del found[key]
+                found[sys_name, machine_stem, "*"] = path
+            else:
+                found.pop((sys_name, machine_stem, "*"), None)
+                found[sys_name, machine_stem, profile] = path
     return list(found.values())
 
 

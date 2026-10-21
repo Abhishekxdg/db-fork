@@ -25,6 +25,7 @@ from leaderboard.run import (
     RunError,
     bounded,
     catch_sigterm,
+    check_alpha_lease,
 )
 from leaderboard.run_macro import port_answers
 from leaderboard.validate import BOARD, validate as validate_micro
@@ -123,8 +124,12 @@ def configure_data_mount(data_mount: str, env: dict[str, str] | None = None) -> 
 
 @contextmanager
 def batch_lock(runs_dir: Path = RUNS) -> Iterator[str]:
-    """Acquire an exclusive batch lock and verify no single-system run.lock is active."""
+    """Acquire an exclusive batch lock and verify no single-system run.lock or foreign alpha lease is active."""
     runs_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        check_alpha_lease(runs_dir)
+    except RunError as exc:
+        raise RuntimeError(str(exc)) from None
     bpath = runs_dir / "batch.lock"
     rpath = runs_dir / "run.lock"
     token = secrets.token_hex(16)
