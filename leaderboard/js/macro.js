@@ -5,6 +5,8 @@
 const MACRO = {
     campaigns: typeof macroCampaigns === 'undefined' ? [] : macroCampaigns,
     excluded: typeof macroExcluded === 'undefined' ? [] : macroExcluded,
+    verbs: typeof verbs === 'undefined' ? [] : verbs,
+    verbsExcluded: typeof verbsExcluded === 'undefined' ? [] : verbsExcluded,
     built: typeof macroSuite !== 'undefined',
 };
 const SCENARIOS = MACRO.built && macroSuite.scenarios ? macroSuite.scenarios : {rl_env: 'S1 RL environment', context_mgmt: 'S2 Context management', multi_agent: 'S3 Multi-agent', dev_agent: 'S4 Dev agent', ops_agent: 'S5 Ops agent', data_agent: 'S6 Data agent'};
@@ -64,7 +66,7 @@ const completion = (c, key) => statusOf(c, key) === 'verified' && typeof c.attem
 // One slot per system folder and machine. The builder lists campaigns newest first, so the newest heads its slot.
 function campaignSlots() {
     const slots = new Map();
-    for (const c of MACRO.campaigns) { const key = `${c.folder}/${c.machine}`; if (!slots.has(key)) slots.set(key, []); slots.get(key).push(c); }
+    for (const c of MACRO.campaigns) { const key = `${c.folder}/${c.machine}${c.native_only ? '/native-only' : ''}`; if (!slots.has(key)) slots.set(key, []); slots.get(key).push(c); }
     return slots;
 }
 const coverageText = c => `${Object.keys(SCENARIOS).filter(k => statusOf(c, k) === 'verified').length} of ${Object.keys(SCENARIOS).length} workflows completed`;
@@ -153,7 +155,7 @@ function macroTable(g, keys, empty = null) {
     const order = sortedRows(ranked.timed.map(x => x.c), g.rows.filter(c => !ranked.rank.has(c)).sort((a, b) => a.system.localeCompare(b.system) || a.machine.localeCompare(b.machine)), state.rankDesc);
     for (const c of order) {
         const tr = body.insertRow();
-        const th = systemHeader(ranked.rank.get(c), c, c.system, [`v${c.version}`, c.started.slice(0, 10)]); tr.append(th);
+        const th = systemHeader(ranked.rank.get(c), c, c.system, [`v${c.version}`, c.started.slice(0, 10), c.native_only ? 'Native-only' : null]); tr.append(th);
         if (!ranked.rank.has(c)) th.title = `Not ranked by ${workflow(state.rank).name}: ${STATUS[statusOf(c, state.rank)].label}`;
         for (const key of keys) macroCell(tr, c, key, stats[key]);
         const cell = tr.insertCell(); cell.className = 'done-cell';
@@ -216,7 +218,25 @@ function provenance(c) {
     const env = c.environment || {};
     return [['Run ID', c.campaign_id], ['Comparison group', c.group], ['Git commit', c.commit], ['Source SHA-256', c.source_sha256],
         ['Dependency lock SHA-256', c.lock_sha256], ['Python', c.python], ['Platform', c.platform], ['CPU', env.cpu || 'unknown'],
-        ['CPU count', env.cpus ?? 'unknown'], ['Memory', gib(env.memory_bytes, 1) || 'unknown'], ['Started', c.started], ['Finished', c.finished]];
+        ['CPU count', env.cpus ?? 'unknown'], ['Memory', gib(env.memory_bytes, 1) || 'unknown'], ['Started', c.started], ['Finished', c.finished],
+        ...(c.native_only ? [['Mode', 'Native-only']] : [])];
+}
+function verbsScalingSection(records) {
+    const ordered = [...records].sort((a, b) => a.system.localeCompare(b.system) || (a.scale - b.scale));
+    const pointIds = uniq(ordered.flatMap(r => (r.points || []).map(p => p.id).filter(id => id && id !== 'control')));
+    const {table, body} = dataTable('heatmap', 'Verb scaling: median p50 latency per grid point', ['Grid point', ...ordered.map(r => {
+        const label = `${r.system}${r.native_only ? ' (Native-only)' : ''} · W=${r.scale}`;
+        const th = colHead(label); th.title = `${r.machine} · ${r.date}`;
+        return th;
+    })]);
+    for (const pid of pointIds) {
+        const tr = body.insertRow(); tr.append(rowHead(pid, 'row-label'));
+        for (const r of ordered) {
+            const pt = (r.points || []).find(p => p.id === pid), td = tr.insertCell(), p50 = pt?.latency?.p50;
+            td.textContent = pt?.status === 'ok' && typeof p50 === 'number' ? `${(p50 * 1000).toFixed(1)} ms` : pt?.status === 'unsupported' ? 'Unsupported' : '—';
+        }
+    }
+    return breakdownSection(null, 'Verb scaling', 'Median p50 latency across scaling axes per system and scale.', table, []);
 }
 let macroGroupsShown = [];
 function renderMacro() {
@@ -236,9 +256,10 @@ function renderMacro() {
     // Without any campaign the table shell stays, with one honest row: no fabricated result.
     el('macro-groups').replaceChildren(...macroGroupsShown.length ? macroGroupsShown.map(g => macroGroup(g, keys))
         : [macroTable({group: '', rows: []}, keys, node('span', 'empty-cell', chosen.length ? 'No matches. Adjust or reset the filters.' : 'No published results yet. Results appear here once a validated run is published.'))]);
-    el('macro-breakdowns').replaceChildren(...macroGroupsShown.map(g => macroBreakdown(g, false)));
-    el('macro-excluded').replaceChildren(...MACRO.excluded.length ? [excludedPanel('macro-excluded-panel', 'Runs not on the board',
-        MACRO.excluded.map(x => ({label: `${x.system} / ${x.source.split('/').at(-1)}`, href: PHASE === 'prod' ? null : x.source, reason: x.reason})))] : []);  // production never links a file it does not serve
+    el('macro-breakdowns').replaceChildren(...macroGroupsShown.map(g => macroBreakdown(g, false)), ...(MACRO.verbs.length ? [verbsScalingSection(MACRO.verbs)] : []));
+    const allExcluded = [...MACRO.excluded.map(x => ({label: `${x.system} / ${x.source.split('/').at(-1)}`, href: PHASE === 'prod' ? null : x.source, reason: x.reason})),
+        ...MACRO.verbsExcluded.map(x => ({label: `verbs / ${x.source}`, href: PHASE === 'prod' ? null : x.source, reason: x.reason}))];
+    el('macro-excluded').replaceChildren(...allExcluded.length ? [excludedPanel('macro-excluded-panel', 'Runs not on the board', allExcluded)] : []);  // production never links a file it does not serve
     renderExplainer(keys);
 }
 // A row's details, all in one place: its rank, each workflow against the fastest with that workflow's evidence behind
