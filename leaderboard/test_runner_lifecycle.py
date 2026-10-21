@@ -13,7 +13,7 @@ from unittest import mock
 
 import psycopg2
 
-from dblib import dolt as dolt_pg, dolt_mysql, file_copy, matrixone, seekdb
+from dblib import chronos, dolt as dolt_pg, dolt_mysql, file_copy, matrixone, seekdb
 from leaderboard import run as runner
 from leaderboard.connector import load_connector
 
@@ -55,6 +55,7 @@ class Recovery(unittest.TestCase):
             ("seekdb", seekdb, "SEEKDB_HOST"),
             ("matrixone", matrixone, "MO_HOST"),
             ("file_copy", file_copy, "PGSQL_HOST"),
+            ("chronos", chronos, "PGSQL_HOST"),
         ):
             server = load_connector(key)
             original = server.scope()
@@ -225,6 +226,40 @@ class RunLifecycle(unittest.TestCase):
             runner.run("dolt", "box", self.board, None, True, 1, "test location")
             self.assertTrue(os.environ["PGOPTIONS"].endswith(" -c statement_timeout=120s"))
             self.assertIn("application_name=bench", os.environ["PGOPTIONS"])
+
+    def test_verbs_wrapper_runs_microbench_verbs_with_lifecycle(self):
+        from leaderboard import verbs
+        self.server.version.return_value = "v1.0"
+        self.server.exists.return_value = False
+        self.start_server.side_effect = lambda _: (
+            runner.RUNS.mkdir(parents=True, exist_ok=True),
+            (runner.RUNS / "dolt.pid").write_text(str(os.getpid())),
+        )
+        with (
+            mock.patch.object(verbs, "ROOT", self.root),
+            mock.patch.object(verbs.run_macro, "ROOT", self.root),
+            mock.patch.object(verbs, "BOARD", self.board),
+            mock.patch.object(verbs, "VERB_RUNS", self.board / ".runs" / "verbs"),
+            mock.patch.object(verbs, "load_connector", return_value=self.server),
+            mock.patch.object(verbs.run_macro, "port_answers", return_value=False),
+            mock.patch.object(verbs.run_macro, "pid_alive", return_value=False),
+            mock.patch.object(
+                verbs,
+                "launch_verbs_child",
+                return_value=subprocess.CompletedProcess(["python", "-m", "microbench.verbs"], 0, stdout="ok\n"),
+            ) as proc_run,
+        ):
+            rc = verbs.run("dolt", 1, "box", self.board, verbs=["branch", "commit"], native_only=True)
+        self.assertEqual(rc, 0)
+        self.start_server.assert_called_once_with(self.board / "dolt")
+        self.lifecycle.assert_called_once_with(self.board / "dolt", "stop")
+        proc_run.assert_called_once()
+        written = list((self.board / "dolt" / "verbs").rglob("bb_*.json"))
+        self.assertEqual(len(written), 1)
+        record = json.loads(written[0].read_text())
+        self.assertEqual(record["system"], "Doltgres")
+        self.assertEqual(record["scale"], 1)
+        self.assertTrue(record["native_only"])
 
 
 class Deadlines(unittest.TestCase):

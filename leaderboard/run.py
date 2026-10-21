@@ -66,7 +66,7 @@ RUNS = BOARD / ".runs"
 # the publication manifest are outputs or website configuration that no run reads,
 # so none of them ever does.
 CODE_PATHS = ["dblib", "microbench", "util", "leaderboard", "db_setup", "pyproject.toml", "uv.lock", "build_protos.py",
-              ":!leaderboard/*/results/*", ":!leaderboard/*/macro/*", ":!leaderboard/.site/*", ":!leaderboard/publish.json",
+              ":!leaderboard/*/results/*", ":!leaderboard/*/macro/*", ":!leaderboard/*/verbs/*", ":!leaderboard/.site/*", ":!leaderboard/publish.json",
               ":!leaderboard/data.js", ":!leaderboard/macro-data.js"]
 POINT_OPS = {"read": ReadOperation, "insert": InsertOperation, "update": UpdateOperation}
 RANGE_OPS = {"range_read": RangeReadOperation, "range_update": RangeUpdateOperation}

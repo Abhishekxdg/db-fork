@@ -44,6 +44,7 @@
                     <label class="option-card"><input id="database-seekdb" type="radio" name="database" value="seekdb"><span class="system-icon" data-system="seekdb">S</span><strong>SeekDB</strong><span>MySQL protocol</span><small>Self-hosted</small></label>
                     <label class="option-card"><input id="database-matrixone" type="radio" name="database" value="matrixone"><span class="system-icon" data-system="matrixone">M</span><strong>MatrixOne</strong><span>MySQL protocol</span><small>Self-hosted</small></label>
                     <label class="option-card"><input id="database-file-copy" type="radio" name="database" value="file_copy"><span class="system-icon" data-system="postgresql-file-copy">P</span><strong>PostgreSQL (FILE_COPY)</strong><span>Full database copy</span><small>Self-hosted</small></label>
+                    <label class="option-card"><input id="database-chronos" type="radio" name="database" value="chronos"><span class="system-icon" data-system="chronos">C</span><strong>Chronos</strong><span>Interval branching</span><small>Self-hosted</small></label>
                     <label class="option-card"><input id="database-neon" type="radio" name="database" value="neon"><span class="system-icon" data-system="neon">N</span><strong>Neon</strong><span>Serverless Postgres</span><small>Managed service</small></label>
                     <label class="option-card"><input id="database-tiger" type="radio" name="database" value="tiger" disabled><span class="system-icon" data-system="tiger-cloud">T</span><strong>Tiger Cloud</strong><span>Postgres service forks</span><small>No connector yet</small></label>
                     <label class="option-card"><input id="database-xata" type="radio" name="database" value="xata"><span class="system-icon" data-system="xata">X</span><strong>Xata</strong><span>Branching Postgres</span><small>Managed service</small></label>
@@ -119,6 +120,7 @@ const SYSTEMS = {
     seekdb: {name: 'SeekDB', requirement: 'SeekDB (OceanBase) binary installed.', keys: []},
     matrixone: {name: 'MatrixOne', requirement: 'MatrixOne (mo-service) binary installed.', keys: []},
     file_copy: {name: 'PostgreSQL (FILE_COPY)', requirement: 'PostgreSQL 18 (postgres, pg_ctl, initdb) and psql (libpq) on PATH.', keys: []},
+    chronos: {name: 'Chronos', requirement: 'PostgreSQL 18 (postgres, pg_ctl, initdb), psql (libpq) on PATH, and chronos-db Python package installed.', keys: []},
     neon: {name: 'Neon', requirement: 'psql (libpq) on PATH.', keys: ['NEON_API_KEY_ORG']},
     xata: {name: 'Xata', requirement: 'psql (libpq) on PATH.', keys: ['XATA_API_KEY', 'XATA_ORGANIZATION_ID']},
 };

@@ -34,7 +34,7 @@ from leaderboard.validate_macro import (
 )
 
 
-DEFAULT_LOCAL_SYSTEMS = ("dolt", "dolt_mysql", "matrixone", "seekdb", "file_copy")
+DEFAULT_LOCAL_SYSTEMS = ("dolt", "dolt_mysql", "matrixone", "seekdb", "file_copy", "chronos")
 DEFAULT_HOSTED_SYSTEMS = ("neon", "xata")
 DEFAULT_BATCH_DEADLINE_MIN = 720.0
 POWEROFF_TIMEOUT_SEC = 60.0
@@ -116,6 +116,7 @@ def configure_data_mount(data_mount: str, env: dict[str, str] | None = None) -> 
         "MO_DATA_DIR": str(mount / "mo" / "matrixone" / "mo-data"),
         "SEEKDB_DATA_DIR": str(mount / "seekdb" / "store"),
         "PGSQL_DATA_DIR": str(mount / "pg_file_copy" / "data"),
+        "CHRONOS_DATA_DIR": str(mount / "pg_chronos" / "data"),
     }
     for key, val in defaults.items():
         if not target_env.get(key):
@@ -465,7 +466,7 @@ def _terminate_process_group(proc: subprocess.Popen, grace_sec: float = 10.0) ->
         try:
             os.killpg(pgid, signal.SIGKILL)
         except OSError:
-            break
+            pass
         time.sleep(0.02)
 
 

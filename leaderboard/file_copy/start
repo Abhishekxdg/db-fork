@@ -39,5 +39,5 @@ if [ -f "$data_dir/postmaster.pid" ]; then
     fi
     rm -f "$data_dir/postmaster.pid"
 fi
-"$pg_bin_dir/postgres" -D "$data_dir" -h "$host" -p "$port" -k /tmp -c max_connections=200 > "$runs/file_copy.log" 2>&1 &
+"$pg_bin_dir/postgres" -D "$data_dir" -h "$host" -p "$port" -k /tmp -c max_connections=400 > "$runs/file_copy.log" 2>&1 &
 echo $! > "$runs/file_copy.pid"

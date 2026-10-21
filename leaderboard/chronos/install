@@ -1,0 +1,18 @@
+#!/bin/bash
+# Ensure PostgreSQL 18 and the Chronos Python library are installed.
+set -euo pipefail
+
+"$(dirname "$0")/../file_copy/install"
+
+py="${PYTHON:-python3}"
+if "$py" -c "import chronos_core.branching" >/dev/null 2>&1; then
+    exit 0
+fi
+
+if command -v uv >/dev/null 2>&1; then
+    uv pip install --python "$py" "${CHRONOS_PIP_SPEC:-chronos-db}" >/dev/null 2>&1 && exit 0
+fi
+"$py" -m pip install "${CHRONOS_PIP_SPEC:-chronos-db}" >/dev/null 2>&1 && exit 0
+
+echo "chronos-db Python package could not be installed; install chronos-db into $py" >&2
+exit 1

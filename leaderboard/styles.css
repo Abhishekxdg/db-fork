@@ -54,7 +54,7 @@
     /* Identity: one color per system for its icon and its chart marks. Chart marks of unnamed systems take a series color
        by position; their icons stay neutral, so an icon never borrows another system's color. */
     --series-1: #347e6b; --series-2: #5475b4; --series-3: #98712d; --series-4: #8660a1;
-    --sys-dolt: var(--series-1); --sys-doltgres: var(--series-2); --sys-tiger-cloud: var(--series-3); --sys-xata: var(--series-4); --sys-neon: #277958; --sys-other: #4b739e;
+    --sys-dolt: var(--series-1); --sys-doltgres: var(--series-2); --sys-tiger-cloud: var(--series-3); --sys-xata: var(--series-4); --sys-neon: #277958; --sys-chronos: #7a5c9e; --sys-other: #4b739e;
     /* Branch-history lanes: slate, mint, dusty blue, clay */
     --lane-main: #5d6d7a; --lane-a: var(--mint); --lane-b: #7a90b3; --lane-c: #b08d7c;
     /* The run wizard's command card */
@@ -192,6 +192,7 @@ code { font: .92em/1.5 var(--mono); }
 .system-icon[data-system="neon"] { --sys: var(--sys-neon); }
 .system-icon[data-system="tiger-cloud"] { --sys: var(--sys-tiger-cloud); }
 .system-icon[data-system="xata"] { --sys: var(--sys-xata); }
+.system-icon[data-system="chronos"] { --sys: var(--sys-chronos); }
 .system-identity { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .system-text { display: flex; flex-direction: column; align-items: flex-start; min-width: 0; }
 .system-title { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
