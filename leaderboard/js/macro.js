@@ -163,7 +163,7 @@ function macroTable(g, keys, empty = null) {
         strip.setAttribute('role', 'img'); strip.setAttribute('aria-label', `${verified} of ${keys.length} workflows completed`);
         for (const k of keys) { const seg = node('span', `strip-seg status-${statusOf(c, k)}`); seg.title = `${workflow(k).name}: ${STATUS[statusOf(c, k)].label}`; strip.append(seg); }
         const summary = node('span', 'done-summary'), line = node('span', 'done-line'); summary.append(node('span', 'done-count', `${verified} / ${keys.length}`), strip);
-        line.append(summary, detailsButton(c.system, opener => showCampaign(c, opener), slug('details', c.folder, c.machine))); cell.append(line);
+        line.append(summary, detailsButton(c.system, opener => showCampaign(c, opener), c.native_only ? slug('details', c.folder, c.machine, 'native-only') : slug('details', c.folder, c.machine))); cell.append(line);
     }
     if (!g.rows.length && empty) { const tr = body.insertRow(); tr.className = 'empty-row'; const td = tr.insertCell(); td.setAttribute('colspan', String(keys.length + 2)); td.append(empty); }
     return scrolling(table, 'Scroll sideways to see every workflow.');
@@ -207,7 +207,7 @@ function machineParts(c) {
 }
 function macroGroup(g, keys) {
     const box = node('section', 'board-group'), heading = node('div', 'group-heading');
-    heading.append(node('h2', '', 'Agent workflows'),
+    heading.append(node('h2', '', g.nativeOnly ? 'Agent workflows (Native-only)' : 'Agent workflows'),
         node('span', 'group-count', `${plural(g.rows.length, 'system')} · ranked by ${workflow(state.rank).name} · lower is better`));
     if (keys.some(k => groupStats(g, k).timed.length >= 2)) heading.append(heatKey('Shading: darker mint is closer to the fastest completion time in its column'));
     box.append(heading, macroTable(g, keys));
@@ -219,7 +219,7 @@ function provenance(c) {
     return [['Run ID', c.campaign_id], ['Comparison group', c.group], ['Git commit', c.commit], ['Source SHA-256', c.source_sha256],
         ['Dependency lock SHA-256', c.lock_sha256], ['Python', c.python], ['Platform', c.platform], ['CPU', env.cpu || 'unknown'],
         ['CPU count', env.cpus ?? 'unknown'], ['Memory', gib(env.memory_bytes, 1) || 'unknown'], ['Started', c.started], ['Finished', c.finished],
-        ...(c.native_only ? [['Mode', 'Native-only']] : [])];
+        ...(c.native_only ? [['Mode', 'Native-only']] : []), ...(c.execution_profile ? [['Execution profile', c.execution_profile]] : [])];
 }
 function verbsScalingSection(records) {
     const ordered = [...records].sort((a, b) => a.system.localeCompare(b.system) || (a.scale - b.scale));
@@ -252,11 +252,15 @@ function renderMacro() {
     el('macro-shown').textContent = `${plural(shown.length, 'system')}${filtered ? ' · filtered' : ''}`;
     const latest = chosen.map(c => c.started.slice(0, 10)).sort().at(-1);
     el('macro-updated').textContent = latest ? `Last run ${latest}` : 'No published runs yet';
-    macroGroupsShown = shown.length ? [{group: shown[0].group, rows: shown}] : [];
+    const stdShown = shown.filter(c => !c.native_only), natShown = shown.filter(c => c.native_only);
+    macroGroupsShown = [
+        ...(stdShown.length ? [{group: stdShown[0].group, rows: stdShown, nativeOnly: false}] : []),
+        ...(natShown.length ? [{group: `${natShown[0].group}-native-only`, rows: natShown, nativeOnly: true}] : []),
+    ];
     // Without any campaign the table shell stays, with one honest row: no fabricated result.
     el('macro-groups').replaceChildren(...macroGroupsShown.length ? macroGroupsShown.map(g => macroGroup(g, keys))
         : [macroTable({group: '', rows: []}, keys, node('span', 'empty-cell', chosen.length ? 'No matches. Adjust or reset the filters.' : 'No published results yet. Results appear here once a validated run is published.'))]);
-    el('macro-breakdowns').replaceChildren(...macroGroupsShown.map(g => macroBreakdown(g, false)), ...(MACRO.verbs.length ? [verbsScalingSection(MACRO.verbs)] : []));
+    el('macro-breakdowns').replaceChildren(...macroGroupsShown.map(g => macroBreakdown(g, Boolean(g.nativeOnly))), ...(MACRO.verbs.length ? [verbsScalingSection(MACRO.verbs)] : []));
     const allExcluded = [...MACRO.excluded.map(x => ({label: `${x.system} / ${x.source.split('/').at(-1)}`, href: PHASE === 'prod' ? null : x.source, reason: x.reason})),
         ...MACRO.verbsExcluded.map(x => ({label: `verbs / ${x.source}`, href: PHASE === 'prod' ? null : x.source, reason: x.reason}))];
     el('macro-excluded').replaceChildren(...allExcluded.length ? [excludedPanel('macro-excluded-panel', 'Runs not on the board', allExcluded)] : []);  // production never links a file it does not serve
@@ -424,11 +428,21 @@ function verbTable(campaigns) {
 function shareChart(campaigns) {
     const card = node('figure', 'panel dotplot-panel'), keys = Object.keys(SCENARIOS);
     card.append(node('h3', '', 'Time in branch operations'), node('p', 'panel-note', 'Share of each completed workflow\'s operation time spent in branch operations; the rest is agent steps.'));
+    const validWorkerTime = a => {
+        const wt = a?.evidence?.worker_time;
+        return Boolean(wt && typeof wt.branch_sec === 'number' && typeof wt.total_sec === 'number' && wt.total_sec > 0);
+    };
+    const useWorkerTime = campaigns.length > 0 && campaigns.every(c => keys.every(k => statusOf(c, k) !== 'verified' || validWorkerTime(c.attempts[k])));
     const rows = keys.map(key => ({label: workflow(key).name, dots: campaigns.flatMap(c => {
-        const a = c.attempts[key], wt = a?.evidence?.worker_time, validWt = wt && typeof wt.branch_sec === 'number' && typeof wt.total_sec === 'number' && wt.total_sec > 0;
-        const counts = statusOf(c, key) === 'verified' && opCounts(a);
-        if (!counts && (statusOf(c, key) !== 'verified' || !validWt)) return [];
-        const branch = validWt ? wt.branch_sec : VERBS.reduce((sum, verb) => sum + (counts[verb.toUpperCase()]?.ok_seconds ?? 0), 0), total = validWt ? wt.total_sec : branch + (counts.EXEC?.ok_seconds ?? 0);
+        if (statusOf(c, key) !== 'verified') return [];
+        const a = c.attempts[key];
+        if (useWorkerTime) {
+            const wt = a.evidence.worker_time, branch = wt.branch_sec, total = wt.total_sec;
+            return total ? [{e: c, value: branch / total, title: `${c.system} · ${workflow(key).name}: ${Math.round(branch / total * 100)}% in branch operations, ${seconds(branch)} of ${seconds(total)}`}] : [];
+        }
+        const counts = opCounts(a);
+        if (!counts) return [];
+        const branch = VERBS.reduce((sum, verb) => sum + (counts[verb.toUpperCase()]?.ok_seconds ?? 0), 0), total = branch + (counts.EXEC?.ok_seconds ?? 0);
         return total ? [{e: c, value: branch / total, title: `${c.system} · ${workflow(key).name}: ${Math.round(branch / total * 100)}% in branch operations, ${seconds(branch)} of ${seconds(total)}`}] : [];
     })}));
     const shares = rows.flatMap(r => r.dots.map(d => d.value)), percent = v => `${Math.round(v * 100)}%`;
@@ -443,7 +457,7 @@ function shareChart(campaigns) {
 // systems in name order.
 function macroBreakdown(g, named) {
     const c = g.rows[0], campaigns = [...g.rows].sort((a, b) => a.system.localeCompare(b.system));
-    return breakdownSection(named ? [(c.environment || {}).cpu, c.machine, `revision ${c.commit.slice(0, 7)}`].filter(Boolean).join(' · ') : null, 'Branch operations',
+    return breakdownSection(named ? [g.nativeOnly ? 'Native-only mode' : null, (c.environment || {}).cpu, c.machine, `revision ${c.commit.slice(0, 7)}`].filter(Boolean).join(' · ') : null, 'Branch operations',
         'Mean time per successful call over every workflow each system ran, shaded within each row.', verbTable(campaigns), [shareChart(campaigns)]);
 }
 

@@ -489,6 +489,17 @@ assert.deepEqual(classNodes(macroEl('macro-breakdowns'), 'breakdown-title').map(
     const bare = mount(data, [], {suite: {suite: 'macro-1'}, excluded: [], campaigns: [dolt]}, '#agent-workflows').el('macro-breakdowns');
     assert.equal(classNodes(bare, 'empty-cell')[0].textContent, 'No branch operations recorded.');
     assert.equal(classNodes(bare, 'chart-empty')[0].textContent, 'No completed workflow recorded its operation time.');
+
+    // Native-only campaigns are isolated in their own table and breakdown group, and shareChart never mixes worker_time with legacy op_status_counts
+    const stdC = campaign('d3000000', 'Dolt', 'dolt_mysql', '2026-10-10T12:00:00+00:00', six('0000021', V, Array(6).fill(10)));
+    const stdB = campaign('d4000000', 'Doltgres', 'dolt', '2026-10-10T12:00:00+00:00', six('0000022', V, Array(6).fill(15)));
+    stdC.attempts.rl_env.evidence.worker_time = {branch_sec: 3.0, data_sec: 1.0, total_sec: 4.0, spine_sec: 0.5};
+    const natC = {...campaign('d5000000', 'Dolt', 'dolt_mysql', '2026-10-10T13:00:00+00:00', six('0000023', V, Array(6).fill(8))), native_only: true};
+    const mixedPage = mount(data, [], {suite: {suite: 'macro-1'}, excluded: [], campaigns: [natC, stdC, stdB]}, '#agent-workflows');
+    assert.equal(boards(mixedPage).length, 2, 'Standard and Native-only campaigns render in separate tables');
+    assert.deepEqual(classNodes(mixedPage.el('macro-groups'), 'group-heading').map(h => h.children[0].textContent), ['Agent workflows', 'Agent workflows (Native-only)']);
+    const mixedDots = classNodes(classNodes(mixedPage.el('macro-breakdowns'), 'dotplot-panel')[0], 'dotplot-dot');
+    assert.equal(mixedDots.find(d => d.title.startsWith('Dolt · Evaluate agent rollouts')).style.left, '11.11%', 'When not all campaigns have worker_time, shareChart uses op_status_counts uniformly');
 }
 
 // Design tokens: every color is written once, as a :root token in styles.css; rules, markup and scripts name the token.
