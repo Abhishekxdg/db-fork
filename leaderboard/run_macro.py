@@ -265,14 +265,19 @@ def enrich_e2e_stats(raw: dict, outdir: Path, run_id: str, runtime: dict | None 
         if type(f_val) is int and f_val >= 0:
             spine_failed = f_val
 
-    resolved_schema_conflicts = int(metrics.get("schema_conflict_resolved_by_rebase", 0) or 0) + int(
-        metrics.get("schema_conflict_resolved_by_merge", 0) or 0
-    )
+    scenario_key = str(out.get("scenario") or "")
+    want_rebase_res = int(metrics.get("schema_conflict_resolved_by_rebase", 0) or 0)
+    want_merge_res = int(metrics.get("schema_conflict_resolved_by_merge", 0) or 0)
+    resolved_schema_conflicts = want_rebase_res + want_merge_res
     schema_resolved = (
-        resolved_schema_conflicts > 0
+        scenario_key == "dev_agent"
+        and resolved_schema_conflicts > 0
+        and int(metrics.get("schema_conflict_rebases", resolved_schema_conflicts) or 0) == resolved_schema_conflicts
         and int(metrics.get("rebase_failed", 0) or 0) <= resolved_schema_conflicts
     )
-    schema_fault_drop = "drop" in str(metrics.get("schema_fault_applied") or "").split(",")
+    schema_fault_drop = scenario_key == "ops_agent" and (
+        "drop" in str(metrics.get("schema_fault_applied") or "").split(",")
+    )
 
     ok_latency: dict[str, float] = {}
     pq_counts: dict[str, dict[str, int]] = {}
@@ -282,6 +287,11 @@ def enrich_e2e_stats(raw: dict, outdir: Path, run_id: str, runtime: dict | None 
     spine_sec = 0.0
     pq_spine_attempted = 0
     pq_spine_failed = 0
+    pq_batch_merges_ok = 0
+    pq_resolved_by_rebase = 0
+    pq_resolved_by_merge = 0
+    pq_recovered_schema_rebases = 0
+    pending_schema_rebases: dict[str, int] = {}
     total_pq_rows = 0
     total_pq_failed = 0
     expected_failed: dict[str, int] = {}
@@ -378,6 +388,21 @@ def enrich_e2e_stats(raw: dict, outdir: Path, run_id: str, runtime: dict | None 
                             continue
 
                         if st == "OK" and op in (*BRANCH_VERBS, "EXEC"):
+                            if op == "MERGE" and lbl == "batch_merge":
+                                pq_batch_merges_ok += 1
+                            s4_key = ref or f"tid:{tid}"
+                            if op == "REBASE" and lbl == "dev_rebase_retry" and pending_schema_rebases.get(s4_key) == 1:
+                                pending_schema_rebases.pop(s4_key, None)
+                                pq_resolved_by_rebase += 1
+                                pq_recovered_schema_rebases += 1
+                            elif op == "MERGE" and lbl == "spine_merge_retry" and pending_schema_rebases.get(s4_key) == 2:
+                                pending_schema_rebases.pop(s4_key, None)
+                                pq_resolved_by_merge += 1
+                                pq_recovered_schema_rebases += 2
+                            elif op in ("REBASE", "MERGE", "DELETE") and s4_key in pending_schema_rebases:
+                                unexpected_failed["REBASE"] = unexpected_failed.get(
+                                    "REBASE", 0
+                                ) + pending_schema_rebases.pop(s4_key, 0)
                             q = pending_retries.get(tid)
                             if q:
                                 if all(
@@ -407,23 +432,6 @@ def enrich_e2e_stats(raw: dict, outdir: Path, run_id: str, runtime: dict | None 
                                 _flush_pending(tid)
                                 expected_failed["invariant"] = expected_failed.get("invariant", 0) + 1
                                 continue
-                            if op == "REBASE" and "schema conflict" in err.lower() and schema_resolved:
-                                _flush_pending(tid)
-                                expected_failed["schema_conflict_rebase"] = (
-                                    expected_failed.get("schema_conflict_rebase", 0) + 1
-                                )
-                                continue
-                            if (
-                                op == "EXEC"
-                                and lbl == "deploy"
-                                and schema_fault_drop
-                                and "approved_by" in err.lower()
-                            ):
-                                _flush_pending(tid)
-                                expected_failed["schema_fault_deploy"] = (
-                                    expected_failed.get("schema_fault_deploy", 0) + 1
-                                )
-                                continue
                             if is_retryable_error(err):
                                 q = pending_retries.get(tid)
                                 if q and (
@@ -437,6 +445,40 @@ def enrich_e2e_stats(raw: dict, outdir: Path, run_id: str, runtime: dict | None 
                                     {"op": op, "ref": ref, "label": lbl, "waited": False}
                                 )
                                 continue
+                            if op == "REBASE" and "schema conflict" in err.lower() and schema_resolved:
+                                _flush_pending(tid)
+                                s4_key = ref or f"tid:{tid}"
+                                if lbl == "dev_rebase":
+                                    prev = pending_schema_rebases.pop(s4_key, 0)
+                                    if prev:
+                                        unexpected_failed["REBASE"] = unexpected_failed.get("REBASE", 0) + prev
+                                    pending_schema_rebases[s4_key] = 1
+                                    continue
+                                if lbl == "dev_rebase_retry" and pending_schema_rebases.get(s4_key) == 1:
+                                    pending_schema_rebases[s4_key] = 2
+                                    continue
+                            if (
+                                op == "EXEC"
+                                and lbl == "deploy"
+                                and schema_fault_drop
+                                and expected_failed.get("schema_fault_deploy", 0) == 0
+                                and "approved_by" in err.lower()
+                                and any(
+                                    tok in err.lower()
+                                    for tok in (
+                                        "unknown column",
+                                        "does not exist",
+                                        "no such column",
+                                        "not found",
+                                        "invalid identifier",
+                                    )
+                                )
+                            ):
+                                _flush_pending(tid)
+                                expected_failed["schema_fault_deploy"] = (
+                                    expected_failed.get("schema_fault_deploy", 0) + 1
+                                )
+                                continue
                             _flush_pending(tid)
                             key = lbl if (op == "EXEC" and lbl) else op
                             unexpected_failed[key] = unexpected_failed.get(key, 0) + 1
@@ -445,6 +487,18 @@ def enrich_e2e_stats(raw: dict, outdir: Path, run_id: str, runtime: dict | None 
                     for item in pending_retries.pop(tid_rem, ()):
                         key = item["label"] if (item["op"] == "EXEC" and item["label"]) else item["op"]
                         unexpected_failed[key] = unexpected_failed.get(key, 0) + 1
+                for unrec_cnt in pending_schema_rebases.values():
+                    unexpected_failed["REBASE"] = unexpected_failed.get("REBASE", 0) + unrec_cnt
+                pending_schema_rebases.clear()
+                if (
+                    schema_resolved
+                    and pq_recovered_schema_rebases > 0
+                    and pq_resolved_by_rebase == want_rebase_res
+                    and pq_resolved_by_merge == want_merge_res
+                ):
+                    expected_failed["schema_conflict_rebase"] = pq_recovered_schema_rebases
+                elif pq_recovered_schema_rebases > 0:
+                    unexpected_failed["REBASE"] = unexpected_failed.get("REBASE", 0) + pq_recovered_schema_rebases
                 parquet_ok = True
         except Exception:
             parquet_ok = False
@@ -536,7 +590,12 @@ def enrich_e2e_stats(raw: dict, outdir: Path, run_id: str, runtime: dict | None 
                 completed_batches = int(metrics.get("merges_fast_forward", 0) or 0) + int(
                     metrics.get("merges_three_way", 0) or 0
                 )
-                if steps_per_batch > 0 and completed_batches > 0:
+                if (
+                    steps_per_batch > 0
+                    and completed_batches > 0
+                    and pq_batch_merges_ok == completed_batches
+                    and int(metrics.get("merges_failed", 0) or 0) == 0
+                ):
                     succeeded = min(expected, max(succeeded, completed_batches * steps_per_batch))
             out["work"] = {
                 "expected": int(expected),

@@ -1003,20 +1003,41 @@ class ChildProcess(unittest.TestCase):
             self.assertEqual(ev_exh["failed_verbs"]["unexpected"], {"BRANCH": 2})
 
             # 7. S4 schema-conflict rebases resolved by merge, S5 deploy failure under drop schema fault,
-            #    and S6 completed batch work units after same-step reset are all classified as verified.
+            #    and S6 completed batch work units after same-step reset are all classified as verified;
+            #    unrecovered or mismatched Parquet sequences remain failed.
             c_s4 = ResultCollector(run_id=run_id, output_dir=str(outdir))
             c_s4.set_context(table_name="macrobench", table_schema="dev_agent", initial_db_size=0, seed=42)
-            for idx in range(4):
+            for b_idx, branch_ref in enumerate(("dev_1", "dev_2")):
+                t0 = 1.0 + b_idx * 0.2
                 c_s4.emit(
                     rslt.OpType.REBASE,
                     status=rslt.OpStatus.FAILED,
                     latency=0.01,
-                    label="dev_rebase" if idx < 2 else "dev_rebase_retry",
+                    ref=branch_ref,
+                    label="dev_rebase",
                     error_message="RuntimeError: schema conflict; rebase aborted",
-                    start_time=1.0 + idx * 0.02,
-                    end_time=1.01 + idx * 0.02,
+                    start_time=t0,
+                    end_time=t0 + 0.01,
                 )
-            c_s4.emit(rslt.OpType.MERGE, status=rslt.OpStatus.OK, latency=0.02, label="spine_merge_retry", start_time=1.2, end_time=1.22)
+                c_s4.emit(
+                    rslt.OpType.REBASE,
+                    status=rslt.OpStatus.FAILED,
+                    latency=0.01,
+                    ref=branch_ref,
+                    label="dev_rebase_retry",
+                    error_message="RuntimeError: schema conflict; rebase aborted",
+                    start_time=t0 + 0.02,
+                    end_time=t0 + 0.03,
+                )
+                c_s4.emit(
+                    rslt.OpType.MERGE,
+                    status=rslt.OpStatus.OK,
+                    latency=0.02,
+                    ref=branch_ref,
+                    label="spine_merge_retry",
+                    start_time=t0 + 0.04,
+                    end_time=t0 + 0.06,
+                )
             c_s4.write_to_parquet(append=False)
             e2e_s4 = dict(e2e)
             e2e_s4["scenario"] = "dev_agent"
@@ -1027,6 +1048,49 @@ class ChildProcess(unittest.TestCase):
             self.assertEqual(ev_s4["failed_verbs"]["expected"], {"schema_conflict_rebase": 4})
             self.assertEqual(ev_s4["failed_verbs"]["unexpected"], {})
             self.assertEqual(validate_macro.classify(ev_s4, CHILD), ("verified", []))
+
+            # S4 negative: only 1 of 2 branches recovered by spine_merge_retry -> unexpected REBASE failures
+            c_s4_bad = ResultCollector(run_id=run_id, output_dir=str(outdir))
+            c_s4_bad.set_context(table_name="macrobench", table_schema="dev_agent", initial_db_size=0, seed=42)
+            for b_idx, branch_ref in enumerate(("dev_1", "dev_2")):
+                t0 = 1.0 + b_idx * 0.2
+                c_s4_bad.emit(
+                    rslt.OpType.REBASE,
+                    status=rslt.OpStatus.FAILED,
+                    latency=0.01,
+                    ref=branch_ref,
+                    label="dev_rebase",
+                    error_message="RuntimeError: schema conflict; rebase aborted",
+                    start_time=t0,
+                    end_time=t0 + 0.01,
+                )
+                c_s4_bad.emit(
+                    rslt.OpType.REBASE,
+                    status=rslt.OpStatus.FAILED,
+                    latency=0.01,
+                    ref=branch_ref,
+                    label="dev_rebase_retry",
+                    error_message="RuntimeError: schema conflict; rebase aborted",
+                    start_time=t0 + 0.02,
+                    end_time=t0 + 0.03,
+                )
+                if b_idx == 0:
+                    c_s4_bad.emit(
+                        rslt.OpType.MERGE,
+                        status=rslt.OpStatus.OK,
+                        latency=0.02,
+                        ref=branch_ref,
+                        label="spine_merge_retry",
+                        start_time=t0 + 0.04,
+                        end_time=t0 + 0.06,
+                    )
+            c_s4_bad.write_to_parquet(append=False)
+            e2e_s4_bad = dict(e2e_s4)
+            e2e_s4_bad.update(c_s4_bad.support_summary())
+            (outdir / f"{run_id}_e2e_stats.json").write_text(json.dumps(e2e_s4_bad))
+            ev_s4_bad, _ = run_macro.read_evidence(outdir, run_id)
+            self.assertEqual(ev_s4_bad["failed_verbs"]["unexpected"], {"REBASE": 4})
+            self.assertEqual(validate_macro.classify(ev_s4_bad, CHILD)[0], "failed")
 
             c_s5 = ResultCollector(run_id=run_id, output_dir=str(outdir))
             c_s5.set_context(table_name="macrobench", table_schema="ops_agent", initial_db_size=0, seed=42)
@@ -1051,9 +1115,37 @@ class ChildProcess(unittest.TestCase):
             self.assertEqual(ev_s5["failed_verbs"]["unexpected"], {})
             self.assertEqual(validate_macro.classify(ev_s5, CHILD), ("verified", []))
 
+            # S5 negative: unrecovered retryable connection error mentioning approved_by is not swallowed
+            c_s5_bad = ResultCollector(run_id=run_id, output_dir=str(outdir))
+            c_s5_bad.set_context(table_name="macrobench", table_schema="ops_agent", initial_db_size=0, seed=42)
+            c_s5_bad.emit(
+                rslt.OpType.EXEC,
+                status=rslt.OpStatus.FAILED,
+                latency=0.01,
+                label="deploy",
+                error_message="OperationalError: server closed the connection unexpectedly while reading unknown column approved_by",
+                start_time=1.0,
+                end_time=1.01,
+            )
+            c_s5_bad.write_to_parquet(append=False)
+            e2e_s5_bad = dict(e2e_s5)
+            e2e_s5_bad.update(c_s5_bad.support_summary())
+            (outdir / f"{run_id}_e2e_stats.json").write_text(json.dumps(e2e_s5_bad))
+            ev_s5_bad, _ = run_macro.read_evidence(outdir, run_id)
+            self.assertEqual(ev_s5_bad["failed_verbs"]["unexpected"], {"deploy": 1})
+            self.assertEqual(validate_macro.classify(ev_s5_bad, CHILD)[0], "failed")
+
             c_s6 = ResultCollector(run_id=run_id, output_dir=str(outdir))
             c_s6.set_context(table_name="macrobench", table_schema="data_agent", initial_db_size=0, seed=42)
-            c_s6.emit(rslt.OpType.MERGE, status=rslt.OpStatus.OK, latency=0.02, label="batch_merge", start_time=1.0, end_time=1.02)
+            for b_idx in range(4):
+                c_s6.emit(
+                    rslt.OpType.MERGE,
+                    status=rslt.OpStatus.OK,
+                    latency=0.02,
+                    label="batch_merge",
+                    start_time=1.0 + b_idx * 0.1,
+                    end_time=1.02 + b_idx * 0.1,
+                )
             c_s6.write_to_parquet(append=False)
             e2e_s6 = dict(e2e)
             e2e_s6["scenario"] = "data_agent"
@@ -1067,6 +1159,18 @@ class ChildProcess(unittest.TestCase):
             ev_s6, _ = run_macro.read_evidence(outdir, run_id)
             self.assertEqual(ev_s6["work"], {"expected": 12, "succeeded": 12, "failed": 0, "skipped": 0})
             self.assertEqual(validate_macro.classify(ev_s6, CHILD), ("verified", []))
+
+            # S6 negative: Parquet only has 1 batch_merge OK vs 4 claimed in metrics -> keeps 9/12 and fails
+            c_s6_bad = ResultCollector(run_id=run_id, output_dir=str(outdir))
+            c_s6_bad.set_context(table_name="macrobench", table_schema="data_agent", initial_db_size=0, seed=42)
+            c_s6_bad.emit(rslt.OpType.MERGE, status=rslt.OpStatus.OK, latency=0.02, label="batch_merge", start_time=1.0, end_time=1.02)
+            c_s6_bad.write_to_parquet(append=False)
+            e2e_s6_bad = dict(e2e_s6)
+            e2e_s6_bad.update(c_s6_bad.support_summary())
+            (outdir / f"{run_id}_e2e_stats.json").write_text(json.dumps(e2e_s6_bad))
+            ev_s6_bad, _ = run_macro.read_evidence(outdir, run_id)
+            self.assertEqual(ev_s6_bad["work"], {"expected": 12, "succeeded": 9, "failed": 0, "skipped": 0})
+            self.assertEqual(validate_macro.classify(ev_s6_bad, CHILD)[0], "failed")
 
     def test_paper_diagnostics_fields_are_preserved_and_validated(self):
         from leaderboard import validate_macro

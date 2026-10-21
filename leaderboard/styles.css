@@ -380,8 +380,7 @@ code { font: .92em/1.5 var(--mono); }
 .arch-svg .node-code { fill: var(--code-bg); stroke: var(--code-line); stroke-width: 1.25; transition: stroke .15s, stroke-width .15s; }
 .arch-svg .node-warn { fill: var(--warn-tint); stroke: var(--warn); stroke-width: 1.25; transition: stroke .15s, stroke-width .15s, fill .15s; }
 .arch-svg .node-bad { fill: var(--surface); stroke: var(--bad); stroke-width: 1.35; stroke-dasharray: 4 3; }
-.arch-svg .arch-node { cursor: pointer; transition: opacity .18s; }
-.arch-svg .arch-node:hover :is(.node-card, .node-accent, .node-warn, .node-code) { stroke: var(--accent); stroke-width: 2; }
+.arch-svg .arch-node { transition: opacity .18s; }
 .arch-svg .step-badge { fill: var(--ink); transition: fill .15s; }
 .arch-svg .step-num { fill: var(--surface); font: 600 11.5px var(--mono); text-anchor: middle; dominant-baseline: central; }
 .arch-svg .lane-kicker { fill: var(--accent); font: 600 11.5px var(--mono); letter-spacing: .4px; }
@@ -446,6 +445,14 @@ code { font: .92em/1.5 var(--mono); }
     .arch-pill.is-active { border-color: var(--line-strong); background: var(--surface); color: var(--ink); font-weight: 650; }
     .arch-step-tab.is-active { border-color: var(--brand); background: var(--mint-tint); }
     .arch-detail-card.is-active { display: grid; }
+    .arch-workbench[data-active-path="local"] .arch-svg [data-path]:not([data-path~="local"]),
+    .arch-workbench[data-active-path="alpha"] .arch-svg [data-path]:not([data-path~="alpha"]),
+    .arch-workbench[data-active-path="prod"] .arch-svg [data-path]:not([data-path~="prod"]) { opacity: .24; }
+    .arch-workbench[data-active-stage="1"] .arch-svg .arch-col-1,
+    .arch-workbench[data-active-stage="2"] .arch-svg .arch-col-2,
+    .arch-workbench[data-active-stage="3"] .arch-svg .arch-col-3,
+    .arch-workbench[data-active-stage="4"] .arch-svg .arch-col-4,
+    .arch-workbench[data-active-stage="5"] .arch-svg .arch-col-5 { stroke: var(--brand); stroke-width: 2; fill: var(--mint-tint); }
 }
 .arch-legend { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 4px 0 0; padding: 0; list-style: none; color: var(--muted); font-size: 12px; }
 .arch-legend li { display: inline-flex; align-items: center; gap: 7px; }

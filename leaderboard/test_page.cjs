@@ -532,9 +532,10 @@ assert.deepEqual(classNodes(macroEl('macro-breakdowns'), 'breakdown-title').map(
         for (const m of rest.matchAll(literal)) report(file, rest, m.index, m[0], '');
     }
     assert.deepEqual(offences, [], `Color literals outside :root:\n${offences.join('\n')}`);
-    assert.doesNotMatch(arch, /--preset=full|<sys>\s+<machine>|\bProject=BranchBench(?!Leaderboard)\b|\.phase-pill/,
-        'architecture.html must match real CLI syntax, AWS tags, and CSS selectors');
+    assert.doesNotMatch(arch, /--preset=full|<sys>\s+<machine>|\bProject=BranchBench(?!Leaderboard)\b|\.phase-pill|run_verbs|validate_verbs\.py|role="tablist"/,
+        'architecture.html must match real CLI syntax, AWS tags, ARIA roles, and CSS selectors');
     assert.match(arch, /Chronos/, 'architecture.html must list Chronos among self-hosted engines');
+    assert.match(arch, /python -m leaderboard\.verbs/, 'architecture.html must reference python -m leaderboard.verbs');
     const svgBodies = [...arch.matchAll(/<svg\s+class="arch-svg"[\s\S]*?<\/svg>/g)].map(([s]) => s);
     assert.equal(svgBodies.length, 2, 'architecture.html must render both architecture and lifecycle SVG diagrams');
     const decodeEntities = s => s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCodePoint(parseInt(h, 16)));

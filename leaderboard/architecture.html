@@ -40,15 +40,15 @@
                 </div>
                 <p class="panel-note">Filter by deployment phase or click any stage to inspect its input/output contract, CLI entrypoints, and fail-closed invariants.</p>
 
-                <div class="arch-workbench" id="arch-workbench">
-                    <div class="arch-toolbar" role="toolbar" aria-label="Filter architecture path by phase">
-                        <div class="arch-filter-group">
+                <div class="arch-workbench" id="arch-workbench" data-active-path="all" data-active-stage="1">
+                    <div class="arch-toolbar">
+                        <div class="arch-filter-group" role="radiogroup" aria-label="Filter architecture path by phase">
                             <label class="arch-pill is-active"><input type="radio" name="arch-path" id="path-all" checked>All paths</label>
                             <label class="arch-pill"><input type="radio" name="arch-path" id="path-local"><span class="arch-pill-dot" aria-hidden="true"></span>Local dev</label>
                             <label class="arch-pill"><input type="radio" name="arch-path" id="path-alpha"><span class="arch-pill-dot arch-pill-dot-warn" aria-hidden="true"></span>AWS Alpha</label>
                             <label class="arch-pill"><input type="radio" name="arch-path" id="path-prod"><span class="arch-pill-dot arch-pill-dot-ink" aria-hidden="true"></span>Official Prod</label>
                         </div>
-                        <p class="arch-toolbar-hint">Click any node or stage card below to inspect details</p>
+                        <p class="arch-toolbar-hint">Select any stage tab below to inspect details</p>
                     </div>
 
                     <div class="arch-diagram-frame" role="region" aria-label="End-to-end technical architecture diagram">
@@ -149,7 +149,7 @@
                             <g class="arch-node" data-stage="3" data-path="local alpha prod">
                                 <rect class="node-card" x="476" y="246" width="168" height="78" rx="8"/>
                                 <text class="node-title" x="488" y="270">3C · Verb Scaling</text>
-                                <text class="node-mono" x="488" y="290">run_verbs (S0)</text>
+                                <text class="node-mono" x="488" y="290">verbs.py (S0)</text>
                                 <text class="node-sub" x="488" y="308">4 scaling axes</text>
                             </g>
 
@@ -200,7 +200,7 @@
                         </svg>
                     </div>
 
-                    <div class="arch-stepper" role="tablist" aria-label="Inspect pipeline stages">
+                    <div class="arch-stepper" role="radiogroup" aria-label="Inspect pipeline stages">
                         <label class="arch-step-tab is-active">
                             <input type="radio" name="arch-stage" id="stage-1" checked>
                             <span class="arch-step-kicker">Stage 01</span>
@@ -285,7 +285,7 @@
                         <article class="arch-detail-card" data-stage="3">
                             <div class="arch-detail-head">
                                 <h3>Stage 03 · Three Benchmark Execution Lanes</h3>
-                                <span class="count-badge">run.py · run_macro.py · run_verbs.py</span>
+                                <span class="count-badge">run.py · run_macro.py · verbs.py</span>
                             </div>
                             <div class="arch-detail-cols">
                                 <div class="arch-detail-box">
@@ -301,7 +301,7 @@
                                 <div class="arch-detail-box">
                                     <h4>3C · VERB SCALING LANE (S0_verbs)</h4>
                                     <p>Sweeps <code>fanout</code>, <code>depth</code>, <code>mutation_scale</code>, and <code>concurrency</code> in isolated process groups with verified cleanup.</p>
-                                    <code class="arch-code-pill">python -m leaderboard.run_verbs &lt;system&gt; --machine &lt;id&gt;</code>
+                                    <code class="arch-code-pill">python -m leaderboard.verbs &lt;system&gt; --machine &lt;id&gt;</code>
                                 </div>
                             </div>
                         </article>
@@ -339,7 +339,7 @@
                                 <div class="arch-detail-box">
                                     <h4>Schema &amp; Provenance Validators</h4>
                                     <p>Verifies <code>schema_version</code>, <code>suite_sha256</code>, <code>dataset_sha256</code>, clean teardown, and <code>execution_profile</code> before any record can rank.</p>
-                                    <code class="arch-code-pill">validate.py · validate_macro.py · validate_verbs.py</code>
+                                    <code class="arch-code-pill">validate.py · validate_macro.py · verbs.py</code>
                                 </div>
                                 <div class="arch-detail-box">
                                     <h4>Profile &amp; Mode Cohort Builders</h4>
@@ -437,7 +437,7 @@
                     </div>
                     <div>
                         <dt>Verb Scaling (<code>S0_verbs</code>)</dt>
-                        <dd>Controlled micro-suite sweeping <code>fanout</code>, <code>depth</code>, <code>mutation_scale</code>, and <code>concurrency</code> via <code>python -m leaderboard.run_verbs &lt;system&gt; --machine &lt;id&gt;</code>.</dd>
+                        <dd>Controlled micro-suite sweeping <code>fanout</code>, <code>depth</code>, <code>mutation_scale</code>, and <code>concurrency</code> via <code>python -m leaderboard.verbs &lt;system&gt; --machine &lt;id&gt;</code>.</dd>
                     </div>
                     <div>
                         <dt>Hardware Cohorts</dt>
@@ -460,7 +460,7 @@
                     </div>
                     <div id="submission-flow">
                         <dt>Official Cloud (<code>prod</code>)</dt>
-                        <dd><code>python -m leaderboard.site</code> (default <code>prod</code>) publishes only records listed in <code>leaderboard/publish.json</code> that pass full validation (clean git commit, <code>full</code> macro preset, and <code>paper_separated_vms</code> for AWS runs), omitting the phase badge and developer wizard.</dd>
+                        <dd><code>python -m leaderboard.site</code> (default <code>prod</code>) publishes only records listed in <code>leaderboard/publish.json</code> that pass full validation (clean git commit, <code>full</code> macro preset, and a homogeneous <code>execution_profile</code> cohort across compared runs), omitting the phase badge and developer wizard.</dd>
                     </div>
                 </dl>
             </section>
@@ -521,6 +521,10 @@
     const wb = document.getElementById('arch-workbench');
     if (!wb) return;
     const syncFallback = () => {
+        const activePath = wb.querySelector('input[name="arch-path"]:checked');
+        const activeStage = wb.querySelector('input[name="arch-stage"]:checked');
+        if (activePath) wb.dataset.activePath = activePath.id.replace('path-', '');
+        if (activeStage) wb.dataset.activeStage = activeStage.id.replace('stage-', '');
         for (const el of wb.querySelectorAll('.arch-pill, .arch-step-tab')) {
             const inp = el.querySelector('input');
             el.classList.toggle('is-active', Boolean(inp && inp.checked));
@@ -531,12 +535,7 @@
         }
     };
     wb.addEventListener('change', syncFallback);
-    for (const node of wb.querySelectorAll('.arch-node[data-stage]')) {
-        node.addEventListener('click', () => {
-            const radio = wb.querySelector(`#stage-${node.dataset.stage}`);
-            if (radio) { radio.checked = true; syncFallback(); }
-        });
-    }
+    syncFallback();
 })();
 </script>
 </body>
