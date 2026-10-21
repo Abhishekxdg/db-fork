@@ -119,7 +119,9 @@ function summaryTable(title, ctx) {
             td.append(line);
             td.title = `Unrounded ${SORTS[key]} score: ${hit.score}${single === null ? ' · composite of several workloads, no single elapsed time' : ''}`;
         }
-        const action = tr.insertCell(); action.className = 'action-cell'; action.append(detailsButton(nameOf(e), opener => showRun(e, opener, ctx), slug('details', e.hosted, e.system, e.machine)));
+        const action = tr.insertCell(); action.className = 'action-cell';
+        const detailId = slug('details', e.hosted, e.system, e.machine, ...(e.execution_profile && e.execution_profile !== 'local_single_host' ? [e.execution_profile] : []));
+        action.append(detailsButton(nameOf(e), opener => showRun(e, opener, ctx), detailId));
     }
     return table;
 }
@@ -155,7 +157,8 @@ function heatmap(ctx) {
     return table;
 }
 function chartPoint(e, x, y, description, attributes, ctx) {
-    const point = svgNode('g', {id: slug('point', e.hosted, e.system, e.machine), class: 'chart-point', tabindex: 0, role: 'button', 'aria-haspopup': 'dialog', 'aria-label': `${label(e)}: ${description}. View run details.`, ...attributes});
+    const ptId = slug('point', e.hosted, e.system, e.machine, ...(e.execution_profile && e.execution_profile !== 'local_single_host' ? [e.execution_profile] : []));
+    const point = svgNode('g', {id: ptId, class: 'chart-point', tabindex: 0, role: 'button', 'aria-haspopup': 'dialog', 'aria-label': `${label(e)}: ${description}. View run details.`, ...attributes});
     point.append(svgNode('title', {}, `${label(e)} · ${description}`), svgNode('circle', {cx: x, cy: y, r: 13, class: 'chart-hit'}), svgNode('circle', {cx: x, cy: y, r: 5, class: 'chart-dot', style: `fill: ${seriesColor(e)}`}));
     point.addEventListener('click', () => showRun(e, point, ctx));
     point.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); showRun(e, point, ctx); } });
@@ -247,7 +250,8 @@ function showRun(e, opener, ctx) {
     body.append(scrolling(table));
     detailsSection(body, 'Environment');
     body.append(metaGrid([['Machine', e.machine], ['Database version', e.version], ['Suite', e.suite], ['Run ID', e.run_id], ['Configuration', e.tuned === 'yes' ? 'Tuned' : e.tuned === 'no' ? 'Default' : null],
-        ['Load', seconds(e.load_time)], ['Provisioning', seconds(e.provision_time)], ['Region', e.region], ['Client location', e.client_location], ['Round-trip baseline', e.rtt_ms === undefined ? null : `${e.rtt_ms} ms`]]));
+        ['Load', seconds(e.load_time)], ['Provisioning', seconds(e.provision_time)], ['Region', e.region], ['Client location', e.client_location], ['Round-trip baseline', e.rtt_ms === undefined ? null : `${e.rtt_ms} ms`],
+        ...(e.execution_profile ? [['Execution profile', e.execution_profile]] : [])]));
     if (e.tags.length) body.append(tagList(e.tags));
     const reproducibility = metaGrid([['Git commit', e.commit], ['Seed', e.seed], ['Python', e.python], ['Suite SHA-256', e.suite_sha256], ['Dataset SHA-256', e.dataset_sha256], ['Dependency lock SHA-256', e.lock_sha256], ...Object.entries(e.service || {})]);
     if (reproducibility.children.length) body.append(disclosure('Reproducibility details', reproducibility));
@@ -366,9 +370,14 @@ function renderMicro() {
     el('empty-title').textContent = data.length ? 'No matches' : 'No published results yet';
     el('empty-description').textContent = data.length ? 'Adjust or reset the filters.' : `Microbenchmark results appear here once they are published.${excluded.length ? ` ${plural(excluded.length, 'run')} without a result ${excluded.length === 1 ? 'is' : 'are'} listed below.` : ''}`;
     el('clear-empty-filters').hidden = !filtered;
-    const groups = shown.length ? [{title: 'Operations', ctx: microContext(shown)}] : [];
+    const profiles = uniq(shown.map(e => e.execution_profile || 'local_single_host'));
+    const groups = profiles.map(prof => ({
+        title: profiles.length > 1 ? `Operations (${prof})` : 'Operations',
+        ctx: microContext(shown.filter(e => (e.execution_profile || 'local_single_host') === prof)),
+        named: profiles.length > 1,
+    }));
     el('groups').replaceChildren(...groups.map(g => boardGroup(g.title, g.ctx)));
-    el('breakdowns').replaceChildren(...groups.map(g => breakdown(g.title, g.ctx, false)));
+    el('breakdowns').replaceChildren(...groups.map(g => breakdown(g.title, g.ctx, g.named)));
     el('excluded').replaceChildren(...excluded.length ? [excludedPanel('excluded-panel', PHASE === 'prod' ? 'Runs without a result' : 'Excluded results',
         excluded.map(x => ({label: `${x.system} / ${x.machine}`, href: x.source, reason: x.reason})), !data.length)] : []);  // with no result at all, the reasons are the news
     renderOperations(groups);
