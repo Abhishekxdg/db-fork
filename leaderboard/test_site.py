@@ -883,6 +883,111 @@ class AwsAlphaLifecycle(Board):
         self.assertIn("custom-alpha-site-bucket", col_all["deleted_buckets"])
         self.assertEqual(self.cloud["buckets"], set())
 
+    def test_sync_git_index_reconstruction_elf_check_and_bucket_tag_fail_closed(self):
+        import subprocess
+
+        # 1. Real temp git repo: write_sync_filelist + rsync --files-from + reconstruct_synced_git_index leaves clean git status
+        src_repo = self.board / "src_repo"
+        dst_repo = self.board / "dst_repo"
+        for rel in (
+            "leaderboard/x.py",
+            "microbench/x.py",
+            "macrobench/x.py",
+            "dblib/x.py",
+            "util/x.py",
+            "pyproject.toml",
+            "uv.lock",
+            "build_protos.py",
+        ):
+            p = src_repo / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("# tracked\n")
+        subprocess.run(["git", "init", str(src_repo)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(src_repo), "config", "user.email", "test@example.com"], check=True)
+        subprocess.run(["git", "-C", str(src_repo), "config", "user.name", "Test"], check=True)
+        subprocess.run(["git", "-C", str(src_repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(src_repo), "commit", "-m", "init"], check=True, capture_output=True)
+        (src_repo / "leaderboard" / "secret_untracked.txt").write_text("do not sync")
+
+        flist = self.aws_alpha.write_sync_filelist(self.runs, "branchbench-alpha", src_repo)
+        dst_repo.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["rsync", "-a", f"--files-from={flist}", f"{src_repo}/", f"{dst_repo}/"],
+            check=True,
+        )
+        self.assertFalse((dst_repo / ".git" / "index").exists(), "index is reconstructed on the destination, not copied")
+        self.aws_alpha.reconstruct_synced_git_index(dst_repo)
+        self.assertTrue((dst_repo / ".git" / "index").is_file())
+        st = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(dst_repo),
+                "status",
+                "--porcelain",
+                "--",
+                "leaderboard",
+                "microbench",
+                "macrobench",
+                "dblib",
+                "util",
+                "pyproject.toml",
+                "uv.lock",
+                "build_protos.py",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(st.stdout.strip(), "")
+
+        # 2. _is_linux_x86_64_elf distinguishes Linux x86_64 ELF from macOS Mach-O
+        macho = self.board / "mo-macho"
+        macho.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 32)
+        self.assertFalse(self.aws_alpha._is_linux_x86_64_elf(macho))
+        elf_x64 = self.board / "mo-elf"
+        elf_x64.write_bytes(b"\x7fELF\x02\x01\x01" + b"\x00" * 9 + b"\x02\x00\x3e\x00" + b"\x00" * 16)
+        self.assertTrue(self.aws_alpha._is_linux_x86_64_elf(elf_x64))
+
+        # 3. run_alpha_benchmarks rejects --profile-mode paper and fails closed on remote lock (42) or journal (43)
+        aws = self.aws_alpha.AwsCli(region="us-east-1", runner=self.fake_aws_runner)
+        self.aws_alpha.up_alpha(
+            aws=aws,
+            stack="branchbench-alpha",
+            runs_dir=self.runs,
+            http_getter=lambda _url: "203.0.113.9",
+        )
+        with self.assertRaisesRegex(self.aws_alpha.AlphaError, "paper_separated_vms|economic"):
+            self.aws_alpha.run_alpha_benchmarks(
+                aws=aws,
+                stack="branchbench-alpha",
+                preset="full",
+                profile_mode="paper",
+                board=self.board,
+                runs_dir=self.runs,
+            )
+        for code, pat in ((42, "active benchmark lock"), (43, "unrecovered journal")):
+            with self.assertRaisesRegex(self.aws_alpha.AlphaError, pat):
+                self.aws_alpha.run_alpha_benchmarks(
+                    aws=aws,
+                    stack="branchbench-alpha",
+                    board=self.board,
+                    runs_dir=self.runs,
+                    cmd_runner=lambda cmd, rc=code, **_kw: subprocess.CompletedProcess(cmd, rc, stdout="", stderr=""),
+                )
+
+        # 4. Bucket tag inspection failure (get-bucket-tagging rc=1) causes collapse_alpha to report collapsed=False
+        self.cloud["buckets"].add("branchbench-alpha-unreadable-tags")
+        self.cloud.get("bucket_tags", {}).pop("branchbench-alpha-unreadable-tags", None)
+        col = self.aws_alpha.collapse_alpha(
+            aws=aws,
+            stack="branchbench-alpha",
+            board=self.board,
+            runs_dir=self.runs,
+        )
+        self.assertFalse(col["collapsed"], "unreadable bucket tags must fail closed during collapse")
+        self.assertIn("branchbench-alpha-unreadable-tags", col["remaining_buckets"])
+
 
 if __name__ == "__main__":
     unittest.main()

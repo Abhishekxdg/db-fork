@@ -375,6 +375,8 @@ def discover_stack_resources(aws: AwsCli, stack: str, state: dict[str, Any]) -> 
         keys.append(state_key)
 
     buckets: list[str] = []
+    unverified_buckets: list[str] = []
+    bucket_discovery_error = ""
     state_bucket = str(state.get("bucket") or "")
     if state_bucket:
         buckets.append(state_bucket)
@@ -384,13 +386,13 @@ def discover_stack_resources(aws: AwsCli, stack: str, state: dict[str, Any]) -> 
             b_name = str((b_item or {}).get("Name") or "")
             if not b_name or b_name in buckets:
                 continue
-            try:
-                verify_bucket_ownership(aws, stack, b_name)
+            ownership = _inspect_bucket_ownership(aws, stack, b_name)
+            if ownership == "owned":
                 buckets.append(b_name)
-            except AlphaError:
-                continue
-    except AlphaError:
-        pass
+            elif ownership == "unknown":
+                unverified_buckets.append(b_name)
+    except AlphaError as exc:
+        bucket_discovery_error = str(exc)
     bucket = buckets[0] if buckets else ""
     return {
         "stack": stack,
@@ -401,6 +403,8 @@ def discover_stack_resources(aws: AwsCli, stack: str, state: dict[str, Any]) -> 
         "key_pairs": keys,
         "bucket": bucket,
         "buckets": buckets,
+        "unverified_buckets": unverified_buckets,
+        "bucket_discovery_error": bucket_discovery_error,
     }
 
 
@@ -499,6 +503,29 @@ def _classify_head_bucket(aws: AwsCli, bucket: str) -> str:
     ):
         return "missing"
     raise AlphaError(f"aws s3api head-bucket failed for {bucket!r}: {detail or f'exit {head.returncode}'}")
+
+
+def _inspect_bucket_ownership(aws: AwsCli, stack: str, bucket: str) -> str:
+    """Return 'owned', 'foreign', or 'unknown' (when bucket tag inspection fails or cannot rule out ownership)."""
+    try:
+        tag_resp = aws.call_json(["s3api", "get-bucket-tagging", "--bucket", bucket])
+    except AlphaError as exc:
+        low = str(exc).lower()
+        if "nosuchtagset" in low and not bucket.startswith(f"{stack}-"):
+            return "foreign"
+        return "unknown"
+    tags = {
+        str(item.get("Key") or ""): str(item.get("Value") or "")
+        for item in (tag_resp.get("TagSet") or [])
+        if isinstance(item, dict)
+    }
+    if (
+        tags.get("Phase") == "alpha"
+        and tags.get("Stack") == stack
+        and tags.get("Project") in ("BranchBenchLeaderboard", "branchbench")
+    ):
+        return "owned"
+    return "foreign"
 
 
 def verify_bucket_ownership(aws: AwsCli, stack: str, bucket: str) -> None:
@@ -895,6 +922,59 @@ def write_sync_filelist(runs_dir: Path, stack: str, root: Path = ROOT) -> Path:
     return filelist_path
 
 
+def reconstruct_synced_git_index(repo_dir: Path) -> None:
+    """Populate .git/index from HEAD in a synced repository and verify that tracked paths are clean."""
+    for git_args in (
+        ["git", "-C", str(repo_dir), "read-tree", "HEAD"],
+        ["git", "-C", str(repo_dir), "update-index", "-q", "--refresh"],
+    ):
+        res = subprocess.run(git_args, capture_output=True, text=True)
+        if res.returncode != 0:
+            detail = (res.stderr or res.stdout or "").strip()
+            raise AlphaError(f"{' '.join(git_args)} failed: {detail or f'exit {res.returncode}'}")
+    st = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_dir),
+            "status",
+            "--porcelain",
+            "--",
+            "leaderboard",
+            "microbench",
+            "macrobench",
+            "dblib",
+            "util",
+            "pyproject.toml",
+            "uv.lock",
+            "build_protos.py",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if st.returncode != 0 or st.stdout.strip():
+        raise AlphaError(f"synced repository {repo_dir} is not clean after index reconstruction: {st.stdout.strip()}")
+
+
+def _is_linux_x86_64_elf(path: Path) -> bool:
+    """Return True iff path is a regular file with a 64-bit little-endian x86_64 ELF header."""
+    try:
+        if not path.is_file() or path.is_symlink():
+            return False
+        with path.open("rb") as fh:
+            header = fh.read(20)
+    except OSError:
+        return False
+    if len(header) < 20:
+        return False
+    return (
+        header[:4] == b"\x7fELF"
+        and header[4] == 2  # ELFCLASS64
+        and header[5] == 1  # ELFDATA2LSB
+        and int.from_bytes(header[18:20], "little") == 0x3E  # EM_X86_64
+    )
+
+
 def run_alpha_benchmarks(
     *,
     aws: AwsCli,
@@ -917,10 +997,13 @@ def run_alpha_benchmarks(
         raise AlphaError(f"--preset must be mini or full, got {preset!r}")
     if lane not in ("all", "micro", "macro"):
         raise AlphaError(f"--lane must be all, micro, or macro, got {lane!r}")
-    if profile_mode not in ("economic", "paper"):
-        raise AlphaError(f"--profile-mode must be economic or paper, got {profile_mode!r}")
-    if profile_mode == "paper" and preset != "full":
-        raise AlphaError("--profile-mode paper requires --preset full")
+    if profile_mode == "paper":
+        raise AlphaError(
+            "--profile-mode paper requires separated client and database VMs (paper_separated_vms); "
+            "the single-VM alpha worker only supports --profile-mode economic (economic_single_vm)"
+        )
+    if profile_mode not in ("economic", "economic_single_vm"):
+        raise AlphaError(f"--profile-mode must be economic, got {profile_mode!r}")
     state = load_state(runs_dir, stack)
     public_ip = str(state.get("public_ip") or "")
     key_path = str(state.get("key_path") or key_file_path(runs_dir, stack))
@@ -939,8 +1022,6 @@ def run_alpha_benchmarks(
         "--batch-deadline-min",
         f"{batch_deadline_min:g}",
     ]
-    if profile_mode != "economic":
-        worker_cmd.extend(["--profile-mode", profile_mode])
     if lane in ("micro", "macro"):
         worker_cmd.extend(["--lane", lane])
     if systems.strip():
@@ -981,21 +1062,43 @@ def run_alpha_benchmarks(
     collapse_failed = False
 
     try:
-        # 1. Wait for cloud-init bootstrap marker on the worker and reset ~/db-fork cleanly
+        # 1. Wait for cloud-init bootstrap marker on the worker, ensure no lock or recovery journal is active, and prepare ~/db-fork.sync
+        wait_script = (
+            "for i in $(seq 1 90); do "
+            "if [ -f /var/lib/branchbench-alpha-ready ]; then "
+            "if [ -d ~/db-fork/leaderboard/.runs ]; then "
+            "flock -n ~/db-fork/leaderboard/.runs/batch.lock -c true || exit 42; "
+            "flock -n ~/db-fork/leaderboard/.runs/run.lock -c true || exit 42; "
+            "for f in ~/db-fork/leaderboard/.runs/*.journal.json ~/db-fork/leaderboard/.runs/*.active.json; do "
+            '[ -e "$f" ] && exit 43; '
+            "done; "
+            "fi; "
+            "rm -rf ~/db-fork.sync && mkdir -p ~/db-fork.sync && exit 0; "
+            "fi; "
+            "sleep 5; "
+            "done; exit 1"
+        )
         wait_cmd = [
             "ssh",
             *ssh_opts,
             "-o",
             "ConnectionAttempts=10",
             ssh_target,
-            "for i in $(seq 1 90); do [ -f /var/lib/branchbench-alpha-ready ] && rm -rf ~/db-fork && mkdir -p ~/db-fork && exit 0; sleep 5; done; exit 1",
+            wait_script,
         ]
-        if cmd_runner(wait_cmd).returncode != 0:
+        wait_res = cmd_runner(wait_cmd)
+        if wait_res.returncode == 42:
+            raise AlphaError(f"remote worker {ssh_target} has an active benchmark lock in ~/db-fork/leaderboard/.runs")
+        if wait_res.returncode == 43:
+            raise AlphaError(
+                f"remote worker {ssh_target} has an unrecovered journal or active run in ~/db-fork/leaderboard/.runs"
+            )
+        if wait_res.returncode != 0:
             raise AlphaError(
                 f"timed out waiting for cloud-init bootstrap (/var/lib/branchbench-alpha-ready) on {ssh_target}"
             )
 
-        # 2. Sync only git-tracked regular files and safe .git metadata (portable across GNU rsync and macOS openrsync)
+        # 2. Sync only git-tracked regular files and safe .git metadata into ~/db-fork.sync/ (portable across GNU rsync and macOS openrsync)
         filelist_path = write_sync_filelist(runs_dir, stack, ROOT)
         try:
             sync_up = [
@@ -1005,33 +1108,95 @@ def run_alpha_benchmarks(
                 "-e",
                 ssh_rsh,
                 f"{ROOT}/",
-                f"{ssh_target}:~/db-fork/",
+                f"{ssh_target}:~/db-fork.sync/",
             ]
             if cmd_runner(sync_up).returncode != 0:
-                raise AlphaError(f"failed to rsync repository to {ssh_target}:~/db-fork/")
+                raise AlphaError(f"failed to rsync repository to {ssh_target}:~/db-fork.sync/")
         finally:
             filelist_path.unlink(missing_ok=True)
 
-        # 2b. If local ~/mo/matrixone or ~/seekdb exists on the operator machine (linux x86_64 binaries), sync them
+        # 2b. If local ~/mo/matrixone or ~/seekdb has a Linux x86_64 ELF binary on the operator machine, sync binaries only (never data/log dirs)
         selected_tokens = set(systems.replace(",", " ").split()) if systems.strip() else {"matrixone", "seekdb"}
         mo_local = Path.home() / "mo" / "matrixone"
-        if "matrixone" in selected_tokens and (mo_local / "mo-service").is_file():
-            cmd_runner(["rsync", "-az", "-e", ssh_rsh, f"{mo_local}/", f"{ssh_target}:~/mo/matrixone/"])
+        if "matrixone" in selected_tokens and _is_linux_x86_64_elf(mo_local / "mo-service"):
+            mo_sync = [
+                "rsync",
+                "-az",
+                "--exclude=mo-data",
+                "--exclude=mo-data/**",
+                "--exclude=store",
+                "--exclude=store/**",
+                "--exclude=log",
+                "--exclude=log/**",
+                "--exclude=*.log",
+                "--exclude=*.pid",
+                "-e",
+                ssh_rsh,
+                f"{mo_local}/",
+                f"{ssh_target}:~/mo/matrixone/",
+            ]
+            if cmd_runner(mo_sync).returncode != 0:
+                raise AlphaError(f"failed to rsync MatrixOne binary from {mo_local} to {ssh_target}")
         seekdb_local = Path.home() / "seekdb"
-        if "seekdb" in selected_tokens and (seekdb_local / "bin" / "seekdb").is_file():
-            cmd_runner(["rsync", "-az", "-e", ssh_rsh, f"{seekdb_local}/", f"{ssh_target}:~/seekdb/"])
+        if "seekdb" in selected_tokens and _is_linux_x86_64_elf(seekdb_local / "bin" / "seekdb"):
+            seekdb_sync = [
+                "rsync",
+                "-az",
+                "--exclude=store",
+                "--exclude=store/**",
+                "--exclude=log",
+                "--exclude=log/**",
+                "--exclude=*.log",
+                "--exclude=*.pid",
+                "-e",
+                ssh_rsh,
+                f"{seekdb_local}/",
+                f"{ssh_target}:~/seekdb/",
+            ]
+            if cmd_runner(seekdb_sync).returncode != 0:
+                raise AlphaError(f"failed to rsync SeekDB binary from {seekdb_local} to {ssh_target}")
 
-        # 3. Execute benchmark batch on worker (pass hosted DB secrets over encrypted SSH stdin, never in argv)
+        # 3. Reconstruct .git/index in ~/db-fork.sync, preserve .runs and existing results/macro/verbs, swap into ~/db-fork, and execute worker
         env_stdin = "".join(
             f"export {k}={shlex.quote(os.environ[k])}\n"
             for k in HOSTED_ENV_KEYS
-            if os.environ.get(k)
+            for val in (os.environ.get(k),)
+            if val
         )
         deadman_min = max(15, int(batch_deadline_min) + 15)
+        activate_sync = (
+            "git -C ~/db-fork.sync read-tree HEAD && "
+            "git -C ~/db-fork.sync update-index -q --refresh && "
+            'test -z "$(git -C ~/db-fork.sync status --porcelain -- leaderboard microbench macrobench dblib util pyproject.toml uv.lock build_protos.py)" && '
+            "if [ -d ~/db-fork ]; then "
+            "if [ -d ~/db-fork/leaderboard/.runs ]; then "
+            "flock -n ~/db-fork/leaderboard/.runs/batch.lock -c true && "
+            "flock -n ~/db-fork/leaderboard/.runs/run.lock -c true && "
+            "rm -rf ~/db-fork.sync/leaderboard/.runs && "
+            "mv ~/db-fork/leaderboard/.runs ~/db-fork.sync/leaderboard/.runs; "
+            "fi && "
+            "for sub in results macro verbs; do "
+            "for d in ~/db-fork/leaderboard/*/$sub; do "
+            '[ -d "$d" ] || continue; '
+            'sys_dir="$(basename "$(dirname "$d")")"; '
+            'mkdir -p ~/db-fork.sync/leaderboard/"$sys_dir" && '
+            'cp -a "$d" ~/db-fork.sync/leaderboard/"$sys_dir"/; '
+            "done; "
+            "done && "
+            "if [ -d ~/db-fork/.venv ] && [ ! -e ~/db-fork.sync/.venv ]; then "
+            "mv ~/db-fork/.venv ~/db-fork.sync/.venv; "
+            "fi; "
+            "fi && "
+            "rm -rf ~/db-fork.prev && "
+            "if [ -d ~/db-fork ]; then mv ~/db-fork ~/db-fork.prev; fi && "
+            "mv ~/db-fork.sync ~/db-fork && "
+            "rm -rf ~/db-fork.prev"
+        )
         remote_steps = [
             'export PATH="$HOME/.local/bin:$PATH"',
             f"sudo -n /sbin/shutdown -P +{deadman_min} >/dev/null 2>&1",
             *(["eval \"$(cat)\""] if env_stdin else []),
+            activate_sync,
             "cd ~/db-fork",
             "(uv sync --frozen --extra chronos || uv sync --frozen)",
             "uv run --frozen python build_protos.py",
@@ -1100,7 +1265,9 @@ def status_alpha(
     discovered = discover_stack_resources(aws, stack, state)
     candidate_buckets = discovered.get("buckets") or ([discovered["bucket"]] if discovered.get("bucket") else [])
     existing_buckets = [b for b in candidate_buckets if _classify_head_bucket(aws, b) == "exists"]
-    bucket_exists = bool(existing_buckets)
+    unverified_buckets = list(discovered.get("unverified_buckets") or [])
+    bucket_discovery_error = str(discovered.get("bucket_discovery_error") or "")
+    bucket_exists = bool(existing_buckets or unverified_buckets or bucket_discovery_error)
     active_compute = any(
         i["state"] in ("pending", "running", "stopping", "stopped") for i in discovered["instances"]
     )
@@ -1114,6 +1281,8 @@ def status_alpha(
         "key_pairs": discovered["key_pairs"],
         "bucket": existing_buckets[0] if existing_buckets else None,
         "buckets": existing_buckets,
+        "unverified_buckets": unverified_buckets,
+        "bucket_discovery_error": bucket_discovery_error or None,
         "local_alpha_site": str(alpha_site) if alpha_site.is_dir() else None,
         "state_file": str(state_file_path(runs_dir, stack)) if state_file_path(runs_dir, stack).is_file() else None,
         "collapsed": not (
@@ -1135,12 +1304,18 @@ def _empty_and_delete_bucket(aws: AwsCli, bucket: str, stack: str = DEFAULT_STAC
         return False
     if bstate == "missing":
         return True
-    verify_bucket_ownership(aws, stack, bucket)
+    try:
+        verify_bucket_ownership(aws, stack, bucket)
+    except AlphaError:
+        return False
     rm_res = aws.call_text(["s3", "rm", f"s3://{bucket}", "--recursive"], check=False)
     if rm_res.returncode != 0:
         return False
     for _ in range(10):
-        versions = aws.call_json(["s3api", "list-object-versions", "--bucket", bucket])
+        try:
+            versions = aws.call_json(["s3api", "list-object-versions", "--bucket", bucket])
+        except AlphaError:
+            return False
         objs = [
             {"Key": str(item["Key"]), "VersionId": str(item["VersionId"])}
             for key in ("Versions", "DeleteMarkers")
@@ -1240,6 +1415,8 @@ def collapse_alpha(
             remaining_keys.append(kname)
 
     candidate_buckets = discovered.get("buckets") or ([discovered["bucket"]] if discovered.get("bucket") else [])
+    unverified_buckets = list(discovered.get("unverified_buckets") or [])
+    bucket_discovery_error = str(discovered.get("bucket_discovery_error") or "")
     deleted_buckets: list[str] = []
     remaining_buckets: list[str] = list(candidate_buckets) if keep_bucket else []
     if not keep_bucket:
@@ -1248,6 +1425,9 @@ def collapse_alpha(
                 deleted_buckets.append(b_name)
             else:
                 remaining_buckets.append(b_name)
+        for ub in unverified_buckets:
+            if ub not in remaining_buckets:
+                remaining_buckets.append(ub)
     deleted_bucket = deleted_buckets[0] if deleted_buckets else None
     remaining_bucket = remaining_buckets[0] if remaining_buckets else ""
 
@@ -1256,7 +1436,13 @@ def collapse_alpha(
         if state.get("key_path"):
             Path(str(state["key_path"])).unlink(missing_ok=True)
 
-    has_remaining = bool(remaining_volumes or remaining_sgs or remaining_keys or remaining_buckets)
+    has_remaining = bool(
+        remaining_volumes
+        or remaining_sgs
+        or remaining_keys
+        or remaining_buckets
+        or (not keep_bucket and bucket_discovery_error)
+    )
     if has_remaining:
         updated = dict(state)
         updated["instance_id"] = ""
@@ -1288,6 +1474,7 @@ def collapse_alpha(
         "remaining_key_pairs": remaining_keys,
         "remaining_bucket": remaining_bucket or None,
         "remaining_buckets": remaining_buckets,
+        "bucket_discovery_error": bucket_discovery_error or None,
         "local_alpha_site_removed": not keep_local_site and not alpha_site.exists(),
         "state_file_removed": not spath.exists(),
         "ongoing_aws_cost": "$0.00/hr" if not has_remaining else "partial (see remaining resources)",
