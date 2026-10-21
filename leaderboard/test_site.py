@@ -1162,7 +1162,25 @@ class AwsAlphaLifecycle(Board):
         )
         self.assertEqual(rc_col_verify_fail, 42, "lost ownership before teardown must return nonzero and skip collapse")
         self.assertTrue((self.runs / "aws_alpha_state.json").is_file(), "worker must not be collapsed when ownership check fails")
-        self.assertNotIn("rm -f ~/db-fork.alpha.owner", " ".join(collapse_verify_fail_calls[4]), "collapse path refreshes owner rather than deleting it")
+        self.assertNotIn("rm -f ~/db-fork.alpha.owner ", " ".join(collapse_verify_fail_calls[4]), "collapse path refreshes owner rather than deleting it")
+
+        # Injected write failure in teardown finalizer preserves both owner files intact and exits nonzero
+        col_teardown_script = collapse_verify_fail_calls[4][-1]
+        col_token_match = re.search(r"\^([0-9_]+):", col_teardown_script)
+        self.assertIsNotNone(col_token_match)
+        col_token = col_token_match.group(1)
+        orig_owner_line = f"{col_token}:9999999999:86400\n"
+        (fake_home / "db-fork.alpha.owner").write_text(orig_owner_line)
+        (runs_sub / "alpha.owner").write_text(orig_owner_line)
+        printf_fail_res = subprocess.run(
+            ["bash", "-c", f"printf() {{ return 1; }}; {col_teardown_script}"],
+            env={**os.environ, "HOME": str(fake_home)},
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(printf_fail_res.returncode, 0, "failed owner write in teardown finalizer must exit nonzero")
+        self.assertEqual((fake_home / "db-fork.alpha.owner").read_text(), orig_owner_line)
+        self.assertEqual((runs_sub / "alpha.owner").read_text(), orig_owner_line)
 
         # Execute the complete generated remote_script with a failing sudo stub and assert worker does not execute
         import shlex as _shlex

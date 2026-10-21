@@ -168,13 +168,13 @@ def check_alpha_lease(runs_dir: Path = RUNS) -> None:
         except OSError:
             continue
         if not raw or ":" not in raw:
-            continue
+            raise RunError("another alpha sync/benchmark session owns this worker")
         parts = raw.split(":")
         owner_token = parts[0]
         try:
             owner_ts = float(parts[1].strip())
         except (IndexError, ValueError):
-            owner_ts = now_ts
+            raise RunError("another alpha sync/benchmark session owns this worker") from None
         try:
             lease_ttl = (
                 float(parts[2].strip())

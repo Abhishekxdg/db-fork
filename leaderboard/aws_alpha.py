@@ -972,6 +972,19 @@ _PORTABLE_LOCK_FD = (
 )
 
 
+def _atomic_write_owner_pair(sync_token: str, lease_ttl_sec: int) -> str:
+    tok = shlex.quote(sync_token)
+    return (
+        'now_ts="$(date +%s)" && '
+        f'printf "%s:%s:%s\\n" {tok} "$now_ts" "{lease_ttl_sec}" >~/db-fork.alpha.owner.tmp && '
+        "[ -s ~/db-fork.alpha.owner.tmp ] && "
+        f'printf "%s:%s:%s\\n" {tok} "$now_ts" "{lease_ttl_sec}" >~/db-fork/leaderboard/.runs/alpha.owner.tmp && '
+        "[ -s ~/db-fork/leaderboard/.runs/alpha.owner.tmp ] && "
+        "mv -f ~/db-fork.alpha.owner.tmp ~/db-fork.alpha.owner && "
+        "mv -f ~/db-fork/leaderboard/.runs/alpha.owner.tmp ~/db-fork/leaderboard/.runs/alpha.owner"
+    )
+
+
 def build_activate_sync_script(sync_dir: str = "~/db-fork.sync") -> str:
     """Return the shell script that validates a staged sync directory and updates ~/db-fork in-place without replacing lockfile inodes."""
     pathspecs = " ".join(shlex.quote(p) for p in _GIT_CLEAN_PATHSPECS)
@@ -1152,9 +1165,10 @@ def run_alpha_benchmarks(
             "lock_fd 8 || exit 42; "
             "for owner_file in ~/db-fork.alpha.owner ~/db-fork/leaderboard/.runs/alpha.owner; do "
             'if [ -f "$owner_file" ]; then '
-            'owner_ts="$(cut -d: -f2 "$owner_file" 2>/dev/null || echo 0)"; '
+            'owner_ts="$(cut -d: -f2 "$owner_file" 2>/dev/null)"; '
             'owner_ttl="$(cut -d: -f3 "$owner_file" 2>/dev/null)"; '
-            '[ -n "$owner_ttl" ] || owner_ttl=86400; '
+            "case \"$owner_ts\" in ''|*[!0-9]*) exit 42 ;; esac; "
+            "case \"$owner_ttl\" in ''|*[!0-9]*) owner_ttl=86400 ;; esac; "
             'now_ts="$(date +%s)"; '
             'if [ "$((now_ts - owner_ts))" -lt "$owner_ttl" ]; then exit 42; fi; '
             "fi; "
@@ -1162,8 +1176,7 @@ def run_alpha_benchmarks(
             "for f in ~/db-fork/leaderboard/.runs/*.journal.json ~/db-fork/leaderboard/.runs/*.active.json; do "
             '[ -e "$f" ] && exit 43; '
             "done; "
-            f'now_ts="$(date +%s)" && printf "%s:%s:%s\\n" {shlex.quote(sync_token)} "$now_ts" "{lease_ttl_sec}" >~/db-fork.alpha.owner && '
-            f'printf "%s:%s:%s\\n" {shlex.quote(sync_token)} "$now_ts" "{lease_ttl_sec}" >~/db-fork/leaderboard/.runs/alpha.owner && '
+            f"{{ {_atomic_write_owner_pair(sync_token, lease_ttl_sec)} || {{ rm -f ~/db-fork.alpha.owner.tmp ~/db-fork/leaderboard/.runs/alpha.owner.tmp; exit 1; }}; }} && "
             f"rm -rf {sync_dir} && mkdir -p {sync_dir} && exit 0; "
             "fi; "
             "sleep 5; "
@@ -1270,11 +1283,12 @@ def run_alpha_benchmarks(
             + f"grep -q '^{sync_token}:' ~/db-fork.alpha.owner 2>/dev/null || exit 42; "
             + "}",
             (
-                f'trap \'now_ts="$(date +%s)"; '
+                f"trap 'ec=$?; rm -rf {sync_dir}; "
                 f'if grep -q "^{sync_token}:" ~/db-fork.alpha.owner 2>/dev/null; then '
-                f'printf "%s:%s:%s\\n" {shlex.quote(sync_token)} "$now_ts" "{lease_ttl_sec}" >~/db-fork.alpha.owner; '
-                f'printf "%s:%s:%s\\n" {shlex.quote(sync_token)} "$now_ts" "{lease_ttl_sec}" >~/db-fork/leaderboard/.runs/alpha.owner; '
-                f'fi; rm -rf {sync_dir}\' EXIT'
+                f"if ! {{ {_atomic_write_owner_pair(sync_token, lease_ttl_sec)}; }}; then "
+                "rm -f ~/db-fork.alpha.owner.tmp ~/db-fork/leaderboard/.runs/alpha.owner.tmp; exit 1; "
+                "fi; "
+                'fi; exit "$ec"\' EXIT'
             ),
             f"sudo -n /sbin/shutdown -P +{deadman_min} >/dev/null 2>&1",
             *(["eval \"$(cat)\""] if env_stdin else []),
@@ -1324,11 +1338,10 @@ def run_alpha_benchmarks(
         if lease_acquired:
             will_collapse = bool(collapse_after and collapse_armed)
             owner_post_action = (
-                f'now_ts="$(date +%s)" && '
-                f'printf "%s:%s:%s\\n" {shlex.quote(sync_token)} "$now_ts" "{lease_ttl_sec}" >~/db-fork.alpha.owner && '
-                f'printf "%s:%s:%s\\n" {shlex.quote(sync_token)} "$now_ts" "{lease_ttl_sec}" >~/db-fork/leaderboard/.runs/alpha.owner; exit 0; '
+                f"if {{ {_atomic_write_owner_pair(sync_token, lease_ttl_sec)}; }}; then exit 0; "
+                "else rm -f ~/db-fork.alpha.owner.tmp ~/db-fork/leaderboard/.runs/alpha.owner.tmp; exit 1; fi; "
                 if will_collapse
-                else "rm -f ~/db-fork.alpha.owner ~/db-fork/leaderboard/.runs/alpha.owner; exit 0; "
+                else "rm -f ~/db-fork.alpha.owner ~/db-fork/leaderboard/.runs/alpha.owner && exit 0 || exit 1; "
             )
             release_script = (
                 "{ "
