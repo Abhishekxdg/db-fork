@@ -357,50 +357,77 @@ def enrich_e2e_stats(raw: dict, outdir: Path, run_id: str, runtime: dict | None 
                             else:
                                 data_sec += lat
 
+                        def _flush_pending(thread_key: int) -> None:
+                            q_items = pending_retries.pop(thread_key, None) or []
+                            for item in q_items:
+                                k = item["label"] if (item["op"] == "EXEC" and item["label"]) else item["op"]
+                                unexpected_failed[k] = unexpected_failed.get(k, 0) + 1
+
                         if op == "API_RETRY_WAIT":
-                            for item in pending_retries.get(tid, ()):
-                                if not lbl or not item["label"] or item["label"] == lbl:
-                                    item["waited"] = True
+                            q = pending_retries.get(tid)
+                            if q and not q[-1]["waited"]:
+                                last = q[-1]
+                                if lbl in ("", "retry", last["label"], last["op"].lower()):
+                                    last["waited"] = True
+                                else:
+                                    _flush_pending(tid)
                             continue
 
                         if st == "OK" and op in (*BRANCH_VERBS, "EXEC"):
                             q = pending_retries.get(tid)
                             if q:
-                                for idx, item in enumerate(q):
-                                    if (
-                                        item["waited"]
-                                        and item["op"] == op
-                                        and (not item["label"] or not lbl or item["label"] == lbl)
-                                        and (not item["ref"] or not ref or item["ref"] == ref)
-                                    ):
-                                        q.pop(idx)
-                                        expected_failed["retry"] = expected_failed.get("retry", 0) + 1
-                                        break
+                                if all(
+                                    item["waited"]
+                                    and item["op"] == op
+                                    and (not item["label"] or not lbl or item["label"] == lbl)
+                                    and (not item["ref"] or not ref or item["ref"] == ref)
+                                    for item in q
+                                ):
+                                    expected_failed["retry"] = expected_failed.get("retry", 0) + len(q)
+                                    pending_retries.pop(tid, None)
+                                else:
+                                    _flush_pending(tid)
+                            continue
+
+                        if st == "UNSUPPORTED":
+                            _flush_pending(tid)
                             continue
 
                         if st == "FAILED" and op in (*BRANCH_VERBS, "EXEC"):
                             if lbl in ("spine", "spine_update"):
+                                _flush_pending(tid)
                                 if op == "EXEC":
                                     expected_failed["spine"] = max(expected_failed.get("spine", 0), pq_spine_failed)
                                 continue
                             if lbl == "invariant":
+                                _flush_pending(tid)
                                 expected_failed["invariant"] = expected_failed.get("invariant", 0) + 1
                                 continue
                             if op == "REBASE" and "schema conflict" in err.lower() and schema_resolved:
+                                _flush_pending(tid)
                                 expected_failed["schema_conflict_rebase"] = (
                                     expected_failed.get("schema_conflict_rebase", 0) + 1
                                 )
                                 continue
                             if is_retryable_error(err):
+                                q = pending_retries.get(tid)
+                                if q and (
+                                    not q[-1]["waited"]
+                                    or q[-1]["op"] != op
+                                    or (q[-1]["label"] and lbl and q[-1]["label"] != lbl)
+                                    or (q[-1]["ref"] and ref and q[-1]["ref"] != ref)
+                                ):
+                                    _flush_pending(tid)
                                 pending_retries.setdefault(tid, []).append(
                                     {"op": op, "ref": ref, "label": lbl, "waited": False}
                                 )
                                 continue
+                            _flush_pending(tid)
                             key = lbl if (op == "EXEC" and lbl) else op
                             unexpected_failed[key] = unexpected_failed.get(key, 0) + 1
 
-                for q in pending_retries.values():
-                    for item in q:
+                for tid_rem in list(pending_retries):
+                    for item in pending_retries.pop(tid_rem, ()):
                         key = item["label"] if (item["op"] == "EXEC" and item["label"]) else item["op"]
                         unexpected_failed[key] = unexpected_failed.get(key, 0) + 1
                 parquet_ok = True

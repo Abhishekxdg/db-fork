@@ -973,6 +973,35 @@ class ChildProcess(unittest.TestCase):
             self.assertEqual(st_unrec, "failed")
             self.assertEqual(ev_unrec["failed_verbs"]["unexpected"], {"MERGE": 1})
 
+            # 5. Upstream retry sequence (label='branch', API_RETRY_WAIT label='retry') with 2 retries before OK recovers both.
+            c_two = ResultCollector(run_id=run_id, output_dir=str(outdir))
+            c_two.set_context(table_name="macrobench", table_schema="rl_env", initial_db_size=0, seed=42)
+            c_two.emit(rslt.OpType.BRANCH, status=rslt.OpStatus.FAILED, latency=0.01, label="branch", error_message="server closed the connection", start_time=1.0, end_time=1.01)
+            c_two.emit(rslt.OpType.API_RETRY_WAIT, status=rslt.OpStatus.OK, latency=0.1, label="retry", start_time=1.01, end_time=1.11)
+            c_two.emit(rslt.OpType.BRANCH, status=rslt.OpStatus.FAILED, latency=0.01, label="branch", error_message="server closed the connection", start_time=1.11, end_time=1.12)
+            c_two.emit(rslt.OpType.API_RETRY_WAIT, status=rslt.OpStatus.OK, latency=0.2, label="retry", start_time=1.12, end_time=1.32)
+            c_two.emit(rslt.OpType.BRANCH, status=rslt.OpStatus.OK, latency=0.02, label="branch", start_time=1.32, end_time=1.34)
+            c_two.write_to_parquet(append=False)
+            e2e_two = dict(e2e)
+            e2e_two.update(c_two.support_summary())
+            (outdir / f"{run_id}_e2e_stats.json").write_text(json.dumps(e2e_two))
+            ev_two, _ = run_macro.read_evidence(outdir, run_id)
+            self.assertEqual(ev_two["failed_verbs"]["expected"], {"retry": 2})
+            self.assertEqual(ev_two["failed_verbs"]["unexpected"], {})
+
+            # 6. Exhausted retry chain (FAILED -> API_RETRY_WAIT -> FAILED with no OK) counts both as unexpected.
+            c_exh = ResultCollector(run_id=run_id, output_dir=str(outdir))
+            c_exh.set_context(table_name="macrobench", table_schema="rl_env", initial_db_size=0, seed=42)
+            c_exh.emit(rslt.OpType.BRANCH, status=rslt.OpStatus.FAILED, latency=0.01, label="branch", error_message="server closed the connection", start_time=1.0, end_time=1.01)
+            c_exh.emit(rslt.OpType.API_RETRY_WAIT, status=rslt.OpStatus.OK, latency=0.1, label="retry", start_time=1.01, end_time=1.11)
+            c_exh.emit(rslt.OpType.BRANCH, status=rslt.OpStatus.FAILED, latency=0.01, label="branch", error_message="server closed the connection", start_time=1.11, end_time=1.12)
+            c_exh.write_to_parquet(append=False)
+            e2e_exh = dict(e2e)
+            e2e_exh.update(c_exh.support_summary())
+            (outdir / f"{run_id}_e2e_stats.json").write_text(json.dumps(e2e_exh))
+            ev_exh, _ = run_macro.read_evidence(outdir, run_id)
+            self.assertEqual(ev_exh["failed_verbs"]["unexpected"], {"BRANCH": 2})
+
     def test_paper_diagnostics_fields_are_preserved_and_validated(self):
         from leaderboard import validate_macro
         ev = good_evidence(

@@ -24,8 +24,9 @@ from leaderboard import run_macro
 from leaderboard.connector import connector_names, load_connector
 from leaderboard.run import RunError, scrub
 from leaderboard.validate import BOARD, MACHINE_RE, parse_day
-from leaderboard.validate_macro import ATTEMPT_RE as RUN_ID_RE, HEX, scrubbed
+from leaderboard.validate_macro import ATTEMPT_RE as RUN_ID_RE, HEX, SECRET_KEY, SECRET_VALUE
 from microbench.verbs.grid import AXES, BASE, VERBS, points_for_run
+import math
 
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 SHA40_RE = HEX[40]
@@ -45,6 +46,61 @@ BACKEND_ARG = {
     "neon": "neon",
     "xata": "xata",
 }
+
+
+def _scrub_deep(value):
+    if isinstance(value, str):
+        return scrub(value)
+    if isinstance(value, list):
+        return [_scrub_deep(v) for v in value]
+    if isinstance(value, dict):
+        return {
+            str(k): ("[REDACTED]" if SECRET_KEY.search(str(k)) and v not in ("", None, False) else _scrub_deep(v))
+            for k, v in value.items()
+        }
+    return value
+
+
+def _has_secret(value) -> bool:
+    if isinstance(value, str):
+        return bool(SECRET_VALUE.search(value)) or scrub(value) != value
+    if isinstance(value, list):
+        return any(_has_secret(v) for v in value)
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if SECRET_KEY.search(str(k)) and v not in ("", None, False, "[REDACTED]"):
+                return True
+            if _has_secret(v):
+                return True
+    return False
+
+
+def _terminate_verbs_child(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except OSError:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def launch_verbs_child(
@@ -68,13 +124,19 @@ def launch_verbs_child(
         out, _ = proc.communicate(timeout=timeout)
         return subprocess.CompletedProcess(cmd, proc.returncode, stdout=out, stderr="")
     except subprocess.TimeoutExpired:
-        run_macro.terminate_tree(proc)
-        out, _ = proc.communicate()
+        _terminate_verbs_child(proc)
+        try:
+            out, _ = proc.communicate(timeout=5)
+        except Exception:
+            out = ""
         raise subprocess.TimeoutExpired(cmd, timeout or 0.0, output=out)
     except BaseException:
-        run_macro.terminate_tree(proc)
-        proc.wait()
+        _terminate_verbs_child(proc)
         raise
+
+
+def _is_finite_nonneg(val) -> bool:
+    return isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val) and val >= 0
 
 
 def classify_verbs_stats(
@@ -83,19 +145,34 @@ def classify_verbs_stats(
     expected_point_ids: list[str],
     exit_code: int,
     timed_out: bool = False,
+    scale: int | None = None,
+    native_only: bool | None = None,
+    reps: int | None = None,
+    warmup: int | None = None,
 ) -> dict:
     reasons: list[str] = []
     if timed_out:
         reasons.append("verb scaling child exceeded deadline")
     if exit_code != 0:
         reasons.append(f"child exited with code {exit_code}")
+    if not expected_point_ids:
+        reasons.append("expected_points must be a non-empty list of grid point IDs")
     if not isinstance(raw_stats, dict):
         reasons.append("missing or unreadable stats JSON")
         return {"status": "failed" if (timed_out or exit_code != 0) else "unverified", "reasons": reasons}
     if raw_stats.get("status") != "completed":
         reasons.append(f"stats.status is {raw_stats.get('status')!r}, expected 'completed'")
+    if scale is not None and "scale" in raw_stats and raw_stats.get("scale") != scale:
+        reasons.append(f"stats.scale is {raw_stats.get('scale')!r}, expected {scale!r}")
+    if native_only is not None and "native_only" in raw_stats and raw_stats.get("native_only") is not native_only:
+        reasons.append(f"stats.native_only is {raw_stats.get('native_only')!r}, expected {native_only!r}")
+    if reps is not None and "reps" in raw_stats and raw_stats.get("reps") != reps:
+        reasons.append(f"stats.reps is {raw_stats.get('reps')!r}, expected {reps!r}")
+    if warmup is not None and "warmup" in raw_stats and raw_stats.get("warmup") != warmup:
+        reasons.append(f"stats.warmup is {raw_stats.get('warmup')!r}, expected {warmup!r}")
     points = raw_stats.get("points")
     has_point_failure = False
+    allowed_ids = {"control", *expected_point_ids}
     if not isinstance(points, list) or not points:
         reasons.append("stats.points must be a non-empty list")
     else:
@@ -105,6 +182,12 @@ def classify_verbs_stats(
                 reasons.append(f"stats.points[{idx}] is not a valid point object")
                 continue
             pid = pt["id"]
+            if pid in by_id:
+                reasons.append(f"duplicate point {pid!r} in stats.points")
+                continue
+            if pid not in allowed_ids:
+                reasons.append(f"unexpected point {pid!r} in stats.points")
+                continue
             by_id[pid] = pt
             st = pt.get("status")
             failed_reps = pt.get("failed", 0)
@@ -116,8 +199,34 @@ def classify_verbs_stats(
                 reasons.append(f"point {pid} had {failed_reps} failed repetition(s)")
             elif st == "ok" and pid != "control":
                 lat = pt.get("latency")
-                if not isinstance(lat, dict) or not isinstance(lat.get("n"), int) or lat.get("n", 0) <= 0:
+                n_val = lat.get("n") if isinstance(lat, dict) else None
+                if not isinstance(lat, dict) or not isinstance(n_val, int) or isinstance(n_val, bool) or n_val <= 0:
                     reasons.append(f"point {pid} recorded no timed latencies")
+                else:
+                    if reps is not None and n_val != reps:
+                        reasons.append(f"point {pid} latency.n is {n_val}, expected {reps}")
+                    if not _is_finite_nonneg(lat.get("p50")):
+                        reasons.append(f"point {pid} latency.p50 must be a finite non-negative number")
+                    for qk in ("min", "p10", "p50", "p90", "max"):
+                        if qk in lat and not _is_finite_nonneg(lat[qk]):
+                            reasons.append(f"point {pid} latency.{qk} must be a finite non-negative number")
+                    if all(qk in lat and _is_finite_nonneg(lat[qk]) for qk in ("min", "p10", "p50", "p90", "max")):
+                        if not (lat["min"] <= lat["p10"] <= lat["p50"] <= lat["p90"] <= lat["max"]):
+                            reasons.append(f"point {pid} latency quantiles are out of order")
+                pt_reps = pt.get("reps")
+                if pt_reps is not None:
+                    if not isinstance(pt_reps, list) or (reps is not None and len(pt_reps) != reps):
+                        reasons.append(f"point {pid} reps list must have {reps} timed entries")
+                    else:
+                        for r_idx, rep in enumerate(pt_reps):
+                            if not isinstance(rep, dict) or rep.get("status") not in (None, "OK") or not _is_finite_nonneg(rep.get("latency", 0.0)):
+                                reasons.append(f"point {pid} rep[{r_idx}] is invalid")
+                                break
+                            if "per_delete" in rep:
+                                pd = rep["per_delete"]
+                                if not isinstance(pd, list) or not pd or not all(_is_finite_nonneg(x) for x in pd):
+                                    reasons.append(f"point {pid} rep[{r_idx}].per_delete must be a non-empty list of finite non-negative floats")
+                                    break
         missing = [pid for pid in expected_point_ids if pid not in by_id]
         if missing:
             reasons.append(f"missing {len(missing)} expected grid point(s): {', '.join(missing[:5])}")
@@ -145,6 +254,10 @@ def run(
         raise RunError(f"machine label {machine!r} must match {MACHINE_RE.pattern}")
     if scale < 1:
         raise RunError("--scale must be a positive integer")
+    if reps < 1:
+        raise RunError("--reps must be a positive integer")
+    if warmup < 0:
+        raise RunError("--warmup must be a non-negative integer")
     if deadline_min <= 0:
         raise RunError("--deadline-min must be positive")
     if not native_only and os.environ.get("DBFORK_NATIVE_ONLY"):
@@ -152,10 +265,14 @@ def run(
     for v in verbs or ():
         if v not in VERBS:
             raise RunError(f"unknown verb {v!r}; choose from {', '.join(VERBS)}")
+    if verbs and len(set(verbs)) != len(verbs):
+        raise RunError("duplicate verb in --verbs")
     valid_axes = {a.name for a in AXES} | {a.key for a in AXES}
     for a in axes or ():
         if a not in valid_axes:
             raise RunError(f"unknown axis {a!r}")
+    if axes and len(set(axes)) != len(axes):
+        raise RunError("duplicate axis in --axes")
     expected_point_ids = [pt.id for pt in points_for_run(scale, verbs, axes)]
     if not expected_point_ids:
         raise RunError("no grid points selected for this scale, verbs, and axes")
@@ -265,6 +382,10 @@ def run(
             expected_point_ids=expected_point_ids,
             exit_code=proc_rc,
             timed_out=timed_out,
+            scale=scale,
+            native_only=native_only,
+            reps=reps,
+            warmup=warmup,
         )
         prov = run_macro.provenance(snapshot, env)
         if prov.get("source", {}).get("changed_during_run"):
@@ -280,9 +401,12 @@ def run(
             "base": dict(BASE),
             "verbs": list(verbs) if verbs else list(VERBS),
             "axes": list(axes) if axes else None,
+            "reps": reps,
+            "warmup": warmup,
             "expected_points": expected_point_ids,
             "machine": machine,
             "date": started.date().isoformat(),
+            "started": started.isoformat(timespec="seconds"),
             "version": version,
             "native_only": native_only,
             "exit_code": proc_rc,
@@ -290,7 +414,7 @@ def run(
             "outcome": outcome,
             "cleanup": cleanup,
             "server": {"started_here": started_here, "stop": stop_status},
-            "stats": scrubbed(raw_stats) if isinstance(raw_stats, dict) else None,
+            "stats": _scrub_deep(raw_stats) if isinstance(raw_stats, dict) else None,
             **prov,
         }
         dest = run_macro.write_json(out / system / "verbs" / started.strftime("%Y%m%d") / f"{run_id}.json", payload)
@@ -336,7 +460,7 @@ def validate_verbs(path: Path, board: Path = BOARD) -> list[str]:
         return [f"{rel.as_posix()}: unreadable JSON: {exc}"]
     if not isinstance(data, dict):
         return [f"{rel.as_posix()}: top-level value must be a JSON object"]
-    if scrubbed(data) != data:
+    if _has_secret(data):
         problems.append("record contains unscrubbed secret material")
     if data.get("suite") != VERBS_SUITE:
         problems.append(f"suite must be {VERBS_SUITE!r}")
@@ -347,6 +471,12 @@ def validate_verbs(path: Path, board: Path = BOARD) -> list[str]:
     scale = data.get("scale")
     if not isinstance(scale, int) or isinstance(scale, bool) or scale < 1:
         problems.append("scale must be a positive integer")
+    reps = data.get("reps")
+    if reps is not None and (not isinstance(reps, int) or isinstance(reps, bool) or reps < 1):
+        problems.append("reps must be a positive integer")
+    warmup = data.get("warmup")
+    if warmup is not None and (not isinstance(warmup, int) or isinstance(warmup, bool) or warmup < 0):
+        problems.append("warmup must be a non-negative integer")
     if not isinstance(data.get("machine"), str) or not MACHINE_RE.fullmatch(data["machine"]):
         problems.append("invalid machine label")
     if not isinstance(data.get("date"), str) or not DATE_RE.fullmatch(data["date"]) or data["date"].replace("-", "") != day_dir:
@@ -380,16 +510,41 @@ def validate_verbs(path: Path, board: Path = BOARD) -> list[str]:
         problems.append("source provenance must be clean and unchanged during the run")
     verbs_sel = data.get("verbs")
     axes_sel = data.get("axes")
+    valid_axes = {a.name for a in AXES} | {a.key for a in AXES}
+    verbs_ok = (
+        isinstance(verbs_sel, list)
+        and bool(verbs_sel)
+        and all(isinstance(v, str) and v in VERBS for v in verbs_sel)
+        and len(set(verbs_sel)) == len(verbs_sel)
+    )
+    if not verbs_ok:
+        problems.append("verbs must be a non-empty list of valid verb names without duplicates")
+    axes_ok = axes_sel is None or (
+        isinstance(axes_sel, list)
+        and bool(axes_sel)
+        and all(isinstance(a, str) and a in valid_axes for a in axes_sel)
+        and len(set(axes_sel)) == len(axes_sel)
+    )
+    if not axes_ok:
+        problems.append("axes must be null or a non-empty list of valid axis names without duplicates")
     expected_pts = (
         [pt.id for pt in points_for_run(scale, verbs_sel, axes_sel)]
-        if isinstance(scale, int) and not isinstance(scale, bool) and scale >= 1
+        if isinstance(scale, int) and not isinstance(scale, bool) and scale >= 1 and verbs_ok and axes_ok
         else []
     )
+    if not expected_pts:
+        problems.append("selected scale, verbs, and axes produce an empty grid")
+    if "expected_points" in data and data.get("expected_points") != expected_pts:
+        problems.append("expected_points does not match selected scale, verbs, and axes")
     check = classify_verbs_stats(
         data.get("stats") if isinstance(data.get("stats"), dict) else None,
         expected_point_ids=expected_pts,
         exit_code=int(data.get("exit_code", -1)) if isinstance(data.get("exit_code"), int) else -1,
         timed_out=bool(data.get("timed_out", False)),
+        scale=scale if isinstance(scale, int) and not isinstance(scale, bool) else None,
+        native_only=data.get("native_only") if isinstance(data.get("native_only"), bool) else None,
+        reps=reps if isinstance(reps, int) and not isinstance(reps, bool) else None,
+        warmup=warmup if isinstance(warmup, int) and not isinstance(warmup, bool) else None,
     )
     outcome = data.get("outcome")
     if not isinstance(outcome, dict) or outcome.get("status") != "verified" or check["status"] != "verified":
@@ -398,7 +553,7 @@ def validate_verbs(path: Path, board: Path = BOARD) -> list[str]:
 
 
 def build_verbs(board: Path = BOARD, sources: set[str] | None = None) -> tuple[list[dict], list[dict]]:
-    """Validate and select the newest verbs scaling record per (system, scale, machine, native_only)."""
+    """Validate and select the newest verbs scaling record per comparable cohort."""
     board = board.resolve()
     candidates: list[Path] = []
     for sysdir in sorted(board.iterdir()):
@@ -415,28 +570,43 @@ def build_verbs(board: Path = BOARD, sources: set[str] | None = None) -> tuple[l
                 if sources is not None and rel not in sources:
                     continue
                 candidates.append(file)
-    by_slot: dict[tuple[str, int, str, bool], list[tuple[str, Path]]] = {}
+    by_slot: dict[tuple, list[tuple[tuple[str, str, int], str, Path]]] = {}
     excluded: list[dict] = []
-    for path in candidates:
+    for order_idx, path in enumerate(candidates):
         rel = path.relative_to(board).as_posix()
         problems = validate_verbs(path, board)
         if problems:
             excluded.append({"source": rel, "reason": "; ".join(problems)})
             continue
         data = json.loads(path.read_text())
-        slot = (data["system"], int(data["scale"]), data["machine"], bool(data.get("native_only", False)))
-        by_slot.setdefault(slot, []).append((rel, path))
+        slot = (
+            data["system"],
+            int(data["scale"]),
+            data["machine"],
+            bool(data.get("native_only", False)),
+            tuple(data.get("verbs") or VERBS),
+            tuple(data.get("axes") or ()),
+            int(data.get("reps", 10)),
+            int(data.get("warmup", 3)),
+        )
+        sort_key = (str(data.get("started") or data["date"]), str(data["date"]), order_idx)
+        by_slot.setdefault(slot, []).append((sort_key, rel, path))
     entries: list[dict] = []
     for slot in sorted(by_slot):
-        rel, path = sorted(by_slot[slot], key=lambda item: item[0])[-1]
+        _, rel, path = sorted(by_slot[slot], key=lambda item: item[0])[-1]
         data = json.loads(path.read_text())
         entries.append({
             "source": rel,
             "run_id": data["run_id"],
             "system": data["system"],
             "scale": data["scale"],
+            "verbs": data.get("verbs") or list(VERBS),
+            "axes": data.get("axes"),
+            "reps": int(data.get("reps", 10)),
+            "warmup": int(data.get("warmup", 3)),
             "machine": data["machine"],
             "date": data["date"],
+            "started": data.get("started"),
             "version": data["version"],
             "native_only": data["native_only"],
             "outcome": data["outcome"],

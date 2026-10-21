@@ -242,8 +242,22 @@ class RunLifecycle(unittest.TestCase):
             outdir = Path(cmd[cmd.index("--outdir") + 1])
             (outdir / "micro_verbs_dolt_w1_stats.json").write_text(json.dumps({
                 "status": "completed",
+                "scale": 1,
+                "reps": 10,
+                "warmup": 3,
+                "native_only": True,
                 "points": [
-                    {"id": pid, "verb": pid.split(":")[0], "status": "ok", "failed": 0, "latency": {"n": 10, "p50": 0.01}}
+                    {
+                        "id": pid,
+                        "verb": pid.split(":")[0],
+                        "status": "ok",
+                        "failed": 0,
+                        "latency": {"n": 10, "min": 0.005, "p10": 0.006, "p50": 0.01, "p90": 0.02, "max": 0.03},
+                        "reps": [
+                            {"timed": True, "status": "OK", "latency": 0.01, "per_delete": [0.003, 0.004]}
+                            for _ in range(10)
+                        ],
+                    }
                     for pid in expected_pts
                 ],
             }))
@@ -272,9 +286,43 @@ class RunLifecycle(unittest.TestCase):
         self.assertTrue(record["native_only"])
         self.assertEqual(record["outcome"]["status"], "verified")
         self.assertEqual(record["server"], {"started_here": True, "stop": "stopped"})
+        # Deeply nested per_delete list is preserved without depth truncation or false secret failure
+        self.assertEqual(
+            record["stats"]["points"][0]["reps"][0]["per_delete"],
+            [0.003, 0.004],
+        )
         self.assertEqual(verbs.validate_verbs(written[0], self.board), [])
         entries, excluded = verbs.build_verbs(self.board)
         self.assertEqual((len(entries), len(excluded)), (1, 0))
+
+        # Cohort separation and chronological tie-breaking (started timestamp beats hex run_id)
+        second_file = written[0].parent / "bb_00000001.json"
+        second_rec = json.loads(written[0].read_text())
+        second_rec["run_id"] = "bb_00000001"
+        second_rec["started"] = "2099-12-31T23:59:59+00:00"
+        second_file.write_text(json.dumps(second_rec))
+        entries2, excluded2 = verbs.build_verbs(self.board)
+        self.assertEqual((len(entries2), len(excluded2)), (1, 0))
+        self.assertEqual(entries2[0]["run_id"], "bb_00000001")
+
+        # Tampered unexpected point or bad quantile is rejected by validate_verbs
+        bad_file = written[0].parent / "bb_00000002.json"
+        bad_rec = json.loads(written[0].read_text())
+        bad_rec["run_id"] = "bb_00000002"
+        bad_rec["stats"]["points"].append({"id": "rogue:point", "status": "ok", "failed": 0, "latency": {"n": 10, "p50": 0.01}})
+        bad_file.write_text(json.dumps(bad_rec))
+        self.assertTrue(any("unexpected point" in p for p in verbs.validate_verbs(bad_file, self.board)))
+
+    def test_launch_verbs_child_timeout_terminates_process_group_cleanly(self):
+        from leaderboard import verbs
+        import sys
+        with self.assertRaises(subprocess.TimeoutExpired):
+            verbs.launch_verbs_child(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                cwd=self.root,
+                env=dict(os.environ),
+                timeout=0.1,
+            )
 
     def test_verbs_wrapper_rejects_missing_stats_failed_points_stop_failure_and_ambient_native_only(self):
         from leaderboard import verbs
