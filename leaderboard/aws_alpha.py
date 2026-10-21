@@ -976,14 +976,15 @@ def build_activate_sync_script(sync_dir: str = "~/db-fork.sync") -> str:
     """Return the shell script that validates a staged sync directory and updates ~/db-fork in-place without replacing lockfile inodes."""
     pathspecs = " ".join(shlex.quote(p) for p in _GIT_CLEAN_PATHSPECS)
     return (
-        _PORTABLE_LOCK_FD
+        "{ "
+        + _PORTABLE_LOCK_FD
         + f"git -C {sync_dir} read-tree HEAD && "
         f"git -C {sync_dir} update-index -q --refresh && "
         f'test -z "$(git -C {sync_dir} status --porcelain -- {pathspecs})" && '
-        "mkdir -p ~/db-fork/leaderboard/.runs && "
-        "exec 7>~/db-fork/leaderboard/.runs/batch.lock && "
+        "mkdir -p ~/db-fork/leaderboard/.runs || exit 1; "
+        "exec 7>>~/db-fork/leaderboard/.runs/batch.lock || exit 1; "
         "lock_fd 7 || exit 42; "
-        "exec 8>~/db-fork/leaderboard/.runs/run.lock && "
+        "exec 8>>~/db-fork/leaderboard/.runs/run.lock || exit 1; "
         "lock_fd 8 || exit 42; "
         "for f in ~/db-fork/leaderboard/.runs/*.journal.json ~/db-fork/leaderboard/.runs/*.active.json; do "
         '[ -e "$f" ] && exit 43; '
@@ -1020,7 +1021,8 @@ def build_activate_sync_script(sync_dir: str = "~/db-fork.sync") -> str:
         "exit 1; "
         "fi; "
         f"rm -rf ~/db-fork.prev {sync_dir}; "
-        "exec 8>&- 7>&-"
+        "exec 8>&- 7>&-; "
+        "}"
     )
 
 
@@ -1136,15 +1138,16 @@ def run_alpha_benchmarks(
     try:
         # 1. Wait for cloud-init bootstrap marker on the worker, ensure no lock or recovery journal is active, claim sync lease, and prepare staging dir
         wait_script = (
-            _PORTABLE_LOCK_FD
+            "{ "
+            + _PORTABLE_LOCK_FD
             + "for i in $(seq 1 90); do "
             "if [ -f /var/lib/branchbench-alpha-ready ]; then "
-            "mkdir -p ~/db-fork/leaderboard/.runs && "
-            "exec 9>~/db-fork/leaderboard/.runs/alpha.lock && "
+            "mkdir -p ~/db-fork/leaderboard/.runs || exit 1; "
+            "exec 9>>~/db-fork/leaderboard/.runs/alpha.lock || exit 1; "
             "lock_fd 9 || exit 42; "
-            "exec 7>~/db-fork/leaderboard/.runs/batch.lock && "
+            "exec 7>>~/db-fork/leaderboard/.runs/batch.lock || exit 1; "
             "lock_fd 7 || exit 42; "
-            "exec 8>~/db-fork/leaderboard/.runs/run.lock && "
+            "exec 8>>~/db-fork/leaderboard/.runs/run.lock || exit 1; "
             "lock_fd 8 || exit 42; "
             "for owner_file in ~/db-fork.alpha.owner ~/db-fork/leaderboard/.runs/alpha.owner; do "
             'if [ -f "$owner_file" ]; then '
@@ -1161,7 +1164,8 @@ def run_alpha_benchmarks(
             f"rm -rf {sync_dir} && mkdir -p {sync_dir} && exit 0; "
             "fi; "
             "sleep 5; "
-            "done; exit 1"
+            "done; exit 1; "
+            "}"
         )
         wait_cmd = [
             "ssh",
@@ -1255,10 +1259,13 @@ def run_alpha_benchmarks(
         remote_steps = [
             'export PATH="$HOME/.local/bin:$PATH"',
             f"export DBFORK_ALPHA_TOKEN={shlex.quote(sync_token)}",
-            _PORTABLE_LOCK_FD + "mkdir -p ~/db-fork/leaderboard/.runs",
-            "exec 9>~/db-fork/leaderboard/.runs/alpha.lock",
-            "lock_fd 9 || exit 42",
-            f"grep -q '^{sync_token}:' ~/db-fork.alpha.owner 2>/dev/null || exit 42",
+            "{ "
+            + _PORTABLE_LOCK_FD
+            + "mkdir -p ~/db-fork/leaderboard/.runs || exit 1; "
+            + "exec 9>>~/db-fork/leaderboard/.runs/alpha.lock || exit 1; "
+            + "lock_fd 9 || exit 42; "
+            + f"grep -q '^{sync_token}:' ~/db-fork.alpha.owner 2>/dev/null || exit 42; "
+            + "}",
             f'trap "rm -rf {sync_dir}" EXIT',
             f"sudo -n /sbin/shutdown -P +{deadman_min} >/dev/null 2>&1",
             *(["eval \"$(cat)\""] if env_stdin else []),
@@ -1304,27 +1311,34 @@ def run_alpha_benchmarks(
 
         rc = run_res.returncode
     finally:
-        release_ok = True
-        if lease_acquired:
+        release_rc = 0
+        if collapse_after and collapse_armed:
+            col_res = collapse_alpha(aws=aws, stack=stack, board=board, runs_dir=runs_dir, keep_local_site=True)
+            if not col_res.get("collapsed", True):
+                collapse_failed = True
+        elif lease_acquired:
             release_script = (
-                _PORTABLE_LOCK_FD
-                + "mkdir -p ~/db-fork/leaderboard/.runs && "
-                "exec 9>~/db-fork/leaderboard/.runs/alpha.lock && "
+                "{ "
+                + _PORTABLE_LOCK_FD
+                + "mkdir -p ~/db-fork/leaderboard/.runs || exit 1; "
+                "exec 9>>~/db-fork/leaderboard/.runs/alpha.lock || exit 1; "
                 "lock_fd 9 || exit 42; "
                 f"rm -rf {sync_dir}; "
                 f"if grep -q '^{sync_token}:' ~/db-fork.alpha.owner 2>/dev/null || "
                 f"grep -q '^{sync_token}:' ~/db-fork/leaderboard/.runs/alpha.owner 2>/dev/null; then "
                 "rm -f ~/db-fork.alpha.owner ~/db-fork/leaderboard/.runs/alpha.owner; exit 0; "
-                "fi; exit 42"
+                "fi; exit 42; "
+                "}"
             )
             rel_res = cmd_runner(["ssh", *ssh_opts, ssh_target, release_script])
-            release_ok = rel_res.returncode == 0
-        if collapse_after and collapse_armed and release_ok:
-            col_res = collapse_alpha(aws=aws, stack=stack, board=board, runs_dir=runs_dir, keep_local_site=True)
-            if not col_res.get("collapsed", True):
-                collapse_failed = True
-        elif collapse_after and collapse_armed and not release_ok:
-            collapse_failed = True
+            if rel_res.returncode != 0:
+                release_rc = rel_res.returncode or 1
+                print(
+                    f"error: failed to release alpha lease on {ssh_target} (exit {rel_res.returncode})",
+                    file=sys.stderr,
+                )
+    if release_rc != 0 and rc == 0:
+        return release_rc
     return 1 if collapse_failed and rc == 0 else rc
 
 

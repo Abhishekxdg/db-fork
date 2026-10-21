@@ -26,9 +26,10 @@ def newest(board: Path, sources: set[str] | None = None) -> list[Path]:
             try:
                 raw = json.loads(path.read_text(encoding="utf-8"))
                 if isinstance(raw, dict):
-                    ep = raw.get("execution_profile")
-                    if isinstance(ep, str) and ep in EXECUTION_PROFILES:
-                        profile = ep
+                    if "execution_profile" in raw:
+                        ep = raw.get("execution_profile")
+                        if isinstance(ep, str) and ep in EXECUTION_PROFILES:
+                            profile = ep
                     elif "error" not in raw and "result" in raw and "suite" in raw:
                         profile = "local_single_host"
             except Exception:

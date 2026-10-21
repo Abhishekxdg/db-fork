@@ -748,7 +748,7 @@ class AwsAlphaLifecycle(Board):
             cmd_runner=fake_cmd_runner,
         )
         self.assertEqual(rc, 0)
-        self.assertEqual(len(ssh_rsync_calls), 5, "wait for bootstrap, rsync up, ssh worker run, rsync pull, ssh lease release")
+        self.assertEqual(len(ssh_rsync_calls), 4, "wait for bootstrap, rsync up, ssh worker run, rsync pull (lease retained through collapse)")
         self.assertTrue((self.site / "alpha" / "data.js").is_file(), "--collapse-after keeps local .site/alpha while tearing down AWS")
         self.assertFalse((self.runs / "aws_alpha_state.json").exists(), "AWS state is collapsed after the run")
         self.assertEqual(self.cloud["sgs"], [])
@@ -1001,7 +1001,20 @@ class AwsAlphaLifecycle(Board):
         staged_repo = fake_home / "db-fork.sync.t1"
         shutil.copytree(dst_repo, staged_repo)
 
-        # Holding run.lock causes build_activate_sync_script to exit 42 without replacing run.lock inode
+        # Holding batch.lock or run.lock causes build_activate_sync_script to exit 42 without truncating batch.lock or replacing run.lock inode
+        batch_lock_file = runs_sub / "batch.lock"
+        batch_lock_file.write_text("active-batch-token-xyz\n")
+        with batch_lock_file.open("a+") as bfh:
+            fcntl.flock(bfh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            batch_locked_res = subprocess.run(
+                ["bash", "-c", self.aws_alpha.build_activate_sync_script("~/db-fork.sync.t1")],
+                env={**os.environ, "HOME": str(fake_home)},
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(batch_locked_res.returncode, 42)
+        self.assertEqual(batch_lock_file.read_text(), "active-batch-token-xyz\n", "rejected invocation must not truncate active batch token")
+
         with run_lock_file.open("a+") as lfh:
             fcntl.flock(lfh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             locked_res = subprocess.run(
@@ -1012,6 +1025,22 @@ class AwsAlphaLifecycle(Board):
             )
         self.assertEqual(locked_res.returncode, 42)
         self.assertEqual(run_lock_file.stat().st_ino, orig_lock_inode)
+
+        # Failed shutdown scheduling (sudo returning 1) before build_activate_sync_script prevents activation and worker execution
+        worker_marker = fake_home / "worker_ran"
+        chain_res = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"false && {self.aws_alpha.build_activate_sync_script('~/db-fork.sync.t1')} && touch {worker_marker}",
+            ],
+            env={**os.environ, "HOME": str(fake_home)},
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(chain_res.returncode, 0)
+        self.assertFalse(worker_marker.exists(), "failed shutdown scheduling must prevent activation and worker execution")
+        self.assertTrue(staged_repo.is_dir(), "activation did not run after failed shutdown scheduling")
 
         # Injected backup copy failure: unreadable result file causes cp -a to fail with exit 1 (not 42), keeping sole_result intact
         sole_result.chmod(0o000)
@@ -1082,7 +1111,58 @@ class AwsAlphaLifecycle(Board):
         self.assertEqual(len(upload_calls), 3, "wait_cmd, failed sync_up, and finally lease release ssh")
         self.assertIn("alpha.owner", " ".join(upload_calls[2]))
 
-        # Newer error record (with or without execution_profile) supersedes older economic_single_vm success
+        # Lease release failure when collapse_after=False returns nonzero (42) even when benchmark run succeeded
+        rel_fail_calls = []
+
+        def fail_on_lease_release(cmd: list[str], **_kw):
+            rel_fail_calls.append(cmd)
+            if len(rel_fail_calls) == 5:
+                return subprocess.CompletedProcess(cmd, 42, stdout="", stderr="lease release failed")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        rc_rel_fail = self.aws_alpha.run_alpha_benchmarks(
+            aws=aws,
+            stack="branchbench-alpha",
+            systems="dolt",
+            deploy_site_after=False,
+            collapse_after=False,
+            board=self.board,
+            runs_dir=self.runs,
+            cmd_runner=fail_on_lease_release,
+        )
+        self.assertEqual(rc_rel_fail, 42, "failed lease release when retaining instance must return nonzero")
+
+        # Execute the complete generated remote_script with a failing sudo stub and assert worker does not execute
+        import shlex as _shlex
+
+        remote_bash_arg = _shlex.split(rel_fail_calls[2][-1])[-1]
+        token_match = re.search(r"DBFORK_ALPHA_TOKEN=([^\s&]+)", remote_bash_arg)
+        self.assertIsNotNone(token_match)
+        captured_token = _shlex.split(token_match.group(1))[0]
+        (fake_home / "db-fork.alpha.owner").write_text(f"{captured_token}:9999999999\n")
+        fake_bin = fake_home / ".local" / "bin"
+        fake_bin.mkdir(parents=True, exist_ok=True)
+        sudo_stub = fake_bin / "sudo"
+        sudo_stub.write_text("#!/bin/sh\nexit 1\n")
+        sudo_stub.chmod(0o755)
+        worker_script = old_repo / "leaderboard" / "aws_worker.sh"
+        worker_script.parent.mkdir(parents=True, exist_ok=True)
+        worker_ran_marker = fake_home / "dummy_worker_executed"
+        worker_script.write_text(f"#!/bin/sh\ntouch {worker_ran_marker}\nexit 0\n")
+        worker_script.chmod(0o755)
+        try:
+            full_remote_res = subprocess.run(
+                ["bash", "-c", remote_bash_arg],
+                env={**os.environ, "HOME": str(fake_home)},
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            worker_script.unlink(missing_ok=True)
+        self.assertNotEqual(full_remote_res.returncode, 0, "failing sudo in complete remote_script must exit nonzero")
+        self.assertFalse(worker_ran_marker.exists(), "failing sudo in complete remote_script must prevent worker execution")
+
+        # Newer error record (with or without execution_profile) or invalid execution_profile supersedes older economic_single_vm success
         from leaderboard import build as micro_build
 
         self.write({**self.payload(), "execution_profile": "economic_single_vm"}, day_dir="20260930")
@@ -1092,6 +1172,10 @@ class AwsAlphaLifecycle(Board):
         entries_after_err, excluded_after_err = micro_build.build(self.board)
         self.assertEqual(entries_after_err, [], "newer error record must supersede older economic_single_vm success")
         self.assertEqual(len(excluded_after_err), 1)
+        err_path.write_text(json.dumps({**self.payload(date="2026-10-01"), "execution_profile": "typo_profile"}))
+        entries_after_typo, excluded_after_typo = micro_build.build(self.board)
+        self.assertEqual(entries_after_typo, [], "newer invalid execution_profile must supersede older economic_single_vm success")
+        self.assertEqual(len(excluded_after_typo), 1)
         err_path.unlink()
 
         # 4. Bucket tag inspection failure (get-bucket-tagging rc=1) causes collapse_alpha to report collapsed=False
