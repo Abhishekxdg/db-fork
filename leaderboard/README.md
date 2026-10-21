@@ -34,34 +34,34 @@ You can also generate a starter scaffold interactively at `http://127.0.0.1:8000
 
 ### Step 1: Create `leaderboard/<system>/system.json`
 
-Every system folder requires a `system.json` manifest:
+Every system folder requires a `system.json` manifest matching the validator contract:
 
 ```json
 {
   "system": "AcmeDB",
-  "kind": "acmedb",
-  "dialect": "postgres",
+  "proprietary": "no",
   "hosted": "no",
-  "tags": ["sql", "branch", "cow", "merge"]
+  "tuned": "no",
+  "tags": ["SQL", "Postgres protocol", "Copy-on-write branches"]
 }
 ```
 
 - `system`: Human-readable display name shown on the leaderboard.
-- `kind`: Stable lowercase identifier (`^[a-z0-9_]+$`).
-- `dialect`: SQL dialect (`"postgres"` or `"mysql"`). Used by the seed loader and SQL client.
+- `proprietary`: `"yes"` or `"no"`.
 - `hosted`: `"no"` for self-hosted servers managed via local lifecycle scripts, or `"yes"` for managed cloud services accessed over the network.
-- `tags`: Lowercase capability tags used by the leaderboard's **Capabilities** filter.
+- `tuned`: `"yes"` or `"no"`.
+- `tags`: Capability and architecture tags used by the leaderboard's **Capabilities** filter.
 
 ### Step 2: Create Lifecycle Scripts (`install`, `start`, `check`, `stop`)
 
-Self-hosted systems (`"hosted": "no"`) must provide four executable scripts (`chmod +x leaderboard/<system>/{install,start,check,stop}`):
+Self-hosted systems (`"hosted": "no"`) must provide executable lifecycle scripts (`chmod +x leaderboard/<system>/{start,check,stop}` and optional `install`):
 
-1. `install`: Installs or verifies the database binary or container image locally. Runs once before the server starts.
-2. `start`: Launches the database server bound to `127.0.0.1` on its local port using an isolated data directory inside `leaderboard/<system>/`. Must be idempotent if already running.
-3. `check`: Probes readiness (for example, running a fast `SELECT 1` or port check) and exits `0` only when the server is ready to accept connections.
-4. `stop`: Stops the server and releases its port. Also invoked automatically by the crash-recovery journal (`leaderboard/.runs/active.json`) if a previous run was interrupted.
+1. `install`: Optional script that installs or verifies the database binary locally before `start`.
+2. `start`: Launches the database server bound to `127.0.0.1` on its local port and writes the server PID to `leaderboard/.runs/<system>.pid`. Must be idempotent if already running.
+3. `check`: Verifies that the PID in `leaderboard/.runs/<system>.pid` is alive and the port answers as the expected database engine, exiting `0` only when ready to accept SQL.
+4. `stop`: Stops only the process recorded in `leaderboard/.runs/<system>.pid` and removes the PID file once the process has exited.
 
-See `leaderboard/dolt/` (`Doltgres`), `leaderboard/dolt_mysql/` (`Dolt`), `leaderboard/matrixone/`, or `leaderboard/seekdb/` for working reference scripts.
+See `leaderboard/dolt/` (`Doltgres`), `leaderboard/dolt_mysql/` (`Dolt`), `leaderboard/matrixone/`, `leaderboard/seekdb/`, or `leaderboard/file_copy/` for working reference scripts.
 
 ### Step 3: Implement `leaderboard/<system>/connector.py`
 
@@ -70,69 +70,63 @@ Create `leaderboard/<system>/connector.py` exporting a module-level `CONNECTOR` 
 ```python
 from __future__ import annotations
 
-import psycopg2
-from psycopg2 import sql
+from contextlib import closing
+from pathlib import Path
 
-from dblib.result_pb2 import ToolSuite
+import psycopg2
+from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+
 from leaderboard.connector import Connector
+from microbench import task2_pb2 as tp
+from microbench.runner2 import BackendInfo
+from util.import_db import load_sql_file
 
 
 class AcmeConnector(Connector):
-    host = "127.0.0.1"
-    port = 5432
-    user = "postgres"
-    password = ""
-    tools = ToolSuite.TOOL_SUITE_PG
+    backend = tp.Backend.DOLT
+    needs_psql = True
+    version_sql = "SELECT version()"
+    data_dir = Path("~/acmedb/data").expanduser()
 
-    def connect(self, database: str, branch: str = "main"):
-        conn = psycopg2.connect(
-            host=self.host,
-            port=self.port,
-            user=self.user,
-            password=self.password,
-            dbname=database,
-        )
-        conn.autocommit = True
+    def scope(self) -> dict:
+        return {"host": "127.0.0.1", "port": 5432, "user": "postgres", "data_dir": str(self.data_dir.resolve())}
+
+    def _admin(self) -> psycopg2.extensions.connection:
+        conn = psycopg2.connect("postgresql://postgres@127.0.0.1:5432/postgres")
+        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
         return conn
 
-    def admin(self):
-        return self.connect("postgres")
+    def provision(self, db: str) -> BackendInfo:
+        with closing(self._admin()) as conn, conn.cursor() as cur:
+            cur.execute(f'CREATE DATABASE "{db}"')
+        return BackendInfo(default_branch_name="main")
 
-    def create_database(self, admin, name: str) -> None:
-        with admin.cursor() as cur:
-            cur.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+    def load(self, info: BackendInfo, db: str, dump: Path) -> None:
+        load_sql_file(f"postgresql://postgres@127.0.0.1:5432/{db}", dump)
 
-    def delete_database(self, admin, name: str) -> None:
-        with admin.cursor() as cur:
-            cur.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(name)))
+    def delete(self, db: str) -> None:
+        with closing(self._admin()) as conn, conn.cursor() as cur:
+            cur.execute(f'DROP DATABASE IF EXISTS "{db}"')
+        if self.exists(db):
+            raise RuntimeError(f"AcmeDB database '{db}' still exists after deletion")
 
-    def list_databases(self, admin) -> list[str]:
-        with admin.cursor() as cur:
-            cur.execute("SELECT datname FROM pg_database WHERE datistemplate = false")
-            return [row[0] for row in cur.fetchall()]
+    def exists(self, db: str) -> bool:
+        with closing(self._admin()) as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_catalog.pg_database WHERE datname = %s", (db,))
+            return cur.fetchone() is not None
 
-    def create_branch(self, conn, branch: str, parent: str = "main") -> None:
-        with conn.cursor() as cur:
-            cur.execute("SELECT acme_branch_create(%s, %s)", (branch, parent))
-
-    def delete_branch(self, conn, branch: str) -> None:
-        with conn.cursor() as cur:
-            cur.execute("SELECT acme_branch_delete(%s)", (branch,))
-
-    def version(self, conn) -> str:
-        with conn.cursor() as cur:
-            cur.execute("SELECT version()")
-            return str(cur.fetchone()[0]).split()[0]
+    def version(self) -> str:
+        with closing(self._admin()) as conn, conn.cursor() as cur:
+            cur.execute(self.version_sql)
+            return str(cur.fetchone()[0])
 
 
 CONNECTOR = AcmeConnector()
 ```
 
-#### Supporting Macrobench Agent Workflows (`AdapterToolSuite`)
+#### Supporting Macrobench Agent Workflows
 
-To run the six Macrobench agent workflows (`python -m leaderboard.run_macro`), your connector's `tool_suite(...)` method must return an object implementing the branching verbs (`branch`, `commit`, `diff`, `log`, `merge`, `rebase`, `revert`, `reset`, `delete`) alongside SQL execution (`execute_sql`, `get_connection_uri`).
-
-If your database already has an adapter in `dblib/` or you wrap a `DBAdapter` inside `leaderboard/<system>/connector.py`, pass it to `AdapterToolSuite` from `leaderboard.connector` (see `leaderboard/dolt/connector.py` and `leaderboard/matrixone/connector.py` for complete examples). If your engine does not support a specific Git-like verb (such as `rebase` or `merge`), raise `NotImplementedError` for that verb; the macrobench harness will record the affected workflow outcome as `incomplete` (`Unsupported: <VERB>`) rather than crashing.
+Both `python -m leaderboard.run` (microbench) and `python -m leaderboard.run_macro` (macrobench) dispatch database operations using `CONNECTOR.backend` (an enum value from `microbench/task2_pb2.py` and `macrobench/task_pb2.py` backed by a `DBToolSuite` subclass in `dblib/`). For each scenario (`S1`–`S6`), `run_macro` records a recovery journal before spawning `python -m macrobench.runner` with a unique `bb_<id>` database and `cleanup: false`, then verifies database deletion through `CONNECTOR.delete(db)` and `CONNECTOR.exists(db)`. If a backend reports a branching verb as unsupported (`UnsupportedOperation`), the scenario stops cleanly with `status = "unsupported: <VERB>: <reason>"` and `validate_macro` classifies the attempt as `incomplete`.
 
 ---
 
@@ -185,13 +179,29 @@ node leaderboard/test_page.cjs
 
 ---
 
-## Hosted connectors (not implemented)
+## Hosted connectors
 
-Managed cloud database folders (`"hosted": "yes"`, such as `leaderboard/neon/`, `leaderboard/tiger/`, and `leaderboard/xata/`) represent remote serverless or cloud-hosted services:
+Managed cloud database folders (`"hosted": "yes"`, such as `leaderboard/neon/`, `leaderboard/xata/`, and `leaderboard/tiger/`) represent remote serverless or cloud-hosted services:
 
 - Hosted connectors do **not** use local `install`, `start`, `check`, or `stop` scripts.
-- They read API and database credentials from environment variables at runtime, require `--client-location <location>` when running `python -m leaderboard.run`, and record both `region` and measured SQL `rtt_ms`.
-- Until a hosted system's `connector.py` is implemented, its card is disabled in `run.html` and illustrative reference rows are supplied in `--phase local` by `leaderboard/mock.py` (never included in `--phase prod`).
+- `leaderboard/neon/connector.py` (`NEON_API_KEY_ORG`) and `leaderboard/xata/connector.py` (`XATA_API_KEY`, `XATA_ORGANIZATION_ID`) read API credentials from environment variables at runtime, run `preflight()` before creating any project, require `--client-location <location>` when running `python -m leaderboard.run`, and record both `region` and measured SQL `rtt_ms`.
+- If a hosted system folder has no `connector.py` yet (such as `leaderboard/tiger/`) or has no result file on disk, illustrative reference rows are supplied in `--phase local` by `leaderboard/mock.py` (never included in `--phase prod`).
+
+---
+
+## Running on AWS (Economic 1-VM Model)
+
+To produce official comparable leaderboard results on a single reusable EC2 worker VM (stopped between releases so you pay only for EBS storage when idle, plus On-Demand compute at `~$0.68/hr` on `i4i.2xlarge` or `~$0.34/hr` on `c6i.2xlarge` while a batch is actively running):
+
+1. Provision one **Ubuntu 24.04 LTS (`x86_64`)** On-Demand EC2 worker (`i4i.2xlarge` with local NVMe formatted as `mkfs.xfs -m crc=1,reflink=1`, or `c6i.2xlarge` with an XFS `reflink=1` `gp3` volume mounted at `/mnt/nvme` so PostgreSQL 18 `file_copy_method=clone` uses real copy-on-write reflinks).
+2. Stop and disable conflicting OS and benchmark services (`postgresql`, `pg18-bench`, `mysql`, `mariadb`, `dolt`, `doltgres`, `matrixone`, `seekdb`, `unattended-upgrades`).
+3. Run all systems sequentially from one clean commit using `leaderboard/aws_worker.sh` (which delegates to `python -m leaderboard.aws_worker`, enforces a batch-wide lock and `--batch-deadline-min`, verifies post-run server stop and cleanup after each system, validates every artifact produced by the batch, and optionally powers off the instance when done):
+
+```bash
+./leaderboard/aws_worker.sh --machine aws-i4i-2xlarge --preset full --data-mount /mnt/nvme --batch-deadline-min 720 --poweroff
+```
+
+4. List the validated result and campaign paths in `leaderboard/publish.json`, build the static production bundle with `uv run --frozen python -m leaderboard.site --phase prod`, and sync `leaderboard/.site/prod/` to S3 + CloudFront or GitHub Pages.
 
 ---
 

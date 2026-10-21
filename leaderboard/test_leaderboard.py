@@ -14,7 +14,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from leaderboard import aws_worker
 from leaderboard.build import build
+from leaderboard.file_copy.connector import FileCopy
 from leaderboard.mock import entries as mock_rows
 from leaderboard.connector import Connector, connector_names, load_connector
 from leaderboard.run import RunError, clean_up, exclusive, scrub
@@ -147,8 +149,11 @@ class ResultFiles(unittest.TestCase):
 class Runner(unittest.TestCase):
     def test_a_second_run_of_a_system_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as runs, mock.patch("leaderboard.run.RUNS", Path(runs)):
-            with exclusive("neon"), self.assertRaises(RunError):
+            with exclusive("neon"), self.assertRaisesRegex(RunError, "another run of neon"):
                 with exclusive("neon"):
+                    pass
+            with exclusive("dolt"), self.assertRaisesRegex(RunError, "another benchmark run is in progress"):
+                with exclusive("matrixone"):
                     pass
 
     def test_unreadable_journal_is_reported_and_kept(self) -> None:
@@ -180,6 +185,101 @@ class Connectors(unittest.TestCase):
                     (Path(board) / name / file).write_text("")
             self.assertEqual(connector_names(Path(board)), ["new"])
 
+    def test_file_copy_provision_runs_info_before_create_database_and_restores_method(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            prev_file = Path(tmp) / "file_copy.prev_method"
+            fc = FileCopy()
+            fc.prev_method_file = prev_file
+            events: list[str] = []
+            current_method = ["copy"]
+            conn = mock.MagicMock()
+            cur = conn.cursor.return_value.__enter__.return_value
+
+            def exec_sql(sql, params=None):
+                events.append(sql if params is None else f"{sql} {params}")
+
+            cur.execute.side_effect = exec_sql
+            cur.fetchone.side_effect = lambda: (current_method[0],)
+
+            def make_info(db: str):
+                events.append(f"FileCopyInfo({db})")
+                current_method[0] = "clone"
+                info = mock.Mock()
+                info.prev_method = "copy"
+                return info
+
+            with mock.patch.object(fc, "_admin", return_value=conn), \
+                    mock.patch("leaderboard.file_copy.connector.FileCopyToolSuite.FileCopyInfo", side_effect=make_info), \
+                    mock.patch("leaderboard.file_copy.connector.file_copy.drop_database", side_effect=lambda db: events.append(f"drop({db})")), \
+                    mock.patch.object(fc, "exists", return_value=False):
+                fc.provision("bb_1234abcd")
+                self.assertEqual(prev_file.read_text().strip(), "copy")
+                # Simulate crash recovery where version() and capture_prev_method() run while server is still 'clone'
+                fc_other = FileCopy()
+                fc_other.prev_method_file = prev_file
+                with mock.patch.object(fc_other, "_admin", return_value=conn), \
+                        mock.patch.object(fc_other, "exists", return_value=False):
+                    fc_other.version()
+                    fc_other.capture_prev_method()
+                    self.assertEqual(prev_file.read_text().strip(), "copy")
+                    fc_other.delete("bb_1234abcd")
+                self.assertFalse(prev_file.exists())
+                # A second recovery delete on a fresh connector instance after prev_file is gone must be idempotent
+                fc_repeat = FileCopy()
+                fc_repeat.prev_method_file = prev_file
+                with mock.patch.object(fc_repeat, "_admin", return_value=conn), \
+                        mock.patch.object(fc_repeat, "exists", return_value=False):
+                    fc_repeat.delete("bb_1234abcd")
+            self.assertEqual(events[:3], ["SHOW file_copy_method;", "FileCopyInfo(bb_1234abcd)", 'CREATE DATABASE "bb_1234abcd"'])
+            self.assertIn("ALTER SYSTEM SET file_copy_method = %s; ('copy',)", events)
+            self.assertNotIn("ALTER SYSTEM RESET file_copy_method;", events)
+
+    def test_matrixone_start_relocates_mo_data_dir_and_keeps_launch_toml(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            mo_home = home / "mo" / "matrixone"
+            (mo_home / "etc" / "launch").mkdir(parents=True)
+            (mo_home / "etc" / "launch" / "launch.toml").write_text("# config\n")
+            fake_bin = mo_home / "mo-service"
+            fake_bin.write_text("#!/bin/bash\npwd > \"$MO_DATA_DIR/launched_from\"\necho \"$@\" > \"$MO_DATA_DIR/launched_args\"\n")
+            fake_bin.chmod(0o755)
+            board = root / "leaderboard"
+            (board / "matrixone").mkdir(parents=True)
+            shutil.copy(BOARD / "matrixone" / "start", board / "matrixone" / "start")
+            mount_data = root / "mnt" / "nvme" / "mo" / "matrixone" / "mo-data"
+            env = {
+                "PATH": "/usr/bin:/bin",
+                "HOME": str(home),
+                "MO_DATA_DIR": str(mount_data),
+            }
+            res = subprocess.run([str(board / "matrixone" / "start")], env=env, capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertTrue((mo_home / "mo-data").is_symlink())
+            self.assertEqual((mo_home / "mo-data").resolve(), mount_data.resolve())
+            for _ in range(20):
+                if (mount_data / "launched_args").is_file():
+                    break
+                __import__("time").sleep(0.05)
+            self.assertEqual((mount_data / "launched_args").read_text().strip(), "-launch ./etc/launch/launch.toml")
+
+    def test_dolt_and_dolt_mysql_check_and_remove_dropped_databases_trash(self) -> None:
+        for name in ("dolt", "dolt_mysql"):
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                srv = load_connector(name)
+                trash = Path(tmp) / ".dolt_dropped_databases" / "bb_1234abcd"
+                trash.mkdir(parents=True)
+                conn = mock.MagicMock()
+                cur = conn.cursor.return_value.__enter__.return_value
+                cur.fetchone.return_value = None
+                target = mock.patch.object(srv, "_admin", return_value=conn) if name == "dolt" else mock.patch("leaderboard.dolt_mysql.connector.dolt_mysql.connect", return_value=conn)
+                with mock.patch.object(srv, "data_dir", Path(tmp)), target, \
+                        mock.patch("leaderboard.dolt_mysql.connector.dolt_mysql.drop_database"):
+                    self.assertTrue(srv.exists("bb_1234abcd"))
+                    srv.delete("bb_1234abcd")
+                    self.assertFalse(trash.exists())
+                    self.assertFalse(srv.exists("bb_1234abcd"))
+
     def test_no_files_outside_leaderboard_differ_from_main_merge_base(self) -> None:
         merge_head = subprocess.run(["git", "-C", str(BOARD.parent), "rev-parse", "-q", "--verify", "MERGE_HEAD"],
                                     capture_output=True, text=True)
@@ -196,6 +296,337 @@ class Connectors(unittest.TestCase):
             capture_output=True, text=True, check=True,
         ).stdout.splitlines()
         self.assertEqual(changed, [], f"files outside leaderboard/ differ from {ref}: {changed}")
+
+
+class AwsWorker(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.board = self.tmp / "leaderboard"
+        self.runs = self.board / ".runs"
+        shutil.copytree(BOARD, self.board, ignore=shutil.ignore_patterns(".runs", ".site", "results", "macro"))
+        self.suite = json.loads((self.board / "suite.json").read_text())
+        patch = mock.patch("leaderboard.aws_worker.resolve_shutdown_bin", return_value="/sbin/shutdown")
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def _valid_micro_payload(self, system: str = "dolt", machine: str = "aws-box") -> dict:
+        meta = json.loads((self.board / system / "system.json").read_text())
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "run_id": "0123abcd",
+            **meta,
+            "date": "2026-10-20",
+            "machine": machine,
+            "version": "1.0.0",
+            "suite": self.suite["suite"],
+            "suite_sha256": sha256(self.board / "suite.json"),
+            "seed": self.suite["seed"],
+            "commit": "0" * 40,
+            "dirty": False,
+            "dataset_sha256": self.suite["dataset"]["sha256"],
+            "python": "3.13.14",
+            "lock_sha256": "0" * 64,
+            "provision_time": 0.05,
+            "load_time": 1.2,
+            "result": [[0.01] * self.suite["tries"] for _ in self.suite["rows"]],
+        }
+
+    def test_duplicate_worker_lock_failure_never_triggers_poweroff(self) -> None:
+        cmds: list[list[str]] = []
+
+        def fake_cmd(cmd, **kwargs):
+            cmds.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with aws_worker.batch_lock(self.runs):
+            rc = aws_worker.run_batch(
+                machine="aws-box",
+                lane="micro",
+                systems_arg="dolt",
+                poweroff=True,
+                board=self.board,
+                runs_dir=self.runs,
+                cmd_runner=fake_cmd,
+                port_checker=lambda _: False,
+                sys_platform="Darwin",
+            )
+        self.assertEqual(rc, 1)
+        self.assertEqual(cmds, [], "duplicate worker that fails lock acquisition must never run sudo shutdown")
+
+    def test_interruption_or_dirty_host_aborts_before_next_system(self) -> None:
+        steps: list[str] = []
+
+        def interrupt_step(cmd, remaining, env):
+            steps.append(cmd[3])
+            return 130, True, False
+
+        rc = aws_worker.run_batch(
+            machine="aws-box",
+            lane="micro",
+            systems_arg="dolt matrixone",
+            board=self.board,
+            runs_dir=self.runs,
+            step_runner=interrupt_step,
+            port_checker=lambda _: False,
+            sys_platform="Darwin",
+        )
+        self.assertEqual(rc, 130)
+        self.assertEqual(steps, ["dolt"], "SIGINT (130) must abort the batch immediately")
+
+        steps.clear()
+
+        def leave_journal_step(cmd, remaining, env):
+            steps.append(cmd[3])
+            out = self.board / cmd[3] / "results" / "20261020" / "aws-box.json"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(self._valid_micro_payload(cmd[3])))
+            (self.runs / f"{cmd[3]}.journal.json").write_text('{"name":"bb_1234abcd"}')
+            return 0, False, False
+
+        rc2 = aws_worker.run_batch(
+            machine="aws-box",
+            lane="micro",
+            systems_arg="dolt matrixone",
+            board=self.board,
+            runs_dir=self.runs,
+            step_runner=leave_journal_step,
+            port_checker=lambda _: False,
+            sys_platform="Darwin",
+        )
+        self.assertEqual(rc2, 1)
+        self.assertEqual(steps, ["dolt"], "leftover journal/server after a step must abort before next system")
+
+    def test_poweroff_preflight_and_shutdown_failure_propagate_nonzero(self) -> None:
+        steps: list[list[str]] = []
+
+        # 1. sudo -n fails during preflight -> batch does not run any step
+        rc_pre = aws_worker.run_batch(
+            machine="aws-box",
+            lane="micro",
+            systems_arg="dolt",
+            poweroff=True,
+            board=self.board,
+            runs_dir=self.runs,
+            step_runner=lambda cmd, rem, env: (steps.append(cmd) or (0, False, False)),
+            cmd_runner=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "sudo: a password is required"),
+            port_checker=lambda _: False,
+            sys_platform="Darwin",
+        )
+        self.assertEqual(rc_pre, 1)
+        self.assertEqual(steps, [])
+
+        # 2. sudo -n -l succeeds with NOPASSWD in preflight, step succeeds, but shutdown -h now fails -> returns 1
+        def step_ok(cmd, rem, env):
+            out = self.board / cmd[3] / "results" / "20261020" / "aws-box.json"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(self._valid_micro_payload(cmd[3])))
+            return 0, False, False
+
+        def cmd_shutdown_fails(cmd, **kw):
+            if "-l" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, "(ALL) NOPASSWD: /sbin/shutdown -h now\n", "")
+            if any("shutdown" in str(c) for c in cmd):
+                return subprocess.CompletedProcess(cmd, 1, "", "shutdown failed")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        rc_shut = aws_worker.run_batch(
+            machine="aws-box",
+            lane="micro",
+            systems_arg="dolt",
+            poweroff=True,
+            board=self.board,
+            runs_dir=self.runs,
+            step_runner=step_ok,
+            cmd_runner=cmd_shutdown_fails,
+            port_checker=lambda _: False,
+            sys_platform="Darwin",
+        )
+        self.assertEqual(rc_shut, 1)
+
+        # 3. sudoers policies allowing only /usr/bin/id, PASSWD: /sbin/shutdown, non-root runas, other shutdown binary, or bare path are rejected
+        for bad_stdout in (
+            "User ubuntu may run the following commands:\n    (ALL) NOPASSWD: /usr/bin/id\n",
+            "User ubuntu may run the following commands:\n    (ALL) NOPASSWD: /usr/bin/id, PASSWD: /sbin/shutdown\n",
+            "(root) PASSWD: /sbin/shutdown -h now\n(backup) NOPASSWD: /sbin/shutdown -h now\n",
+            "(root) PASSWD: /sbin/shutdown -h now\n(root) NOPASSWD: /opt/test/shutdown -h now\n",
+            "/sbin/shutdown -h now\n",
+        ):
+            rc_bad = aws_worker.run_batch(
+                machine="aws-box",
+                lane="micro",
+                systems_arg="dolt",
+                poweroff=True,
+                board=self.board,
+                runs_dir=self.runs,
+                step_runner=lambda cmd, rem, env: (steps.append(cmd) or (0, False, False)),
+                cmd_runner=lambda cmd, out=bad_stdout, **kw: subprocess.CompletedProcess(cmd, 0, out, ""),
+                port_checker=lambda _: False,
+                sys_platform="Darwin",
+            )
+            self.assertEqual(rc_bad, 1, bad_stdout)
+            self.assertEqual(steps, [])
+
+    def test_batch_lock_blocks_direct_runner_and_allows_tokenized_child(self) -> None:
+        with mock.patch("leaderboard.run.RUNS", self.runs):
+            with aws_worker.batch_lock(self.runs) as token:
+                with self.assertRaisesRegex(RunError, "another benchmark batch worker"):
+                    with exclusive("dolt"):
+                        pass
+                with mock.patch.dict("os.environ", {"DBFORK_BATCH_TOKEN": token}):
+                    with exclusive("dolt"):
+                        pass
+
+    def test_negative_signal_and_preflight_deadline_and_validation_crash_poweroff(self) -> None:
+        # 1. Negative signal (-9 / -SIGKILL) aborts batch before next system
+        seen: list[str] = []
+        rc_sigkill = aws_worker.run_batch(
+            machine="aws-box",
+            lane="micro",
+            systems_arg="dolt matrixone",
+            board=self.board,
+            runs_dir=self.runs,
+            step_runner=lambda cmd, rem, env: (seen.append(cmd[3]) or (-9, aws_worker.is_interrupted_returncode(-9), False)),
+            port_checker=lambda _: False,
+            sys_platform="Darwin",
+        )
+        self.assertEqual(rc_sigkill, 130)
+        self.assertEqual(seen, ["dolt"])
+
+        # 2. Preflight consuming batch deadline aborts before starting any child step (even when shutdown also fails)
+        fake_now = [100.0]
+        child_called: list[str] = []
+
+        def slow_preflight_and_failing_shutdown(cmd, **kw):
+            if "-l" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, "(ALL) NOPASSWD: /sbin/shutdown -h now\n", "")
+            if "-h" in cmd:
+                return subprocess.CompletedProcess(cmd, 1, "", "shutdown failed")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        def slow_port_checker(scope):
+            fake_now[0] += 120.0
+            return False
+
+        rc_deadline = aws_worker.run_batch(
+            machine="aws-box",
+            lane="micro",
+            systems_arg="dolt",
+            batch_deadline_min=1.0,
+            poweroff=True,
+            board=self.board,
+            runs_dir=self.runs,
+            step_runner=lambda cmd, rem, env: (child_called.append(cmd[3]) or (0, False, False)),
+            cmd_runner=slow_preflight_and_failing_shutdown,
+            port_checker=slow_port_checker,
+            sys_platform="Darwin",
+            clock=lambda: fake_now[0],
+        )
+        self.assertEqual(rc_deadline, 124)
+        self.assertEqual(child_called, [])
+
+        # 3. Invalid UTF-8 in produced artifact does not skip poweroff
+        shutdown_calls: list[list[str]] = []
+
+        def write_bad_utf8(cmd, rem, env):
+            out = self.board / cmd[3] / "results" / "20261020" / "aws-box.json"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(b"\xff\xfeinvalid utf8")
+            return 0, False, False
+
+        def track_shutdown(cmd, **kw):
+            if "-l" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, "(ALL) NOPASSWD: /sbin/shutdown -h now\n", "")
+            if "-h" in cmd:
+                shutdown_calls.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        rc_utf8 = aws_worker.run_batch(
+            machine="aws-box",
+            lane="micro",
+            systems_arg="dolt",
+            poweroff=True,
+            board=self.board,
+            runs_dir=self.runs,
+            step_runner=write_bad_utf8,
+            cmd_runner=track_shutdown,
+            port_checker=lambda _: False,
+            sys_platform="Darwin",
+        )
+        self.assertEqual(rc_utf8, 1)
+        self.assertEqual(len(shutdown_calls), 1, "poweroff must still run when validation encounters invalid UTF-8")
+
+        # 4. Advancing clock past deadline inside artifact validator returns 124
+        val_now = [100.0]
+        art = self.board / "dolt" / "results" / "20261020" / "aws-box.json"
+        art.parent.mkdir(parents=True, exist_ok=True)
+        art.write_text(json.dumps(self._valid_micro_payload("dolt")))
+        with mock.patch("leaderboard.aws_worker.validate_micro", side_effect=lambda p, b: (val_now.__setitem__(0, 300.0) or [])):
+            self.assertEqual(
+                aws_worker.validate_batch_artifacts([art], [], board=self.board, deadline=200.0, clock=lambda: val_now[0]),
+                124,
+            )
+
+    def test_execute_step_terminates_surviving_descendant_on_timeout(self) -> None:
+        pid_file = self.tmp / "grandchild.pid"
+        script = (
+            "import os, signal, subprocess, sys, time; "
+            f"p = subprocess.Popen([sys.executable, '-c', 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)']); "
+            f"open({str(pid_file)!r}, 'w').write(str(p.pid)); "
+            "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); "
+            "time.sleep(60)"
+        )
+        rc, interrupted, timed_out = aws_worker.execute_step(
+            [__import__("sys").executable, "-c", script],
+            remaining_sec=0.3,
+            env=dict(__import__("os").environ),
+        )
+        self.assertEqual((rc, interrupted, timed_out), (124, False, True))
+        grandchild_pid = int(pid_file.read_text().strip())
+        with self.assertRaises(ProcessLookupError):
+            __import__("os").kill(grandchild_pid, 0)
+
+    def test_systemd_conflicts_open_ports_and_batch_scoped_validation(self) -> None:
+        # 1. pg18-bench active on Linux is caught by systemd preflight
+        with mock.patch("shutil.which", return_value="/bin/systemctl"):
+            with self.assertRaisesRegex(RuntimeError, "pg18-bench"):
+                aws_worker.check_linux_systemd_conflicts(
+                    sys_platform="Linux",
+                    run_cmd=lambda cmd, **kw: subprocess.CompletedProcess(
+                        cmd, 0 if cmd[-1] == "pg18-bench" else 3, "", ""
+                    ),
+                )
+
+        # 2. Open benchmark port is caught by verify_host_clean
+        with self.assertRaisesRegex(RuntimeError, "already accepting connections"):
+            aws_worker.verify_host_clean(
+                board=self.board,
+                runs_dir=self.runs,
+                check_port=lambda scope: int(scope["port"]) == 5433,
+            )
+
+        # 3. Unrelated broken historical result on disk does not fail a clean batch
+        broken_historical = self.board / "matrixone" / "results" / "20260101" / "old-box.json"
+        broken_historical.parent.mkdir(parents=True, exist_ok=True)
+        broken_historical.write_text("{broken json")
+
+        def step_ok(cmd, rem, env):
+            out = self.board / cmd[3] / "results" / "20261020" / "aws-box.json"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(self._valid_micro_payload(cmd[3])))
+            return 0, False, False
+
+        rc = aws_worker.run_batch(
+            machine="aws-box",
+            lane="micro",
+            systems_arg="dolt",
+            board=self.board,
+            runs_dir=self.runs,
+            step_runner=step_ok,
+            port_checker=lambda _: False,
+            sys_platform="Darwin",
+        )
+        self.assertEqual(rc, 0)
 
 
 if __name__ == "__main__":
