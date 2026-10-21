@@ -12,7 +12,7 @@ import os
 import pymysql
 
 conn = pymysql.connect(
-    host=os.environ.get("DOLT_MYSQL_HOST", "127.0.0.1"),
+    host=os.environ.get("DOLT_MYSQL_HOST") or os.environ.get("DBFORK_SERVER_HOST", "127.0.0.1"),
     port=int(os.environ.get("DOLT_MYSQL_PORT", "3306")),
     user=os.environ.get("DOLT_MYSQL_USER", "root"),
     password=os.environ.get("DOLT_MYSQL_PASSWORD", ""),

@@ -34,13 +34,17 @@ class Dolt(Connector):
 
     def delete(self, db: str) -> None:
         dolt_mysql.drop_database(db)
-        shutil.rmtree(self.data_dir / ".dolt_dropped_databases" / db, ignore_errors=True)
+        dropped = self.data_dir / ".dolt_dropped_databases" / db
+        if dropped.exists():
+            shutil.rmtree(dropped)
+        if self.exists(db):
+            raise RuntimeError(f"Dolt database '{db}' still exists after deletion")
 
     def exists(self, db: str) -> bool:
         with closing(dolt_mysql.connect()) as conn, conn.cursor() as cur:
             cur.execute("SHOW DATABASES LIKE %s", (db,))
             listed = cur.fetchone() is not None
-        return listed or (self.data_dir / db).exists()
+        return listed or (self.data_dir / db).exists() or (self.data_dir / ".dolt_dropped_databases" / db).exists()
 
     def version(self) -> str:
         with closing(dolt_mysql.connect()) as conn, conn.cursor() as cur:

@@ -45,13 +45,17 @@ class Doltgres(Connector):
     def delete(self, db: str) -> None:
         with closing(self._admin()) as conn, conn.cursor() as cur:
             cur.execute(f"DROP DATABASE IF EXISTS {db}")
-        shutil.rmtree(self.data_dir / ".dolt_dropped_databases" / db, ignore_errors=True)
+        dropped = self.data_dir / ".dolt_dropped_databases" / db
+        if dropped.exists():
+            shutil.rmtree(dropped)
+        if self.exists(db):
+            raise RuntimeError(f"Doltgres database '{db}' still exists after deletion")
 
     def exists(self, db: str) -> bool:
         with closing(self._admin()) as conn, conn.cursor() as cur:
             cur.execute("SELECT 1 FROM pg_catalog.pg_database WHERE datname = %s", (db,))
             listed = cur.fetchone() is not None
-        return listed or (self.data_dir / db).exists()
+        return listed or (self.data_dir / db).exists() or (self.data_dir / ".dolt_dropped_databases" / db).exists()
 
     def version(self) -> str:
         with closing(self._admin()) as conn, conn.cursor() as cur:

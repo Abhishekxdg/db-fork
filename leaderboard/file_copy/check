@@ -10,22 +10,37 @@ runs="$(cd "$(dirname "$0")/.." && pwd)/.runs"
 import os
 
 import psycopg2
+from psycopg2 import sql
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
-conn = psycopg2.connect(
-    host=os.environ.get("PGSQL_HOST", "localhost"),
-    port=int(os.environ.get("PGSQL_PORT", "5433")),
-    user=os.environ.get("PGSQL_USER", os.environ.get("USER", "postgres")),
-    password=os.environ.get("PGSQL_PASSWORD", ""),
-    dbname="postgres",
-    connect_timeout=2,
-)
+host = os.environ.get("FILE_COPY_HOST") or os.environ.get("PGSQL_HOST") or os.environ.get("DBFORK_SERVER_HOST", "localhost")
+port = int(os.environ.get("FILE_COPY_PORT") or os.environ.get("PGSQL_PORT", "5433"))
+password = os.environ.get("PGSQL_PASSWORD", "")
+target_user = os.environ.get("PGSQL_USER", "elaineang")
+bootstrap_users = []
+for u in (os.environ.get("USER"), target_user, "postgres"):
+    if u and u not in bootstrap_users:
+        bootstrap_users.append(u)
+
+conn = None
+for u in bootstrap_users:
+    try:
+        conn = psycopg2.connect(host=host, port=port, user=u, password=password, dbname="postgres", connect_timeout=2)
+        break
+    except psycopg2.OperationalError:
+        continue
+if conn is None:
+    raise SystemExit(1)
+
 conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
 with conn.cursor() as cur:
     cur.execute("SELECT current_setting('server_version')")
-    cur.execute(
-        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'postgres') "
-        "THEN CREATE ROLE postgres WITH SUPERUSER LOGIN; END IF; END $$;"
-    )
+    for role in ("postgres", target_user):
+        cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,))
+        if cur.fetchone() is None:
+            cur.execute(sql.SQL("CREATE ROLE {} WITH SUPERUSER LOGIN").format(sql.Identifier(role)))
+conn.close()
+
+conn = psycopg2.connect(host=host, port=port, user=target_user, password=password, dbname="postgres", connect_timeout=2)
 conn.close()
 EOF
