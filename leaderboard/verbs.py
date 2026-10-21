@@ -19,12 +19,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+from leaderboard import aws_worker
 from leaderboard import run as micro
 from leaderboard import run_macro
 from leaderboard.connector import connector_names, load_connector
 from leaderboard.run import RunError, scrub
 from leaderboard.validate import BOARD, MACHINE_RE, parse_day
-from leaderboard.validate_macro import ATTEMPT_RE as RUN_ID_RE, HEX, SECRET_KEY, SECRET_VALUE
+from leaderboard.validate_macro import ATTEMPT_RE as RUN_ID_RE, ExecutionProfile, EXECUTION_PROFILES, HEX, SECRET_KEY, SECRET_VALUE
 from microbench.verbs.grid import AXES, BASE, VERBS, points_for_run
 import math
 
@@ -75,32 +76,8 @@ def _has_secret(value) -> bool:
     return False
 
 
-def _terminate_verbs_child(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except OSError:
-        try:
-            proc.terminate()
-        except OSError:
-            pass
-    try:
-        proc.wait(timeout=5)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except OSError:
-        try:
-            proc.kill()
-        except OSError:
-            pass
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        pass
+def _terminate_verbs_child(proc: subprocess.Popen, grace_sec: float = 5.0) -> None:
+    aws_worker._terminate_process_group(proc, grace_sec=grace_sec)
 
 
 def launch_verbs_child(
@@ -122,6 +99,8 @@ def launch_verbs_child(
     )
     try:
         out, _ = proc.communicate(timeout=timeout)
+        if aws_worker._pgid_alive(proc.pid):
+            _terminate_verbs_child(proc)
         return subprocess.CompletedProcess(cmd, proc.returncode, stdout=out, stderr="")
     except subprocess.TimeoutExpired:
         _terminate_verbs_child(proc)
@@ -393,6 +372,9 @@ def run(
                 "status": "unverified",
                 "reasons": [*outcome["reasons"], "tracked sources changed during the run"],
             }
+        exec_profile = os.environ.get("DBFORK_EXECUTION_PROFILE") or "local_single_host"
+        if exec_profile not in EXECUTION_PROFILES:
+            raise RunError(f"invalid DBFORK_EXECUTION_PROFILE {exec_profile!r}")
         payload = {
             "suite": VERBS_SUITE,
             "run_id": run_id,
@@ -405,6 +387,7 @@ def run(
             "warmup": warmup,
             "expected_points": expected_point_ids,
             "machine": machine,
+            "execution_profile": exec_profile,
             "date": started.date().isoformat(),
             "started": started.isoformat(timespec="seconds"),
             "version": version,
@@ -472,11 +455,14 @@ def validate_verbs(path: Path, board: Path = BOARD) -> list[str]:
     if not isinstance(scale, int) or isinstance(scale, bool) or scale < 1:
         problems.append("scale must be a positive integer")
     reps = data.get("reps")
-    if reps is not None and (not isinstance(reps, int) or isinstance(reps, bool) or reps < 1):
+    if not isinstance(reps, int) or isinstance(reps, bool) or reps < 1:
         problems.append("reps must be a positive integer")
     warmup = data.get("warmup")
-    if warmup is not None and (not isinstance(warmup, int) or isinstance(warmup, bool) or warmup < 0):
+    if not isinstance(warmup, int) or isinstance(warmup, bool) or warmup < 0:
         problems.append("warmup must be a non-negative integer")
+    exec_profile = data.get("execution_profile", "local_single_host")
+    if not isinstance(exec_profile, str) or exec_profile not in EXECUTION_PROFILES:
+        problems.append(f"execution_profile must be one of {sorted(EXECUTION_PROFILES)}")
     if not isinstance(data.get("machine"), str) or not MACHINE_RE.fullmatch(data["machine"]):
         problems.append("invalid machine label")
     if not isinstance(data.get("date"), str) or not DATE_RE.fullmatch(data["date"]) or data["date"].replace("-", "") != day_dir:
@@ -583,11 +569,12 @@ def build_verbs(board: Path = BOARD, sources: set[str] | None = None) -> tuple[l
             data["system"],
             int(data["scale"]),
             data["machine"],
+            str(data.get("execution_profile") or "local_single_host"),
             bool(data.get("native_only", False)),
-            tuple(data.get("verbs") or VERBS),
-            tuple(data.get("axes") or ()),
-            int(data.get("reps", 10)),
-            int(data.get("warmup", 3)),
+            tuple(data["verbs"]),
+            tuple(data["axes"] or ()),
+            int(data["reps"]),
+            int(data["warmup"]),
         )
         sort_key = (str(data.get("started") or data["date"]), str(data["date"]), order_idx)
         by_slot.setdefault(slot, []).append((sort_key, rel, path))
@@ -600,11 +587,12 @@ def build_verbs(board: Path = BOARD, sources: set[str] | None = None) -> tuple[l
             "run_id": data["run_id"],
             "system": data["system"],
             "scale": data["scale"],
-            "verbs": data.get("verbs") or list(VERBS),
+            "verbs": data["verbs"],
             "axes": data.get("axes"),
-            "reps": int(data.get("reps", 10)),
-            "warmup": int(data.get("warmup", 3)),
+            "reps": int(data["reps"]),
+            "warmup": int(data["warmup"]),
             "machine": data["machine"],
+            "execution_profile": str(data.get("execution_profile") or "local_single_host"),
             "date": data["date"],
             "started": data.get("started"),
             "version": data["version"],

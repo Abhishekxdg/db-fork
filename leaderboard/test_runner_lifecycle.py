@@ -312,6 +312,22 @@ class RunLifecycle(unittest.TestCase):
         bad_rec["stats"]["points"].append({"id": "rogue:point", "status": "ok", "failed": 0, "latency": {"n": 10, "p50": 0.01}})
         bad_file.write_text(json.dumps(bad_rec))
         self.assertTrue(any("unexpected point" in p for p in verbs.validate_verbs(bad_file, self.board)))
+        bad_file.unlink()
+
+        # reps=None, warmup=None, and invalid execution_profile are rejected by validate_verbs
+        for bad_patch in ({"reps": None}, {"warmup": None}, {"execution_profile": "bogus_profile"}):
+            bad_rec = {**json.loads(written[0].read_text()), "run_id": "bb_00000002", **bad_patch}
+            bad_file.write_text(json.dumps(bad_rec))
+            self.assertNotEqual(verbs.validate_verbs(bad_file, self.board), [])
+        bad_file.unlink()
+
+        # build_verbs separates slots by execution_profile so economic_single_vm and local_single_host do not overwrite each other
+        econ_file = written[0].parent / "bb_00000003.json"
+        econ_rec = {**json.loads(written[0].read_text()), "run_id": "bb_00000003", "execution_profile": "economic_single_vm"}
+        econ_file.write_text(json.dumps(econ_rec))
+        entries3, excluded3 = verbs.build_verbs(self.board)
+        self.assertEqual((len(entries3), len(excluded3)), (2, 0))
+        self.assertEqual({r["execution_profile"] for r in entries3}, {"local_single_host", "economic_single_vm"})
 
     def test_launch_verbs_child_timeout_terminates_process_group_cleanly(self):
         from leaderboard import verbs
@@ -372,6 +388,37 @@ class RunLifecycle(unittest.TestCase):
                 verbs.run("dolt", 1, "box", self.board, verbs=["branch"])
         self.assertGreaterEqual(self.server.delete.call_count, 1)
         self.lifecycle.assert_called_once_with(self.board / "dolt", "stop")
+
+    def test_launch_verbs_child_kills_sigterm_ignoring_descendants_and_validates_reps_and_profile(self):
+        import sys
+        from leaderboard import verbs
+
+        pid_file = self.root / "grandchild.pid"
+        child_code = (
+            "import subprocess, sys\n"
+            "p = subprocess.Popen(\n"
+            "    [sys.executable, '-c', 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'],\n"
+            "    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n"
+            ")\n"
+            f"open({str(pid_file)!r}, 'w').write(str(p.pid))\n"
+            "sys.exit(0)\n"
+        )
+        orig_term = verbs.aws_worker._terminate_process_group
+        with mock.patch.object(
+            verbs.aws_worker,
+            "_terminate_process_group",
+            side_effect=lambda proc, grace_sec=5.0: orig_term(proc, grace_sec=0.1),
+        ):
+            res = verbs.launch_verbs_child(
+                [sys.executable, "-c", child_code],
+                env=dict(os.environ),
+                cwd=self.root,
+                timeout=10.0,
+            )
+        self.assertEqual(res.returncode, 0)
+        gpid = int(pid_file.read_text().strip())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(gpid, 0)
 
 
 class Deadlines(unittest.TestCase):

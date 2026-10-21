@@ -51,6 +51,8 @@ OUTCOMES = ("verified", "incomplete", "failed", "timed_out", "unverified")
 CLEANUPS = ("verified", "failed", "unknown")
 ENDINGS = ("exited", "killed", "interrupted", "launch_failed")
 STOPS = ("pending", "stopped", "failed", "not_started")
+EXECUTION_PROFILES = ("local_single_host", "economic_single_vm", "paper_separated_vms")
+ExecutionProfile = str
 VERBS = ("branch", "commit", "diff", "log", "merge", "rebase", "revert", "reset", "delete")
 ATTEMPT_RE = re.compile(r"bb_[0-9a-f]{8}")
 CAMPAIGN_RE = re.compile(r"[0-9a-f]{8}")
@@ -388,7 +390,7 @@ def load(path: Path, board: Path, fields: dict) -> tuple[list[str], dict | None,
         return problems + ["not a JSON object"], None, None, []
     problems += [f"{where} looks like a credential" for where in credentials(data)]
     problems += [f"{where} is not a finite number" for where in non_finite(data)]
-    optional = {"native_only": bool} if fields is CAMPAIGN_FIELDS else {}
+    optional = {"native_only": bool, "execution_profile": str} if fields is CAMPAIGN_FIELDS else {"execution_profile": str}
     if missing := sorted(fields.keys() - data.keys()):
         problems.append(f"missing keys: {missing}")
     if unexpected := sorted(data.keys() - fields.keys() - optional.keys()):
@@ -429,6 +431,8 @@ def provenance_problems(data: dict) -> list[str]:
         problems.append("environment must hold cpu, cpus and memory_bytes, each known or null")
     if not MACHINE_RE.fullmatch(data["machine"]):
         problems.append("machine label is malformed")
+    if "execution_profile" in data and data["execution_profile"] not in EXECUTION_PROFILES:
+        problems.append(f"execution_profile must be one of {EXECUTION_PROFILES}")
     return problems
 
 

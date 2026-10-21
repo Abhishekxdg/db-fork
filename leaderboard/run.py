@@ -539,6 +539,7 @@ def run(system: str, machine: str, out: Path, max_batch: int | None, allow_dirty
         "dataset_sha256": suite["dataset"]["sha256"],
         "python": platform.python_version(),
         "lock_sha256": digests[str(ROOT / "uv.lock")],
+        "execution_profile": os.environ.get("DBFORK_EXECUTION_PROFILE") or "local_single_host",
         "provision_time": round(provision_time, 6),
         "load_time": round(load_time, 6),
     }

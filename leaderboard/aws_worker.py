@@ -678,11 +678,12 @@ def run_batch(
     if lane not in ("all", "micro", "macro"):
         print(f"error: --lane must be all, micro, or macro, got {lane!r}", file=sys.stderr)
         return 2
-    if profile_mode not in ("economic", "paper"):
-        print(f"error: --profile-mode must be economic or paper, got {profile_mode!r}", file=sys.stderr)
-        return 2
-    if profile_mode == "paper" and preset != "full":
-        print("error: --profile-mode paper requires --preset full (scale>=10)", file=sys.stderr)
+    if profile_mode not in ("economic", "economic_single_vm"):
+        print(
+            f"error: aws_worker implements the single-VM colocated economic topology (--profile-mode economic), not {profile_mode!r}; "
+            "separated client/server paper topology requires dedicated VMs",
+            file=sys.stderr,
+        )
         return 2
     if not (math.isfinite(batch_deadline_min) and batch_deadline_min > 0):
         print("error: --batch-deadline-min must be a finite positive number", file=sys.stderr)
@@ -740,7 +741,7 @@ def run_batch(
                 env = dict(os.environ)
                 env.pop("DBFORK_NATIVE_ONLY", None)
                 env["DBFORK_BATCH_TOKEN"] = batch_token
-                env["DBFORK_EXECUTION_PROFILE"] = profile_mode
+                env["DBFORK_EXECUTION_PROFILE"] = "economic_single_vm"
 
                 try:
                     with catch_sigterm():

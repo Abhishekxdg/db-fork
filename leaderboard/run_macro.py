@@ -721,6 +721,7 @@ def source_digest(snapshot: dict) -> str:
 
 
 def provenance(snapshot: dict, env: dict) -> dict:
+    exec_profile = os.environ.get("DBFORK_EXECUTION_PROFILE") or "local_single_host"
     return {
         "source": {"commit": snapshot["commit"], "dirty": bool(snapshot["status"].strip()),
                    "changed_during_run": micro.source_snapshot(CODE_PATHS) != snapshot, "source_sha256": source_digest(snapshot)},
@@ -728,6 +729,7 @@ def provenance(snapshot: dict, env: dict) -> dict:
         "python": platform.python_version(),
         "platform": f"{platform.system()} {platform.release()} {platform.machine()}",
         "environment": env,
+        "execution_profile": exec_profile,
     }
 
 

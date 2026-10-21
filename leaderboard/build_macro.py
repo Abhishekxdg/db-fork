@@ -42,7 +42,8 @@ def group_key(campaign: dict) -> str:
                 "source_sha256": campaign["source_sha256"], "lock_sha256": campaign["lock_sha256"],
                 "python": campaign["python"], "platform": campaign["platform"], "machine": campaign["machine"],
                 "environment": campaign["environment"],
-                "native_only": any((a.get("evidence") or {}).get("native_only") is True for a in campaign["attempts"].values()),
+                "execution_profile": campaign.get("execution_profile", "local_single_host"),
+                "native_only": bool(campaign.get("native_only")) or any((a.get("evidence") or {}).get("native_only") is True for a in campaign["attempts"].values()),
                 "configs": {k: a["config_sha256"] for k, a in sorted(campaign["attempts"].items()) if a["config_sha256"]}}
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:12]
 
@@ -108,6 +109,7 @@ def build(board: Path = BOARD, sources: set[str] | None = None) -> tuple[list[di
         campaigns[(path.parts[-4], data["id"])] = {
             "campaign_id": data["id"], "system": data["system"], "folder": path.parts[-4], "machine": data["machine"],
             "hosted": meta.get("hosted", "no"), "native_only": bool(data.get("native_only", False)),
+            "execution_profile": data.get("execution_profile", "local_single_host"),
             "preset": data["preset"], "scenarios": data["scenarios"], "started": data["started"], "finished": data["finished"],
             "aborted": data["aborted"], "server": data["server"], "source": source, "expected": data["attempts"],
             "version": data["version"], "dirty": data["source"]["dirty"], "changed_during_run": data["source"]["changed_during_run"],
@@ -161,6 +163,8 @@ def build(board: Path = BOARD, sources: set[str] | None = None) -> tuple[list[di
         for field in PROVENANCE:
             if data[field] != campaign[field]:
                 campaign["conflicts"].append(f"{SCENARIOS[key]}: {field} differs from the campaign record")
+        if data.get("execution_profile", "local_single_host") != campaign.get("execution_profile", "local_single_host"):
+            campaign["conflicts"].append(f"{SCENARIOS[key]}: execution_profile differs from the campaign record")
         if campaign["tags"] is None:
             campaign["tags"] = data["tags"]
         campaign["dirty"] = campaign["dirty"] or data["source"]["dirty"]

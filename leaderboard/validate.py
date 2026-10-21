@@ -30,6 +30,8 @@ FIELDS = {
 }
 # Hosted results add these. service holds only requested, non-secret settings.
 HOSTED_FIELDS = {"region": str, "rtt_ms": float, "client_location": str, "service": dict}
+OPTIONAL_FIELDS = {"execution_profile": str}
+EXECUTION_PROFILES = ("local_single_host", "economic_single_vm", "paper_separated_vms")
 SERVICE_KEYS = {"region", "pg_version", "endpoint_type", "cpu_millis", "memory_gbs", "instance_type", "image",
                 "replicas", "scale_to_zero_minutes"}
 SECRET_KEY = re.compile(r"pass(word)?|secret|token|api[-_]?key|credential", re.I)
@@ -92,9 +94,12 @@ def validate(path: Path, board: Path = BOARD) -> list[str]:
     fields = FIELDS | HOSTED_FIELDS if data.get("hosted") == "yes" else FIELDS
     if missing := sorted(fields.keys() - data.keys()):
         problems.append(f"missing keys: {missing}")
-    if unexpected := sorted(data.keys() - fields.keys()):
+    if unexpected := sorted(data.keys() - fields.keys() - OPTIONAL_FIELDS.keys()):
         problems.append(f"unexpected keys: {unexpected}")
-    problems += [f"{k} must be {t.__name__}" for k, t in fields.items() if k in data and not has_type(data[k], t)]
+    all_fields = fields | OPTIONAL_FIELDS
+    problems += [f"{k} must be {t.__name__}" for k, t in all_fields.items() if k in data and not has_type(data[k], t)]
+    if "execution_profile" in data and data["execution_profile"] not in EXECUTION_PROFILES:
+        problems.append(f"execution_profile must be one of {EXECUTION_PROFILES}")
     if problems:
         return problems  # the checks below rely on every key being present and typed
 
