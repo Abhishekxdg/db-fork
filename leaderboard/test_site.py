@@ -1137,6 +1137,10 @@ class AwsAlphaLifecycle(Board):
         import time as _time
 
         six_hr_plus_ts = int(_time.time()) - 21601
+        wait_script_under_test = rel_fail_calls[0][-1].replace(
+            "/var/lib/branchbench-alpha-ready", str(fake_home / "ready_marker")
+        )
+        (fake_home / "ready_marker").write_text("ok\n")
         for bad_or_active_owner in (
             f"foreign_token:{six_hr_plus_ts}:86400\n",
             f"foreign_token:{six_hr_plus_ts}\n",
@@ -1148,10 +1152,22 @@ class AwsAlphaLifecycle(Board):
             "foreign_token:0:86400\n",
             f": {six_hr_plus_ts}:86400\n",
             f"foreign_token:{six_hr_plus_ts}:86400:extra\n",
+            f"foreign:1:1\nforeign:{int(_time.time())}:86400",
         ):
+            (fake_home / "db-fork.alpha.owner").write_text(bad_or_active_owner)
             (runs_sub / "alpha.owner").write_text(bad_or_active_owner)
             with self.assertRaisesRegex(micro.RunError, "another alpha sync/benchmark session owns this worker"):
                 micro.check_alpha_lease(runs_sub)
+            ws_res = subprocess.run(
+                ["bash", "-c", wait_script_under_test],
+                env={**os.environ, "HOME": str(fake_home)},
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(ws_res.returncode, 42, f"wait_script must exit 42 for {bad_or_active_owner!r}")
+            self.assertEqual((fake_home / "db-fork.alpha.owner").read_text(), bad_or_active_owner)
+            self.assertEqual((runs_sub / "alpha.owner").read_text(), bad_or_active_owner)
+        (fake_home / "db-fork.alpha.owner").unlink(missing_ok=True)
         (runs_sub / "alpha.owner").unlink(missing_ok=True)
 
         collapse_verify_fail_calls = []

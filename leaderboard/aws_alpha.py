@@ -1165,8 +1165,8 @@ def run_alpha_benchmarks(
             "lock_fd 8 || exit 42; "
             "for owner_file in ~/db-fork.alpha.owner ~/db-fork/leaderboard/.runs/alpha.owner; do "
             'if [ -f "$owner_file" ]; then '
-            '[ "$(wc -l < "$owner_file" 2>/dev/null | tr -d " ")" -le 1 ] || exit 42; '
-            'owner_raw="$(head -n 1 "$owner_file" 2>/dev/null)"; '
+            'owner_raw="$(cat "$owner_file" 2>/dev/null)" || exit 42; '
+            "case \"$owner_raw\" in ''|*[[:space:]]*) exit 42 ;; esac; "
             'colon_cnt="$(printf "%s" "$owner_raw" | tr -cd ":" | wc -c | tr -d " ")"; '
             'owner_tok="$(printf "%s" "$owner_raw" | cut -d: -f1)"; '
             'owner_ts="$(printf "%s" "$owner_raw" | cut -d: -f2)"; '

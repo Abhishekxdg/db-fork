@@ -167,10 +167,10 @@ def check_alpha_lease(runs_dir: Path = RUNS) -> None:
             raw = owner_path.read_text(encoding="utf-8").strip()
         except OSError:
             continue
-        if not raw or ":" not in raw or "\n" in raw:
+        if not raw or ":" not in raw or any(ch.isspace() for ch in raw):
             raise RunError("another alpha sync/benchmark session owns this worker")
         parts = raw.split(":")
-        if len(parts) not in (2, 3) or not parts[0].strip():
+        if len(parts) not in (2, 3) or not parts[0]:
             raise RunError("another alpha sync/benchmark session owns this worker")
         owner_token = parts[0]
         try:
