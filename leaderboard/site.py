@@ -140,7 +140,12 @@ def published_verbs(board: Path, manifest: dict[str, list[str]]) -> tuple[list[d
             raise SiteError(f"{rel}: invalid: {'; '.join(problems)}; an invalid verbs record is never published")
     if not selected:
         return [], []
-    return verbs_lane.build_verbs(board, sources=set(selected))
+    entries, excluded = verbs_lane.build_verbs(board, sources=set(selected))
+    if len({e.get("execution_profile", "local_single_host") for e in entries}) > 1:
+        raise SiteError(
+            "publish.json: verbs records mix different execution_profile values; official verbs results must share one execution profile"
+        )
+    return entries, excluded
 
 
 def published(board: Path, manifest: dict[str, list[str]]) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
@@ -159,6 +164,10 @@ def published(board: Path, manifest: dict[str, list[str]]) -> tuple[list[dict], 
     for field in ("commit", "lock_sha256", "python"):
         if len({e[field] for e in micro}) > 1:
             raise SiteError(f"publish.json: micro records mix different {field} values; official micro results must share one revision and runtime")
+    if len({e.get("execution_profile", "local_single_host") for e in micro}) > 1:
+        raise SiteError(
+            "publish.json: micro records mix different execution_profile values; official micro results must share one execution profile"
+        )
     if len({e["machine"] for e in micro if e.get("hosted") == "no"}) > 1:
         raise SiteError("publish.json: self-hosted micro records mix different machine labels; official self-hosted micro results must share one machine")
     campaigns, macro_excluded = build_macro.build(board, sources=set(manifest["macro"]))

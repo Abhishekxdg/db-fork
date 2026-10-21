@@ -956,6 +956,45 @@ def reconstruct_synced_git_index(repo_dir: Path) -> None:
         raise AlphaError(f"synced repository {repo_dir} is not clean after index reconstruction: {st.stdout.strip()}")
 
 
+def build_activate_sync_script(sync_dir: str = "~/db-fork.sync") -> str:
+    """Return the shell script that validates a staged sync directory, preserves .runs and results, and swaps ~/db-fork."""
+    return (
+        f"git -C {sync_dir} read-tree HEAD && "
+        f"git -C {sync_dir} update-index -q --refresh && "
+        f'test -z "$(git -C {sync_dir} status --porcelain -- leaderboard microbench macrobench dblib util pyproject.toml uv.lock build_protos.py)" && '
+        "if [ ! -d ~/db-fork ] && [ -d ~/db-fork.prev ]; then mv ~/db-fork.prev ~/db-fork || exit 1; fi && "
+        "if [ -d ~/db-fork ]; then "
+        "if [ -d ~/db-fork/leaderboard/.runs ]; then "
+        "flock -n ~/db-fork/leaderboard/.runs/batch.lock -c true || exit 42; "
+        "flock -n ~/db-fork/leaderboard/.runs/run.lock -c true || exit 42; "
+        "for f in ~/db-fork/leaderboard/.runs/*.journal.json ~/db-fork/leaderboard/.runs/*.active.json; do "
+        '[ -e "$f" ] && exit 43; '
+        "done; "
+        f"rm -rf {sync_dir}/leaderboard/.runs || exit 1; "
+        f"cp -a ~/db-fork/leaderboard/.runs {sync_dir}/leaderboard/.runs || exit 1; "
+        "fi && "
+        "for sub in results macro verbs; do "
+        "for d in ~/db-fork/leaderboard/*/$sub; do "
+        '[ -d "$d" ] || continue; '
+        'sys_dir="$(basename "$(dirname "$d")")"; '
+        f'mkdir -p {sync_dir}/leaderboard/"$sys_dir" || exit 1; '
+        f'cp -a "$d" {sync_dir}/leaderboard/"$sys_dir"/ || exit 1; '
+        "done; "
+        "done; "
+        "fi && "
+        "rm -rf ~/db-fork.prev && "
+        "if [ -d ~/db-fork ]; then mv ~/db-fork ~/db-fork.prev || exit 1; fi && "
+        f"if ! mv {sync_dir} ~/db-fork; then "
+        "if [ -d ~/db-fork.prev ] && [ ! -e ~/db-fork ]; then mv ~/db-fork.prev ~/db-fork || true; fi; "
+        "exit 1; "
+        "fi && "
+        "if [ -d ~/db-fork.prev/.venv ] && [ ! -e ~/db-fork/.venv ]; then "
+        "mv ~/db-fork.prev/.venv ~/db-fork/.venv || true; "
+        "fi && "
+        "rm -rf ~/db-fork.prev"
+    )
+
+
 def _is_linux_x86_64_elf(path: Path) -> bool:
     """Return True iff path is a regular file with a 64-bit little-endian x86_64 ELF header."""
     try:
@@ -1060,12 +1099,23 @@ def run_alpha_benchmarks(
     ssh_target = f"ubuntu@{public_ip}"
     ssh_rsh = f"ssh {' '.join(shlex.quote(o) for o in ssh_opts)}"
     collapse_failed = False
+    collapse_armed = False
+    sync_token = f"{os.getpid()}_{int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)}"
+    sync_dir = f"~/db-fork.sync.{sync_token}"
 
     try:
-        # 1. Wait for cloud-init bootstrap marker on the worker, ensure no lock or recovery journal is active, and prepare ~/db-fork.sync
+        # 1. Wait for cloud-init bootstrap marker on the worker, ensure no lock or recovery journal is active, claim sync lease, and prepare staging dir
         wait_script = (
             "for i in $(seq 1 90); do "
             "if [ -f /var/lib/branchbench-alpha-ready ]; then "
+            "exec 9>~/db-fork.alpha.lock; "
+            "flock -n 9 || exit 42; "
+            "if [ -f ~/db-fork.alpha.owner ]; then "
+            'owner_ts="$(cut -d: -f2 ~/db-fork.alpha.owner 2>/dev/null || echo 0)"; '
+            'now_ts="$(date +%s)"; '
+            'if [ "$((now_ts - owner_ts))" -lt 21600 ]; then exit 42; fi; '
+            "fi; "
+            "if [ ! -d ~/db-fork ] && [ -d ~/db-fork.prev ]; then mv ~/db-fork.prev ~/db-fork || exit 1; fi; "
             "if [ -d ~/db-fork/leaderboard/.runs ]; then "
             "flock -n ~/db-fork/leaderboard/.runs/batch.lock -c true || exit 42; "
             "flock -n ~/db-fork/leaderboard/.runs/run.lock -c true || exit 42; "
@@ -1073,7 +1123,8 @@ def run_alpha_benchmarks(
             '[ -e "$f" ] && exit 43; '
             "done; "
             "fi; "
-            "rm -rf ~/db-fork.sync && mkdir -p ~/db-fork.sync && exit 0; "
+            f'printf "%s:%s\\n" {shlex.quote(sync_token)} "$(date +%s)" >~/db-fork.alpha.owner && '
+            f"rm -rf {sync_dir} && mkdir -p {sync_dir} && exit 0; "
             "fi; "
             "sleep 5; "
             "done; exit 1"
@@ -1097,8 +1148,9 @@ def run_alpha_benchmarks(
             raise AlphaError(
                 f"timed out waiting for cloud-init bootstrap (/var/lib/branchbench-alpha-ready) on {ssh_target}"
             )
+        collapse_armed = True
 
-        # 2. Sync only git-tracked regular files and safe .git metadata into ~/db-fork.sync/ (portable across GNU rsync and macOS openrsync)
+        # 2. Sync only git-tracked regular files and safe .git metadata into per-invocation staging dir (portable across GNU rsync and macOS openrsync)
         filelist_path = write_sync_filelist(runs_dir, stack, ROOT)
         try:
             sync_up = [
@@ -1108,10 +1160,10 @@ def run_alpha_benchmarks(
                 "-e",
                 ssh_rsh,
                 f"{ROOT}/",
-                f"{ssh_target}:~/db-fork.sync/",
+                f"{ssh_target}:{sync_dir}/",
             ]
             if cmd_runner(sync_up).returncode != 0:
-                raise AlphaError(f"failed to rsync repository to {ssh_target}:~/db-fork.sync/")
+                raise AlphaError(f"failed to rsync repository to {ssh_target}:{sync_dir}/")
         finally:
             filelist_path.unlink(missing_ok=True)
 
@@ -1156,7 +1208,7 @@ def run_alpha_benchmarks(
             if cmd_runner(seekdb_sync).returncode != 0:
                 raise AlphaError(f"failed to rsync SeekDB binary from {seekdb_local} to {ssh_target}")
 
-        # 3. Reconstruct .git/index in ~/db-fork.sync, preserve .runs and existing results/macro/verbs, swap into ~/db-fork, and execute worker
+        # 3. Reconstruct .git/index in staging dir, preserve .runs and existing results/macro/verbs, swap into ~/db-fork, and execute worker under lock
         env_stdin = "".join(
             f"export {k}={shlex.quote(os.environ[k])}\n"
             for k in HOSTED_ENV_KEYS
@@ -1164,36 +1216,12 @@ def run_alpha_benchmarks(
             if val
         )
         deadman_min = max(15, int(batch_deadline_min) + 15)
-        activate_sync = (
-            "git -C ~/db-fork.sync read-tree HEAD && "
-            "git -C ~/db-fork.sync update-index -q --refresh && "
-            'test -z "$(git -C ~/db-fork.sync status --porcelain -- leaderboard microbench macrobench dblib util pyproject.toml uv.lock build_protos.py)" && '
-            "if [ -d ~/db-fork ]; then "
-            "if [ -d ~/db-fork/leaderboard/.runs ]; then "
-            "flock -n ~/db-fork/leaderboard/.runs/batch.lock -c true && "
-            "flock -n ~/db-fork/leaderboard/.runs/run.lock -c true && "
-            "rm -rf ~/db-fork.sync/leaderboard/.runs && "
-            "mv ~/db-fork/leaderboard/.runs ~/db-fork.sync/leaderboard/.runs; "
-            "fi && "
-            "for sub in results macro verbs; do "
-            "for d in ~/db-fork/leaderboard/*/$sub; do "
-            '[ -d "$d" ] || continue; '
-            'sys_dir="$(basename "$(dirname "$d")")"; '
-            'mkdir -p ~/db-fork.sync/leaderboard/"$sys_dir" && '
-            'cp -a "$d" ~/db-fork.sync/leaderboard/"$sys_dir"/; '
-            "done; "
-            "done && "
-            "if [ -d ~/db-fork/.venv ] && [ ! -e ~/db-fork.sync/.venv ]; then "
-            "mv ~/db-fork/.venv ~/db-fork.sync/.venv; "
-            "fi; "
-            "fi && "
-            "rm -rf ~/db-fork.prev && "
-            "if [ -d ~/db-fork ]; then mv ~/db-fork ~/db-fork.prev; fi && "
-            "mv ~/db-fork.sync ~/db-fork && "
-            "rm -rf ~/db-fork.prev"
-        )
+        activate_sync = build_activate_sync_script(sync_dir)
         remote_steps = [
             'export PATH="$HOME/.local/bin:$PATH"',
+            "exec 9>~/db-fork.alpha.lock",
+            "flock -n 9 || exit 42",
+            f'trap "rm -rf {sync_dir} ~/db-fork.alpha.owner" EXIT',
             f"sudo -n /sbin/shutdown -P +{deadman_min} >/dev/null 2>&1",
             *(["eval \"$(cat)\""] if env_stdin else []),
             activate_sync,
@@ -1208,6 +1236,11 @@ def run_alpha_benchmarks(
             run_res = cmd_runner(ssh_run_cmd, input=env_stdin, text=True)
         else:
             run_res = cmd_runner(ssh_run_cmd)
+        if run_res.returncode in (42, 43):
+            collapse_armed = False
+            raise AlphaError(
+                f"remote worker {ssh_target} rejected activation due to an active benchmark lock or recovery journal (exit {run_res.returncode})"
+            )
 
         # 4. Pull results, macro, and verbs records back to local leaderboard/ even if a benchmark step failed
         pull_cmd = [
@@ -1233,7 +1266,7 @@ def run_alpha_benchmarks(
 
         rc = run_res.returncode
     finally:
-        if collapse_after:
+        if collapse_after and collapse_armed:
             col_res = collapse_alpha(aws=aws, stack=stack, board=board, runs_dir=runs_dir, keep_local_site=True)
             if not col_res.get("collapsed", True):
                 collapse_failed = True

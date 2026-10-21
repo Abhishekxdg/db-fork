@@ -971,10 +971,43 @@ class AwsAlphaLifecycle(Board):
                 self.aws_alpha.run_alpha_benchmarks(
                     aws=aws,
                     stack="branchbench-alpha",
+                    collapse_after=True,
                     board=self.board,
                     runs_dir=self.runs,
                     cmd_runner=lambda cmd, rc=code, **_kw: subprocess.CompletedProcess(cmd, rc, stdout="", stderr=""),
                 )
+            self.assertTrue(
+                (self.runs / "aws_alpha_state.json").is_file(),
+                "rejected duplicate invocation must NOT collapse the active worker even when collapse_after=True",
+            )
+            self.assertEqual(self.cloud["instances"][0]["State"]["Name"], "running")
+
+        # 3b. Activation script preserves original results on cp failure and restores ~/db-fork on final rename failure
+        fake_home = self.board / "fake_home"
+        old_repo = fake_home / "db-fork"
+        (old_repo / "leaderboard" / ".runs").mkdir(parents=True, exist_ok=True)
+        (old_repo / "leaderboard" / ".runs" / "file_copy.prev_method").write_text("reflink\n")
+        (old_repo / "leaderboard" / "dolt" / "results" / "20261020").mkdir(parents=True, exist_ok=True)
+        sole_result = old_repo / "leaderboard" / "dolt" / "results" / "20261020" / "box.json"
+        sole_result.write_text('{"ok": true}\n')
+        staged_repo = fake_home / "db-fork.sync.t1"
+        shutil.copytree(dst_repo, staged_repo)
+        # Make destination results dir read-only so cp -a into staged_repo fails
+        ro_target = staged_repo / "leaderboard" / "dolt"
+        ro_target.mkdir(parents=True, exist_ok=True)
+        ro_target.chmod(0o500)
+        try:
+            act_res = subprocess.run(
+                ["bash", "-c", self.aws_alpha.build_activate_sync_script("~/db-fork.sync.t1")],
+                env={**os.environ, "HOME": str(fake_home)},
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(act_res.returncode, 0)
+            self.assertTrue(sole_result.is_file(), "sole old result in ~/db-fork survives failed preservation copy")
+            self.assertTrue((old_repo / "leaderboard" / ".runs" / "file_copy.prev_method").is_file())
+        finally:
+            ro_target.chmod(0o700)
 
         # 4. Bucket tag inspection failure (get-bucket-tagging rc=1) causes collapse_alpha to report collapsed=False
         self.cloud["buckets"].add("branchbench-alpha-unreadable-tags")

@@ -314,11 +314,18 @@ class RunLifecycle(unittest.TestCase):
         self.assertTrue(any("unexpected point" in p for p in verbs.validate_verbs(bad_file, self.board)))
         bad_file.unlink()
 
-        # reps=None, warmup=None, and invalid execution_profile are rejected by validate_verbs
+        # reps=None, warmup=None, missing axes, and invalid execution_profile are rejected by validate_verbs
         for bad_patch in ({"reps": None}, {"warmup": None}, {"execution_profile": "bogus_profile"}):
             bad_rec = {**json.loads(written[0].read_text()), "run_id": "bb_00000002", **bad_patch}
             bad_file.write_text(json.dumps(bad_rec))
             self.assertNotEqual(verbs.validate_verbs(bad_file, self.board), [])
+        no_axes = json.loads(written[0].read_text())
+        no_axes["run_id"] = "bb_00000002"
+        no_axes.pop("axes", None)
+        bad_file.write_text(json.dumps(no_axes))
+        self.assertNotEqual(verbs.validate_verbs(bad_file, self.board), [])
+        _, ex_no_axes = verbs.build_verbs(self.board)
+        self.assertEqual(len(ex_no_axes), 1)
         bad_file.unlink()
 
         # build_verbs separates slots by execution_profile so economic_single_vm and local_single_host do not overwrite each other

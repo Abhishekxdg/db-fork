@@ -505,11 +505,14 @@ def validate_verbs(path: Path, board: Path = BOARD) -> list[str]:
     )
     if not verbs_ok:
         problems.append("verbs must be a non-empty list of valid verb names without duplicates")
-    axes_ok = axes_sel is None or (
-        isinstance(axes_sel, list)
-        and bool(axes_sel)
-        and all(isinstance(a, str) and a in valid_axes for a in axes_sel)
-        and len(set(axes_sel)) == len(axes_sel)
+    axes_ok = "axes" in data and (
+        axes_sel is None
+        or (
+            isinstance(axes_sel, list)
+            and bool(axes_sel)
+            and all(isinstance(a, str) and a in valid_axes for a in axes_sel)
+            and len(set(axes_sel)) == len(axes_sel)
+        )
     )
     if not axes_ok:
         problems.append("axes must be null or a non-empty list of valid axis names without duplicates")
@@ -572,7 +575,7 @@ def build_verbs(board: Path = BOARD, sources: set[str] | None = None) -> tuple[l
             str(data.get("execution_profile") or "local_single_host"),
             bool(data.get("native_only", False)),
             tuple(data["verbs"]),
-            tuple(data["axes"] or ()),
+            tuple(data.get("axes") or ()),
             int(data["reps"]),
             int(data["warmup"]),
         )

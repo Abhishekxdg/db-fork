@@ -14,12 +14,19 @@ from leaderboard.validate import BOARD, validate
 
 
 def newest(board: Path, sources: set[str] | None = None) -> list[Path]:
-    """For each system and machine, the file in the newest date directory, among
-    every result file or only the given board-relative sources."""
-    found: dict[tuple[str, str], Path] = {}
+    """For each system, machine, and execution profile, the file in the newest date directory,
+    among every result file or only the given board-relative sources."""
+    found: dict[tuple[str, str, str], Path] = {}
     for path in sorted(board.glob("*/results/*/*.json")):  # YYYYMMDD directories sort by date
         if sources is None or path.relative_to(board).as_posix() in sources:
-            found[path.parts[-4], path.stem] = path
+            profile = "local_single_host"
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict) and isinstance(raw.get("execution_profile"), str):
+                    profile = raw["execution_profile"]
+            except Exception:
+                pass
+            found[path.parts[-4], path.stem, profile] = path
     return list(found.values())
 
 
