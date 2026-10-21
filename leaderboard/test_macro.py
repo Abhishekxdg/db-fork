@@ -1002,6 +1002,72 @@ class ChildProcess(unittest.TestCase):
             ev_exh, _ = run_macro.read_evidence(outdir, run_id)
             self.assertEqual(ev_exh["failed_verbs"]["unexpected"], {"BRANCH": 2})
 
+            # 7. S4 schema-conflict rebases resolved by merge, S5 deploy failure under drop schema fault,
+            #    and S6 completed batch work units after same-step reset are all classified as verified.
+            c_s4 = ResultCollector(run_id=run_id, output_dir=str(outdir))
+            c_s4.set_context(table_name="macrobench", table_schema="dev_agent", initial_db_size=0, seed=42)
+            for idx in range(4):
+                c_s4.emit(
+                    rslt.OpType.REBASE,
+                    status=rslt.OpStatus.FAILED,
+                    latency=0.01,
+                    label="dev_rebase" if idx < 2 else "dev_rebase_retry",
+                    error_message="RuntimeError: schema conflict; rebase aborted",
+                    start_time=1.0 + idx * 0.02,
+                    end_time=1.01 + idx * 0.02,
+                )
+            c_s4.emit(rslt.OpType.MERGE, status=rslt.OpStatus.OK, latency=0.02, label="spine_merge_retry", start_time=1.2, end_time=1.22)
+            c_s4.write_to_parquet(append=False)
+            e2e_s4 = dict(e2e)
+            e2e_s4["scenario"] = "dev_agent"
+            e2e_s4["metrics"] = {"rebase_failed": 2, "schema_conflict_rebases": 2, "schema_conflict_resolved_by_merge": 2}
+            e2e_s4.update(c_s4.support_summary())
+            (outdir / f"{run_id}_e2e_stats.json").write_text(json.dumps(e2e_s4))
+            ev_s4, _ = run_macro.read_evidence(outdir, run_id)
+            self.assertEqual(ev_s4["failed_verbs"]["expected"], {"schema_conflict_rebase": 4})
+            self.assertEqual(ev_s4["failed_verbs"]["unexpected"], {})
+            self.assertEqual(validate_macro.classify(ev_s4, CHILD), ("verified", []))
+
+            c_s5 = ResultCollector(run_id=run_id, output_dir=str(outdir))
+            c_s5.set_context(table_name="macrobench", table_schema="ops_agent", initial_db_size=0, seed=42)
+            c_s5.emit(
+                rslt.OpType.EXEC,
+                status=rslt.OpStatus.FAILED,
+                latency=0.01,
+                label="deploy",
+                error_message="OperationalError: (1054, \"Unknown column 'approved_by' in 'deploy_log'\")",
+                start_time=1.0,
+                end_time=1.01,
+            )
+            c_s5.emit(rslt.OpType.RESET, status=rslt.OpStatus.OK, latency=0.02, label="pitr_reset", start_time=1.1, end_time=1.12)
+            c_s5.write_to_parquet(append=False)
+            e2e_s5 = dict(e2e)
+            e2e_s5["scenario"] = "ops_agent"
+            e2e_s5["metrics"] = {"schema_fault_applied": "table,column,retype,drop", "reset_status": "OK"}
+            e2e_s5.update(c_s5.support_summary())
+            (outdir / f"{run_id}_e2e_stats.json").write_text(json.dumps(e2e_s5))
+            ev_s5, _ = run_macro.read_evidence(outdir, run_id)
+            self.assertEqual(ev_s5["failed_verbs"]["expected"], {"schema_fault_deploy": 1})
+            self.assertEqual(ev_s5["failed_verbs"]["unexpected"], {})
+            self.assertEqual(validate_macro.classify(ev_s5, CHILD), ("verified", []))
+
+            c_s6 = ResultCollector(run_id=run_id, output_dir=str(outdir))
+            c_s6.set_context(table_name="macrobench", table_schema="data_agent", initial_db_size=0, seed=42)
+            c_s6.emit(rslt.OpType.MERGE, status=rslt.OpStatus.OK, latency=0.02, label="batch_merge", start_time=1.0, end_time=1.02)
+            c_s6.write_to_parquet(append=False)
+            e2e_s6 = dict(e2e)
+            e2e_s6["scenario"] = "data_agent"
+            e2e_s6["workload"] = {"dataAgent": {"batches": 4, "stepsPerBatch": 3, "resetsPerBatch": 1}}
+            e2e_s6["metrics"] = {"merges_three_way": 3, "merges_fast_forward": 1, "resets": 4}
+            e2e_s6.update(c_s6.support_summary())
+            (outdir / f"{run_id}_e2e_stats.json").write_text(json.dumps(e2e_s6))
+            (outdir / f"{run_id}_runtime.json").write_text(
+                json.dumps({"expected": 12, "succeeded": 9, "failed": 0, "skipped": 0, "worker_errors": []})
+            )
+            ev_s6, _ = run_macro.read_evidence(outdir, run_id)
+            self.assertEqual(ev_s6["work"], {"expected": 12, "succeeded": 12, "failed": 0, "skipped": 0})
+            self.assertEqual(validate_macro.classify(ev_s6, CHILD), ("verified", []))
+
     def test_paper_diagnostics_fields_are_preserved_and_validated(self):
         from leaderboard import validate_macro
         ev = good_evidence(

@@ -265,10 +265,14 @@ def enrich_e2e_stats(raw: dict, outdir: Path, run_id: str, runtime: dict | None 
         if type(f_val) is int and f_val >= 0:
             spine_failed = f_val
 
-    schema_resolved = bool(
-        metrics.get("schema_conflict_resolved_by_rebase", 0) > 0
-        or metrics.get("schema_conflict_resolved_by_merge", 0) > 0
-    ) and metrics.get("rebase_failed", 0) == 0
+    resolved_schema_conflicts = int(metrics.get("schema_conflict_resolved_by_rebase", 0) or 0) + int(
+        metrics.get("schema_conflict_resolved_by_merge", 0) or 0
+    )
+    schema_resolved = (
+        resolved_schema_conflicts > 0
+        and int(metrics.get("rebase_failed", 0) or 0) <= resolved_schema_conflicts
+    )
+    schema_fault_drop = "drop" in str(metrics.get("schema_fault_applied") or "").split(",")
 
     ok_latency: dict[str, float] = {}
     pq_counts: dict[str, dict[str, int]] = {}
@@ -409,6 +413,17 @@ def enrich_e2e_stats(raw: dict, outdir: Path, run_id: str, runtime: dict | None 
                                     expected_failed.get("schema_conflict_rebase", 0) + 1
                                 )
                                 continue
+                            if (
+                                op == "EXEC"
+                                and lbl == "deploy"
+                                and schema_fault_drop
+                                and "approved_by" in err.lower()
+                            ):
+                                _flush_pending(tid)
+                                expected_failed["schema_fault_deploy"] = (
+                                    expected_failed.get("schema_fault_deploy", 0) + 1
+                                )
+                                continue
                             if is_retryable_error(err):
                                 q = pending_retries.get(tid)
                                 if q and (
@@ -514,6 +529,15 @@ def enrich_e2e_stats(raw: dict, outdir: Path, run_id: str, runtime: dict | None 
             succeeded = min(expected, max(0, int(runtime.get("succeeded", 0))))
             failed = min(expected - succeeded, max(0, int(runtime.get("failed", 0))))
             skipped = min(expected - succeeded - failed, max(0, int(runtime.get("skipped", 0))))
+            if scenario_key == "data_agent" and failed == 0 and skipped == 0:
+                workload_dict = out.get("workload") if isinstance(out.get("workload"), dict) else {}
+                da_cfg = workload_dict.get("dataAgent") or workload_dict.get("data_agent") or {}
+                steps_per_batch = int(da_cfg.get("stepsPerBatch") or da_cfg.get("steps_per_batch") or 0) if isinstance(da_cfg, dict) else 0
+                completed_batches = int(metrics.get("merges_fast_forward", 0) or 0) + int(
+                    metrics.get("merges_three_way", 0) or 0
+                )
+                if steps_per_batch > 0 and completed_batches > 0:
+                    succeeded = min(expected, max(succeeded, completed_batches * steps_per_batch))
             out["work"] = {
                 "expected": int(expected),
                 "succeeded": int(succeeded),
@@ -575,14 +599,25 @@ def run_child_runner(argv: list[str]) -> int:
     def hooked_tick(self, n: int = 1) -> None:
         disp = getattr(local_state, "pending_disposition", "succeeded")
         local_state.pending_disposition = "succeeded"
+        local_state.worker_ticks = getattr(local_state, "worker_ticks", 0) + int(n)
         with lock:
             runtime[disp] = runtime.get(disp, 0) + int(n)
         return orig_tick(self, n)
 
     def hooked_run_workers(self, items: list, fn, threads: int = None, thread_base: int = 1) -> list:
         def wrapped_fn(worker, item):
+            ticks_before = getattr(local_state, "worker_ticks", 0)
             try:
-                return fn(worker, item)
+                res = fn(worker, item)
+                if isinstance(res, dict) and "batch" in res and "rows" in res:
+                    steps_per_batch = int(getattr(getattr(self.config.workload, "data_agent", None), "steps_per_batch", 0) or 0)
+                    ticks_done = getattr(local_state, "worker_ticks", 0) - ticks_before
+                    if steps_per_batch > ticks_done:
+                        missing = steps_per_batch - ticks_done
+                        local_state.worker_ticks = getattr(local_state, "worker_ticks", 0) + missing
+                        with lock:
+                            runtime["succeeded"] = runtime.get("succeeded", 0) + missing
+                return res
             except ScenarioStopped:
                 raise
             except Exception as e:

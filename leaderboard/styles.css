@@ -536,6 +536,10 @@ body:has(.dialog[open]) { overflow: hidden; }
 .run-timings { min-width: 560px; }
 .run-timings tbody th { position: sticky; left: 0; z-index: 1; min-width: 190px; background: var(--surface); }
 :is(.check-table, .ops-table) :is(td, th) { text-align: left; }
+.check-table tbody th { min-width: 180px; }
+.check-table td:nth-child(2) { width: 1%; white-space: nowrap; }
+.check-table .status-chip { white-space: nowrap; }
+.check-table td:nth-child(3) { overflow-wrap: anywhere; }
 .why-table th:first-child { text-align: left; }
 .why-category > * { padding-top: 14px; }
 .why-category th { font-weight: 600; }
