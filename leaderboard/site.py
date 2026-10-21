@@ -37,7 +37,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from leaderboard import build, build_macro, mock
+from leaderboard import build, build_macro, mock, verbs as verbs_lane
 from leaderboard.validate import BOARD, MACHINE_RE, validate
 from leaderboard.validate_macro import MACRO_SUITE, OUTCOMES, SCENARIOS, VERBS
 
@@ -54,6 +54,7 @@ PAGES = {
 WORKFLOW_DIAGRAMS = tuple(f"workflow-diagrams/{key}.png" for key in ("rl_env", "context_mgmt", "multi_agent", "dev_agent", "ops_agent", "data_agent"))
 MICRO_RE = re.compile(r"[a-z0-9_]+/results/\d{8}/" + MACHINE_RE.pattern + r"\.json")
 MACRO_RE = re.compile(r"[a-z0-9_]+/macro/\d{8}/campaign_[0-9a-f]{8}\.json")
+VERBS_RE = verbs_lane.VERBS_RE
 SUITE_FIELDS = {"suite": str, "seed": int, "tries": int, "table": str, "range_size": int, "chain_length": int, "dataset": dict, "rows": list}
 
 
@@ -109,20 +110,37 @@ def read_suite(board: Path) -> dict:
 
 
 def read_manifest(board: Path) -> dict[str, list[str]]:
-    """publish.json: exact relative paths of official micro results and macro campaign
-    records. Shape and path syntax are checked here; what the paths point at is
-    checked by published()."""
+    """publish.json: exact relative paths of official micro results, macro campaign
+    records, and optional verbs scaling records. Shape and path syntax are checked here;
+    what the paths point at is checked by published()."""
     data = read_json(board, "publish.json", "publication manifest")
-    if set(data) != {"micro", "macro"} or not all(isinstance(v, list) and all(isinstance(s, str) for s in v) for v in data.values()):
-        raise SiteError("publish.json must be an object with exactly two lists of strings: micro and macro")
+    keys = set(data)
+    if not ({"micro", "macro"} <= keys <= {"micro", "macro", "verbs"}) or not all(
+        isinstance(v, list) and all(isinstance(s, str) for s in v) for v in data.values()
+    ):
+        raise SiteError("publish.json must be an object with lists of strings for micro and macro (and optionally verbs)")
+    data = {**data, "verbs": list(data.get("verbs", []))}
     for kind, pattern, shape in (("micro", MICRO_RE, "<system>/results/<YYYYMMDD>/<machine>.json"),
-                                 ("macro", MACRO_RE, "<system>/macro/<YYYYMMDD>/campaign_<id>.json")):
+                                 ("macro", MACRO_RE, "<system>/macro/<YYYYMMDD>/campaign_<id>.json"),
+                                 ("verbs", VERBS_RE, "<system>/verbs/<YYYYMMDD>/bb_<id>.json")):
         for entry in data[kind]:
             if not pattern.fullmatch(entry):
                 raise SiteError(f"publish.json: {kind} entry {entry!r} is not a relative {shape} path")
         if len(set(data[kind])) != len(data[kind]):
             raise SiteError(f"publish.json: {kind} lists a record twice")
     return data
+
+
+def published_verbs(board: Path, manifest: dict[str, list[str]]) -> tuple[list[dict], list[dict]]:
+    selected = list(manifest.get("verbs", []))
+    for rel in selected:
+        plain_file(board, rel)
+    for rel in selected:
+        if problems := verbs_lane.validate_verbs(board / rel, board):
+            raise SiteError(f"{rel}: invalid: {'; '.join(problems)}; an invalid verbs record is never published")
+    if not selected:
+        return [], []
+    return verbs_lane.build_verbs(board, sources=set(selected))
 
 
 def published(board: Path, manifest: dict[str, list[str]]) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
@@ -132,7 +150,7 @@ def published(board: Path, manifest: dict[str, list[str]]) -> tuple[list[dict], 
     newer selected error record still supersedes an older selected success. Only
     selected campaign records are heads, each named once, and each must pass the
     builder's validation and be a full run."""
-    for rel in manifest["micro"] + manifest["macro"]:
+    for rel in manifest["micro"] + manifest["macro"] + manifest.get("verbs", []):
         plain_file(board, rel)
     for rel in manifest["micro"]:
         if problems := validate(board / rel, board):
@@ -164,13 +182,26 @@ def everything(board: Path) -> tuple[list[dict], list[dict], list[dict], list[di
     return entries, excluded, campaigns, macro_excluded
 
 
-def raw_files(entries: list[dict], excluded: list[dict], campaigns: list[dict], macro_excluded: list[dict], phase: str) -> set[str]:
+def raw_files(
+    entries: list[dict],
+    excluded: list[dict],
+    campaigns: list[dict],
+    macro_excluded: list[dict],
+    phase: str,
+    verbs_entries: list[dict] = (),
+    verbs_excluded: list[dict] = (),
+) -> set[str]:
     """The record files the page links to: in prod only validated records and error
     records, in alpha and local every file the builders saw."""
-    files = {e["source"] for e in entries} | {x["source"] for x in excluded} | {c["source"] for c in campaigns}
+    files = (
+        {e["source"] for e in entries}
+        | {x["source"] for x in excluded}
+        | {c["source"] for c in campaigns}
+        | {v["source"] for v in verbs_entries}
+    )
     files |= {a["source"] for c in campaigns for a in c["attempts"].values()}
     if phase != "prod":
-        files |= {x["source"] for x in macro_excluded}
+        files |= {x["source"] for x in macro_excluded} | {x["source"] for x in verbs_excluded}
     return files
 
 
@@ -203,16 +234,31 @@ def assemble(phase: str, board: Path = BOARD) -> Path:
     target = output_dir(board, phase)
     suite = read_suite(board)
     sidecars(board)
-    entries, excluded, campaigns, macro_excluded = published(board, read_manifest(board)) if phase == "prod" else everything(board)
+    if phase == "prod":
+        manifest = read_manifest(board)
+        entries, excluded, campaigns, macro_excluded = published(board, manifest)
+        verbs_entries, verbs_excluded = published_verbs(board, manifest)
+    else:
+        entries, excluded, campaigns, macro_excluded = everything(board)
+        verbs_entries, verbs_excluded = verbs_lane.build_verbs(board)
     target.parent.mkdir(exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{phase}-", dir=target.parent))
     try:
         macro_suite = {"suite": MACRO_SUITE, "scenarios": SCENARIOS, "outcomes": list(OUTCOMES), "verbs": list(VERBS)}
         js = lambda pairs: "".join(f"const {name} = {json.dumps(value, indent=1)};\n" for name, value in pairs)
         rows = entries + (mock.entries(board) if phase == "local" else [])
-        (staging / "data.js").write_text(js((("site", {"phase": phase}), ("suite", suite), ("data", rows), ("excluded", excluded))))
+        (staging / "data.js").write_text(
+            js((
+                ("site", {"phase": phase}),
+                ("suite", suite),
+                ("data", rows),
+                ("excluded", excluded),
+                ("verbs", verbs_entries),
+                ("verbsExcluded", verbs_excluded),
+            ))
+        )
         (staging / "macro-data.js").write_text(js((("macroSuite", macro_suite), ("macroCampaigns", campaigns), ("macroExcluded", macro_excluded))))
-        for rel in [*PAGES[phase], *WORKFLOW_DIAGRAMS, *sorted(raw_files(entries, excluded, campaigns, macro_excluded, phase))]:
+        for rel in [*PAGES[phase], *WORKFLOW_DIAGRAMS, *sorted(raw_files(entries, excluded, campaigns, macro_excluded, phase, verbs_entries, verbs_excluded))]:
             (staging / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(plain_file(board, rel), staging / rel)
     except BaseException:

@@ -13,7 +13,7 @@ if [ "$(uname -s)" = "Linux" ]; then
         aarch64|arm64) platform="linux-arm64" ;;
         *) echo "Unsupported Linux architecture for doltgres: $arch" >&2; exit 1 ;;
     esac
-    ver="${DOLTGRES_VERSION:-v0.54.10}"
+    ver="${DOLTGRES_VERSION:-v1.4.0}"
     dest="$HOME/doltgres-1.4.0/dl"
     mkdir -p "$dest" "$HOME/.local/bin"
     url="https://github.com/dolthub/doltgresql/releases/download/${ver}/doltgresql-${platform}.tar.gz"

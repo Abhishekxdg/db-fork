@@ -229,12 +229,26 @@ class RunLifecycle(unittest.TestCase):
 
     def test_verbs_wrapper_runs_microbench_verbs_with_lifecycle(self):
         from leaderboard import verbs
+        from microbench.verbs.grid import points_for_run
         self.server.version.return_value = "v1.0"
         self.server.exists.return_value = False
         self.start_server.side_effect = lambda _: (
             runner.RUNS.mkdir(parents=True, exist_ok=True),
             (runner.RUNS / "dolt.pid").write_text(str(os.getpid())),
         )
+        expected_pts = [pt.id for pt in points_for_run(1, ["branch", "commit"], None)]
+
+        def fake_verbs_child(cmd, *, cwd, env, timeout=None):
+            outdir = Path(cmd[cmd.index("--outdir") + 1])
+            (outdir / "micro_verbs_dolt_w1_stats.json").write_text(json.dumps({
+                "status": "completed",
+                "points": [
+                    {"id": pid, "verb": pid.split(":")[0], "status": "ok", "failed": 0, "latency": {"n": 10, "p50": 0.01}}
+                    for pid in expected_pts
+                ],
+            }))
+            return subprocess.CompletedProcess(cmd, 0, stdout="ok\n")
+
         with (
             mock.patch.object(verbs, "ROOT", self.root),
             mock.patch.object(verbs.run_macro, "ROOT", self.root),
@@ -243,11 +257,7 @@ class RunLifecycle(unittest.TestCase):
             mock.patch.object(verbs, "load_connector", return_value=self.server),
             mock.patch.object(verbs.run_macro, "port_answers", return_value=False),
             mock.patch.object(verbs.run_macro, "pid_alive", return_value=False),
-            mock.patch.object(
-                verbs,
-                "launch_verbs_child",
-                return_value=subprocess.CompletedProcess(["python", "-m", "microbench.verbs"], 0, stdout="ok\n"),
-            ) as proc_run,
+            mock.patch.object(verbs, "launch_verbs_child", side_effect=fake_verbs_child) as proc_run,
         ):
             rc = verbs.run("dolt", 1, "box", self.board, verbs=["branch", "commit"], native_only=True)
         self.assertEqual(rc, 0)
@@ -260,6 +270,60 @@ class RunLifecycle(unittest.TestCase):
         self.assertEqual(record["system"], "Doltgres")
         self.assertEqual(record["scale"], 1)
         self.assertTrue(record["native_only"])
+        self.assertEqual(record["outcome"]["status"], "verified")
+        self.assertEqual(record["server"], {"started_here": True, "stop": "stopped"})
+        self.assertEqual(verbs.validate_verbs(written[0], self.board), [])
+        entries, excluded = verbs.build_verbs(self.board)
+        self.assertEqual((len(entries), len(excluded)), (1, 0))
+
+    def test_verbs_wrapper_rejects_missing_stats_failed_points_stop_failure_and_ambient_native_only(self):
+        from leaderboard import verbs
+        self.server.version.return_value = "v1.0"
+        self.server.exists.return_value = False
+        self.start_server.side_effect = lambda _: (
+            runner.RUNS.mkdir(parents=True, exist_ok=True),
+            (runner.RUNS / "dolt.pid").write_text(str(os.getpid())),
+        )
+        with mock.patch.dict(os.environ, {"DBFORK_NATIVE_ONLY": "1"}):
+            with self.assertRaisesRegex(runner.RunError, "DBFORK_NATIVE_ONLY"):
+                verbs.run("dolt", 1, "box", self.board, verbs=["branch"])
+        with (
+            mock.patch.object(verbs, "ROOT", self.root),
+            mock.patch.object(verbs.run_macro, "ROOT", self.root),
+            mock.patch.object(verbs, "BOARD", self.board),
+            mock.patch.object(verbs, "VERB_RUNS", self.board / ".runs" / "verbs"),
+            mock.patch.object(verbs, "load_connector", return_value=self.server),
+            mock.patch.object(verbs.run_macro, "port_answers", return_value=False),
+            mock.patch.object(verbs.run_macro, "pid_alive", return_value=False),
+            mock.patch.object(
+                verbs,
+                "launch_verbs_child",
+                return_value=subprocess.CompletedProcess(["python", "-m", "microbench.verbs"], 0, stdout="ok\n"),
+            ),
+        ):
+            rc = verbs.run("dolt", 1, "box", self.board, verbs=["branch"])
+        self.assertEqual(rc, 1, "missing stats file must not succeed even if child exit code is 0")
+        written = list((self.board / "dolt" / "verbs").rglob("bb_*.json"))
+        self.assertEqual(len(written), 1)
+        self.assertNotEqual(verbs.validate_verbs(written[0], self.board), [])
+
+        # KeyboardInterrupt during child execution still runs verified_cleanup and server stop
+        self.server.delete.reset_mock()
+        self.lifecycle.reset_mock()
+        with (
+            mock.patch.object(verbs, "ROOT", self.root),
+            mock.patch.object(verbs.run_macro, "ROOT", self.root),
+            mock.patch.object(verbs, "BOARD", self.board),
+            mock.patch.object(verbs, "VERB_RUNS", self.board / ".runs" / "verbs"),
+            mock.patch.object(verbs, "load_connector", return_value=self.server),
+            mock.patch.object(verbs.run_macro, "port_answers", return_value=False),
+            mock.patch.object(verbs.run_macro, "pid_alive", return_value=False),
+            mock.patch.object(verbs, "launch_verbs_child", side_effect=KeyboardInterrupt),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                verbs.run("dolt", 1, "box", self.board, verbs=["branch"])
+        self.assertGreaterEqual(self.server.delete.call_count, 1)
+        self.lifecycle.assert_called_once_with(self.board / "dolt", "stop")
 
 
 class Deadlines(unittest.TestCase):

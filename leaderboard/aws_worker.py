@@ -84,23 +84,21 @@ def resolve_systems(
         selected = parse_systems_arg(systems_arg)
     else:
         selected = [s for s in DEFAULT_LOCAL_SYSTEMS if s in known]
-        if client_location.strip() and lane != "macro":
-            selected.extend(s for s in DEFAULT_HOSTED_SYSTEMS if s in known and s not in selected)
+        if client_location.strip():
+            if lane == "macro":
+                selected.extend(s for s in ("neon",) if s in known and s not in selected)
+            else:
+                selected.extend(s for s in DEFAULT_HOSTED_SYSTEMS if s in known and s not in selected)
     if not selected:
         raise RuntimeError("no systems selected")
     unknown = [s for s in selected if s not in known]
     if unknown:
         raise RuntimeError(f"unknown system(s): {', '.join(unknown)}")
-    if lane == "macro":
-        hosted = [s for s in selected if known[s].get("hosted") == "yes"]
-        if hosted:
-            raise RuntimeError(f"macrobench supports self-hosted systems only; got hosted: {', '.join(hosted)}")
-    if lane in ("all", "micro"):
-        hosted_selected = [s for s in selected if known[s].get("hosted") == "yes"]
-        if hosted_selected and not client_location.strip():
-            raise RuntimeError(
-                f"hosted system(s) {', '.join(hosted_selected)} require --client-location"
-            )
+    hosted_selected = [s for s in selected if known[s].get("hosted") == "yes"]
+    if hosted_selected and not client_location.strip():
+        raise RuntimeError(
+            f"hosted system(s) {', '.join(hosted_selected)} require --client-location"
+        )
     return selected
 
 
@@ -806,7 +804,7 @@ def run_batch(
                                     status = status or 130
                                     break
 
-                            if lane in ("all", "macro") and not hosted:
+                            if lane in ("all", "macro") and (not hosted or sys_name != "xata" or systems_arg.strip()):
                                 remaining = deadline - clock()
                                 if remaining <= 0:
                                     print(
@@ -830,6 +828,8 @@ def run_batch(
                                     "--out",
                                     str(board),
                                 ]
+                                if hosted:
+                                    cmd.append("--allow-hosted")
                                 rc, interrupted, timed_out = step_runner(cmd, remaining, env)
                                 changed = _changed_files(before, macro_dir)
                                 produced = collect_macro_artifacts(changed)

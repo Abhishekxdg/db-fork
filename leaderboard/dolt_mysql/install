@@ -13,7 +13,7 @@ if [ "$(uname -s)" = "Linux" ]; then
         aarch64|arm64) platform="linux-arm64" ;;
         *) echo "Unsupported Linux architecture for dolt: $arch" >&2; exit 1 ;;
     esac
-    ver="${DOLT_VERSION:-v1.83.5}"
+    ver="${DOLT_VERSION:-v2.4.2}"
     tmp="$(mktemp -d)"
     trap 'rm -rf "$tmp"' EXIT
     url="https://github.com/dolthub/dolt/releases/download/${ver}/dolt-${platform}.tar.gz"
