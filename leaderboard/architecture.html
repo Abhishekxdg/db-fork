@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#eceff1">
-<meta name="description" content="Technical architecture of BranchBench for local developer benchmarking and official cloud VM leaderboard runs.">
+<meta name="description" content="End-to-end technical architecture of BranchBench from CLI, HTTP, and AWS entrypoints to validated static leaderboard result generation.">
 <title>Technical architecture · BranchBench</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='10' fill='%23428c80'/%3E%3Cpath d='M13 10v20m0-10h7q7 0 7-7v-3' fill='none' stroke='white' stroke-width='3'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="styles.css">
@@ -18,27 +18,279 @@
     </a>
     <nav class="header-nav" aria-label="Main navigation">
         <a class="nav-link" href="index.html#agent-workflows">Leaderboard</a>
+        <a class="nav-link" href="#system-diagram">System diagram</a>
         <a class="nav-link" href="#what-we-test">Suites</a>
-        <a class="nav-link" href="#local-architecture">Local setup</a>
-        <a class="nav-link" href="#submission-flow">Cloud VM setup</a>
+        <a class="nav-link" href="#local-architecture">Local</a>
+        <a class="nav-link" href="#alpha-architecture">AWS Alpha</a>
+        <a class="nav-link" href="#submission-flow">AWS Prod</a>
         <a class="nav-link" href="README.md">DB developer guide <span aria-hidden="true">↗</span></a>
     </nav>
-    <div class="header-actions"><a class="button" href="index.html">Back to leaderboard</a><a class="button button-primary" href="run.html">Run a benchmark</a></div>
+    <div class="header-actions"><a class="button" href="index.html">Back to leaderboard</a></div>
 </header>
 
 <main class="shell" id="main-content">
     <section aria-labelledby="arch-title">
-        <h1 class="page-title" id="arch-title" tabindex="-1">Technical Architecture: Local &amp; Cloud Setup</h1>
-        <p class="section-description">How BranchBench isolates benchmark execution, validates reproducibility, and assembles both local developer previews (<code>local</code> phase) and official cloud VM rankings (<code>prod</code> phase).</p>
+        <h1 class="page-title" id="arch-title" tabindex="-1">Technical Architecture: Entrypoints to Leaderboard Generation</h1>
+        <p class="section-description">How BranchBench orchestrates database benchmarks across local workstations (<code>local</code>), collapsible personal AWS staging stacks (<code>alpha</code>), and official AWS batch workers (<code>prod</code>), enforcing single-run hardware isolation, crash-safe teardown journals, and fail-closed static site assembly.</p>
 
         <div class="arch-grid">
+            <section class="panel" id="system-diagram">
+                <div class="panel-head">
+                    <h2>1. End-to-End Architecture: Entrypoints to Static Leaderboard</h2>
+                    <span class="count-badge">5 pipeline stages</span>
+                </div>
+                <p class="panel-note">Every benchmark run follows the same deterministic five-stage pipeline from CLI/HTTP/AWS entrypoints through file-lock isolation, suite execution, connector hooks, and fail-closed static bundle generation.</p>
+
+                <div class="arch-diagram-frame" role="region" aria-label="End-to-end technical architecture diagram">
+                    <svg class="arch-svg" viewBox="0 0 1120 784" role="img" aria-labelledby="arch-svg-title arch-svg-desc">
+                        <title id="arch-svg-title">BranchBench End-to-End Architecture Pipeline</title>
+                        <desc id="arch-svg-desc">Five-stage architecture diagram showing Stage 1 Entrypoints (Local serve.py/CLI, Personal AWS Alpha aws_alpha.sh, and Official Cloud Batch aws_worker.sh), Stage 2 Mutual Exclusion and Provenance Gate (batch.lock, run.lock, crash recovery journals, and git source snapshot), Stage 3 Microbench and Macrobench Execution Lanes, Stage 4 Pluggable System Adapters and dblib Connectors, and Stage 5 Fail-Closed Validators, Score Builders, and Atomic Site Assembler.</desc>
+                        <defs>
+                            <marker id="mk-ink" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                                <path class="arrow-ink" d="M 0 1.5 L 9 5 L 0 8.5 z"/>
+                            </marker>
+                            <marker id="mk-accent" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                                <path class="arrow-accent" d="M 0 1.5 L 9 5 L 0 8.5 z"/>
+                            </marker>
+                            <marker id="mk-bad" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                                <path class="arrow-bad" d="M 0 1.5 L 9 5 L 0 8.5 z"/>
+                            </marker>
+                        </defs>
+
+                        <!-- STAGE 1: ENTRYPOINTS -->
+                        <rect class="lane-bg" x="16" y="16" width="1088" height="136" rx="12"/>
+                        <circle class="step-badge" cx="40" cy="35" r="10"/>
+                        <text class="step-num" x="40" y="35">1</text>
+                        <text class="lane-kicker" x="58" y="39">STAGE 1 · ENTRYPOINTS &amp; PHASE TRIGGERS</text>
+
+                        <rect class="node-card" x="32" y="52" width="336" height="86" rx="8"/>
+                        <text class="node-title" x="46" y="73">Local Workstation (phase=local)</text>
+                        <text class="node-mono" x="46" y="92">serve.py (127.0.0.1:8765 POST /api/run)</text>
+                        <text class="node-sub" x="46" y="109">run.html wizard · direct python -m CLI</text>
+                        <text class="node-sub" x="46" y="125">Shows mint LOCAL badge · includes mock rows</text>
+
+                        <rect class="node-warn" x="392" y="52" width="336" height="86" rx="8"/>
+                        <text class="node-title" x="406" y="73">Personal AWS Alpha (phase=alpha)</text>
+                        <text class="node-warn-ink" x="406" y="92">aws_alpha.sh {up,run,deploy-site,collapse}</text>
+                        <text class="node-sub" x="406" y="109">Spot i4i.2xlarge + private S3 · /32 SSH</text>
+                        <text class="node-sub" x="406" y="125">Shows amber ALPHA badge · collapses to $0/hr</text>
+
+                        <rect class="node-accent" x="752" y="52" width="336" height="86" rx="8"/>
+                        <text class="node-title" x="766" y="73">Official Cloud Batch (phase=prod)</text>
+                        <text class="node-mono" x="766" y="92">aws_worker.sh --systems all --preset full</text>
+                        <text class="node-sub" x="766" y="109">1 shared NVMe VM · sequential DB batch</text>
+                        <text class="node-sub" x="766" y="125">No phase badge · publish.json allowlist only</text>
+
+                        <!-- Connectors Stage 1 -> Stage 2 -->
+                        <path class="edge" d="M 200 138 V 162 H 560 V 184" marker-end="url(#mk-ink)"/>
+                        <path class="edge" d="M 560 138 V 184" marker-end="url(#mk-ink)"/>
+                        <path class="edge" d="M 920 138 V 162 H 560 V 184" marker-end="url(#mk-ink)"/>
+
+                        <!-- STAGE 2: MUTUAL EXCLUSION & PROVENANCE GATE -->
+                        <rect class="lane-bg" x="16" y="184" width="1088" height="104" rx="12"/>
+                        <circle class="step-badge" cx="40" cy="203" r="10"/>
+                        <text class="step-num" x="40" y="203">2</text>
+                        <text class="lane-kicker" x="58" y="207">STAGE 2 · MUTUAL EXCLUSION, CRASH RECOVERY &amp; PROVENANCE SNAPSHOT</text>
+
+                        <rect class="node-card" x="32" y="218" width="336" height="58" rx="8"/>
+                        <text class="node-title" x="46" y="240">Exclusive File Locks (.runs/)</text>
+                        <text class="node-mono" x="46" y="259">batch.lock (worker) · run.lock (flock -n)</text>
+
+                        <rect class="node-card" x="392" y="218" width="336" height="58" rx="8"/>
+                        <text class="node-title" x="406" y="240">Crash-Recovery Journals (.runs/)</text>
+                        <text class="node-mono" x="406" y="259">&lt;sys&gt;.journal.json · &lt;sys&gt;.active.json</text>
+
+                        <rect class="node-card" x="752" y="218" width="336" height="58" rx="8"/>
+                        <text class="node-title" x="766" y="240">Provenance &amp; Host Preflight</text>
+                        <text class="node-mono" x="766" y="259">source_snapshot(CODE_PATHS) · suite_sha256</text>
+
+                        <!-- Connectors Stage 2 -> Stage 3 -->
+                        <path class="edge-accent" d="M 370 288 V 303 H 282 V 318" marker-end="url(#mk-accent)"/>
+                        <path class="edge-accent" d="M 750 288 V 303 H 838 V 318" marker-end="url(#mk-accent)"/>
+
+                        <!-- STAGE 3A: MICROBENCH LANE -->
+                        <rect class="lane-bg-tint" x="16" y="318" width="532" height="136" rx="12"/>
+                        <circle class="step-badge" cx="40" cy="337" r="10"/>
+                        <text class="step-num" x="40" y="337">3A</text>
+                        <text class="lane-kicker" x="58" y="341">MICROBENCH LANE · python -m leaderboard.run &lt;system&gt;</text>
+
+                        <rect class="node-card" x="32" y="352" width="242" height="88" rx="8"/>
+                        <text class="node-title" x="44" y="373">Deterministic CH-benCHmark</text>
+                        <text class="node-sub" x="44" y="391">Seed load_time &amp; provision_time</text>
+                        <text class="node-mono" x="44" y="408">8 ops × 3 tries (suite.json)</text>
+                        <text class="node-sub" x="44" y="425">Fresh run_id DB per try · 20m cap</text>
+
+                        <path class="edge" d="M 274 396 H 290" marker-end="url(#mk-ink)"/>
+
+                        <rect class="node-card" x="290" y="352" width="242" height="88" rx="8"/>
+                        <text class="node-title" x="302" y="373">Raw Timing &amp; Error Capture</text>
+                        <text class="node-sub" x="302" y="391">Per-op wall-clock matrix [8 × 3]</text>
+                        <text class="node-sub" x="302" y="408">Clean teardown verified before save</text>
+                        <text class="node-mono" x="302" y="425">&lt;sys&gt;/results/YYYYMMDD/&lt;m&gt;.json</text>
+
+                        <!-- STAGE 3B: MACROBENCH LANE -->
+                        <rect class="lane-bg-tint" x="572" y="318" width="532" height="136" rx="12"/>
+                        <circle class="step-badge" cx="596" cy="337" r="10"/>
+                        <text class="step-num" x="596" y="337">3B</text>
+                        <text class="lane-kicker" x="614" y="341">MACROBENCH LANE · python -m leaderboard.run_macro &lt;system&gt;</text>
+
+                        <rect class="node-card" x="588" y="352" width="242" height="88" rx="8"/>
+                        <text class="node-title" x="600" y="373">6 Stateful Agent Workflows</text>
+                        <text class="node-mono" x="600" y="391">rl_env · context_mgmt · multi_agent</text>
+                        <text class="node-mono" x="600" y="408">dev_agent · ops_agent · data_agent</text>
+                        <text class="node-sub" x="600" y="425">1 isolated subprocess per scenario</text>
+
+                        <path class="edge" d="M 830 396 H 846" marker-end="url(#mk-ink)"/>
+
+                        <rect class="node-card" x="846" y="352" width="242" height="88" rx="8"/>
+                        <text class="node-title" x="858" y="373">Campaign &amp; Attempt Evidence</text>
+                        <text class="node-sub" x="858" y="391">9 Git-like verbs + SQL work units</text>
+                        <text class="node-mono" x="858" y="408">campaign_&lt;id&gt;.json + 6 bb_&lt;id&gt;.json</text>
+                        <text class="node-mono" x="858" y="425">&lt;sys&gt;/macro/YYYYMMDD/*.json</text>
+
+                        <!-- Connectors Stage 3 <-> Stage 4 -->
+                        <path class="edge" d="M 153 454 V 482" marker-end="url(#mk-ink)"/>
+                        <path class="edge" d="M 411 454 V 482" marker-end="url(#mk-ink)"/>
+                        <path class="edge" d="M 709 454 V 482" marker-end="url(#mk-ink)"/>
+                        <path class="edge" d="M 967 454 V 482" marker-end="url(#mk-ink)"/>
+
+                        <!-- STAGE 4: ADAPTER & CONNECTOR LAYER -->
+                        <rect class="lane-bg" x="16" y="482" width="1088" height="104" rx="12"/>
+                        <circle class="step-badge" cx="40" cy="501" r="10"/>
+                        <text class="step-num" x="40" y="501">4</text>
+                        <text class="lane-kicker" x="58" y="505">STAGE 4 · PLUGGABLE SYSTEM ADAPTERS (leaderboard/&lt;system&gt;/) &amp; dblib CONNECTOR API</text>
+
+                        <rect class="node-code" x="32" y="516" width="516" height="58" rx="8"/>
+                        <text class="node-title-inv" x="46" y="538">Self-Hosted Engines ("hosted": "no" — Dolt, Doltgres, Postgres, Kpg)</text>
+                        <text class="node-mono-inv" x="46" y="557">Lifecycle hooks: install → start → check → CONNECTOR → stop + drop DB</text>
+
+                        <rect class="node-code" x="572" y="516" width="516" height="58" rx="8"/>
+                        <text class="node-title-inv" x="586" y="538">Managed Cloud Services ("hosted": "yes" — Neon, Tiger Cloud, Xata)</text>
+                        <text class="node-mono-inv" x="586" y="557">preflight() API key check · --client-location · SQL rtt_ms probe · microbench</text>
+
+                        <!-- Connectors Stage 4 -> Stage 5 -->
+                        <path class="edge-accent" d="M 290 586 V 614" marker-end="url(#mk-accent)"/>
+                        <path class="edge-accent" d="M 830 586 V 614" marker-end="url(#mk-accent)"/>
+
+                        <!-- STAGE 5: VALIDATION, BUILDERS & STATIC SITE ASSEMBLY -->
+                        <rect class="lane-bg" x="16" y="614" width="1088" height="154" rx="12"/>
+                        <circle class="step-badge" cx="40" cy="633" r="10"/>
+                        <text class="step-num" x="40" y="633">5</text>
+                        <text class="lane-kicker" x="58" y="637">STAGE 5 · FAIL-CLOSED VALIDATION, SCORE BUILDERS &amp; STATIC SITE GENERATION</text>
+
+                        <rect class="node-card" x="32" y="648" width="324" height="106" rx="8"/>
+                        <text class="node-title" x="46" y="669">Schema &amp; Hash Validators</text>
+                        <text class="node-mono" x="46" y="688">validate.py · validate_macro.py</text>
+                        <text class="node-sub" x="46" y="706">Checks schema_version, suite_sha256,</text>
+                        <text class="node-sub" x="46" y="722">dataset_sha256, 6 scenario outcomes,</text>
+                        <text class="node-sub" x="46" y="738">and clean source_snapshot provenance</text>
+
+                        <path class="edge-accent" d="M 356 701 H 382" marker-end="url(#mk-accent)"/>
+
+                        <rect class="node-card" x="382" y="648" width="324" height="106" rx="8"/>
+                        <text class="node-title" x="396" y="669">Dataset Builders &amp; Ranking Prep</text>
+                        <text class="node-mono" x="396" y="688">build.py → data, excluded</text>
+                        <text class="node-mono" x="396" y="705">build_macro.py → macroCampaigns</text>
+                        <text class="node-sub" x="396" y="722">Newest record per (system, machine);</text>
+                        <text class="node-sub" x="396" y="738">failed runs preserved in excluded[]</text>
+
+                        <path class="edge-accent" d="M 706 701 H 732" marker-end="url(#mk-accent)"/>
+
+                        <rect class="node-accent" x="732" y="648" width="356" height="106" rx="8"/>
+                        <text class="node-title" x="746" y="669">Atomic Site Assembler (site.py → .site/)</text>
+                        <text class="node-mono" x="746" y="688">local → .site/local/ (+ mock + run.html + badge)</text>
+                        <text class="node-mono" x="746" y="705">alpha → .site/alpha/ (real runs + alpha badge)</text>
+                        <text class="node-mono" x="746" y="722">prod  → .site/prod/  (publish.json, no badge)</text>
+                        <text class="node-sub" x="746" y="739">Browser UI (app.js, macro.js, micro.js) renders boards</text>
+                    </svg>
+                </div>
+
+                <ul class="arch-legend" aria-label="Diagram key">
+                    <li><span class="arch-swatch"></span> Standard pipeline stage</li>
+                    <li><span class="arch-swatch arch-swatch-accent"></span> Official / primary data path</li>
+                    <li><span class="arch-swatch arch-swatch-warn"></span> Personal AWS Alpha staging path</li>
+                    <li><span class="arch-swatch arch-swatch-code"></span> Pluggable DB adapter &amp; connector boundary</li>
+                </ul>
+            </section>
+
+            <section class="panel" id="lifecycle-diagram">
+                <div class="panel-head">
+                    <h2>2. Single-Run Lifecycle, Crash Recovery &amp; Fail-Closed Teardown</h2>
+                    <span class="count-badge">Zero leftover servers</span>
+                </div>
+                <p class="panel-note">How a single database invocation guarantees exclusive hardware access, recovers from prior <code>SIGKILL</code> or power loss, and refuses to publish any timing if database deletion or server shutdown fails.</p>
+
+                <div class="arch-diagram-frame" role="region" aria-label="Single-run lifecycle and crash recovery diagram">
+                    <svg class="arch-svg" viewBox="0 0 1120 264" role="img" aria-labelledby="life-svg-title life-svg-desc">
+                        <title id="life-svg-title">Single-Run Execution Lifecycle and Fail-Closed Recovery Bus</title>
+                        <desc id="life-svg-desc">Five sequential execution steps (Acquire Lock and Recover, Write Journal and Start, Execute Suite and Probe, Teardown and Verify Clean, Emit Validated Record) with a fan-in failure and cleanup bus that catches timeouts, SQL errors, or dirty teardowns and writes an explicit error record.</desc>
+
+                        <!-- Step 1 -->
+                        <rect class="node-card" x="20" y="24" width="192" height="92" rx="8"/>
+                        <text class="node-title" x="34" y="47">1. Lock &amp; Recover</text>
+                        <text class="node-mono" x="34" y="66">flock -n .runs/run.lock</text>
+                        <text class="node-sub" x="34" y="84">Replay stale journal / active</text>
+                        <text class="node-sub" x="34" y="100">stop script before starting</text>
+
+                        <path class="edge" d="M 212 70 H 242" marker-end="url(#mk-ink)"/>
+
+                        <!-- Step 2 -->
+                        <rect class="node-card" x="242" y="24" width="192" height="92" rx="8"/>
+                        <text class="node-title" x="256" y="47">2. Journal &amp; Start</text>
+                        <text class="node-mono" x="256" y="66">&lt;sys&gt;.journal / active</text>
+                        <text class="node-sub" x="256" y="84">Run install → start → check</text>
+                        <text class="node-sub" x="256" y="100">or preflight() for cloud DB</text>
+
+                        <path class="edge" d="M 434 70 H 464" marker-end="url(#mk-ink)"/>
+
+                        <!-- Step 3 -->
+                        <rect class="node-accent" x="464" y="24" width="192" height="92" rx="8"/>
+                        <text class="node-title" x="478" y="47">3. Execute Suite</text>
+                        <text class="node-mono" x="478" y="66">CONNECTOR + run_id DB</text>
+                        <text class="node-sub" x="478" y="84">Seed load + 8 ops × 3 tries</text>
+                        <text class="node-sub" x="478" y="100">or 6 isolated agent workflows</text>
+
+                        <path class="edge" d="M 656 70 H 686" marker-end="url(#mk-ink)"/>
+
+                        <!-- Step 4 -->
+                        <rect class="node-card" x="686" y="24" width="192" height="92" rx="8"/>
+                        <text class="node-title" x="700" y="47">4. Teardown &amp; Verify</text>
+                        <text class="node-mono" x="700" y="66">cleanup_database() + stop</text>
+                        <text class="node-sub" x="700" y="84">Verify DB deleted &amp; server</text>
+                        <text class="node-sub" x="700" y="100">stopped; unlink journal file</text>
+
+                        <path class="edge-accent" d="M 878 70 H 908" marker-end="url(#mk-accent)"/>
+
+                        <!-- Step 5 -->
+                        <rect class="node-accent" x="908" y="24" width="192" height="92" rx="8"/>
+                        <text class="node-title" x="922" y="47">5. Emit Valid Record</text>
+                        <text class="node-mono" x="922" y="66">validate() before publish</text>
+                        <text class="node-sub" x="922" y="84">Write results/ or macro/ JSON</text>
+                        <text class="node-sub" x="922" y="100">Release .runs/run.lock</text>
+
+                        <!-- Fan-in Failure / Cleanup Bus -->
+                        <path class="edge-bad" d="M 338 116 V 150 H 782 M 560 116 V 174 M 782 116 V 150" marker-end="url(#mk-bad)"/>
+
+                        <rect class="node-bad" x="210" y="174" width="700" height="72" rx="8"/>
+                        <text class="node-bad-ink" x="226" y="197">Fail-Closed Error &amp; Teardown Path (timeout, SQL error, dirty cleanup, or SIGKILL)</text>
+                        <text class="node-mono" x="226" y="216">Executes stop hook + cleanup_database() in finally block · writes {"error": "&lt;reason&gt;"} or campaign aborted</text>
+                        <text class="node-sub" x="226" y="233">Surfaced under "Runs without a result" in UI · refused by site.py in prod if listed in publish.json</text>
+                    </svg>
+                </div>
+
+                <ul class="arch-legend" aria-label="Lifecycle diagram key">
+                    <li><span class="arch-swatch arch-swatch-accent"></span> Normal verified execution flow</li>
+                    <li><span class="arch-swatch arch-swatch-bad"></span> Fail-closed exception, timeout, or dirty-teardown path</li>
+                </ul>
+            </section>
+
             <section class="panel" id="what-we-test">
-                <h2>1. Architectural Boundary &amp; Benchmark Suites</h2>
+                <h2>3. Architectural Boundary &amp; Benchmark Suites</h2>
                 <p class="panel-note">The <code>leaderboard/</code> package is a self-contained harness and static site builder layered over <code>dblib/</code>, <code>microbench/</code>, and <code>macrobench/</code> without modifying upstream files.</p>
                 <dl class="rule-list">
                     <div>
                         <dt>Open-Closed Boundary</dt>
-                        <dd>All runner orchestration, system lifecycle hooks, connector shims, and UI assets live strictly inside <code>leaderboard/</code>. Automated boundary tests verify that zero files outside <code>leaderboard/</code> differ from <code>origin/main</code>.</dd>
+                        <dd>All runner orchestration, system lifecycle hooks, connector shims, AWS deployment scripts, and UI assets live strictly inside <code>leaderboard/</code>. Automated boundary tests (<code>test_no_files_outside_leaderboard_differ_from_main_merge_base</code>) verify that zero files outside <code>leaderboard/</code> differ from <code>origin/main</code>.</dd>
                     </div>
                     <div>
                         <dt>Macrobench (<code>Agent workflows</code>)</dt>
@@ -52,20 +304,20 @@
             </section>
 
             <section class="panel" id="local-architecture">
-                <h2>2. Local Developer Setup (<code>LEADERBOARD_PHASE=local</code>)</h2>
-                <p class="panel-note">Designed for database developers building and verifying a connector on their own workstation before opening a pull request.</p>
+                <h2>4. Local Developer Setup (<code>LEADERBOARD_PHASE=local</code>)</h2>
+                <p class="panel-note">Designed for database developers building and verifying a connector on their own workstation before opening a pull request. Displays a compact mint <code>LOCAL</code> badge in the top brand header.</p>
                 <dl class="rule-list">
                     <div>
                         <dt>CLI &amp; HTTP Runner</dt>
-                        <dd><code>python -m leaderboard.run &lt;system&gt; --machine &lt;id&gt;</code> runs the microbench suite; <code>python -m leaderboard.run_macro &lt;system&gt; --preset {mini|full} --machine &lt;id&gt;</code> runs all six agent workflows in isolated subprocesses. <code>python -m leaderboard.serve --phase local</code> serves the site on port 8000 and exposes <code>POST /api/run</code> on loopback (<code>127.0.0.1</code> / <code>::1</code>), rejecting non-loopback or cross-origin requests with HTTP <code>403</code>.</dd>
+                        <dd><code>python -m leaderboard.run &lt;system&gt; --machine &lt;id&gt;</code> runs the microbench suite; <code>python -m leaderboard.run_macro &lt;system&gt; --preset {mini|full} --machine &lt;id&gt;</code> runs all six agent workflows in isolated subprocesses. <code>python -m leaderboard.serve --phase local</code> serves the site on port <code>8765</code> and exposes <code>POST /api/run</code> on loopback (<code>127.0.0.1</code> / <code>::1</code>), rejecting non-loopback or cross-origin requests with HTTP <code>403</code>.</dd>
                     </div>
                     <div>
                         <dt>Single-Run Lock (<code>run.lock</code>)</dt>
                         <dd>Both runners acquire an exclusive non-blocking file lock at <code>leaderboard/.runs/run.lock</code>. Only one database benchmark can execute at a time on a machine so engines never contend for CPU cores, memory bandwidth, disk I/O, or local ports.</dd>
                     </div>
                     <div>
-                        <dt>Crash Recovery (<code>active.json</code>)</dt>
-                        <dd>Before starting a self-hosted server, the runner records the active system in <code>leaderboard/.runs/active.json</code>. If a process is killed (such as <code>SIGKILL</code> or power loss), the next invocation reads <code>active.json</code> and executes that system's <code>stop</code> script before starting a new run.</dd>
+                        <dt>Crash Recovery Journals</dt>
+                        <dd>Before starting a server or creating a benchmark database, the microbench runner writes <code>leaderboard/.runs/&lt;system&gt;.journal.json</code> and the macrobench runner writes <code>leaderboard/.runs/&lt;system&gt;.active.json</code>. If a process is killed by <code>SIGKILL</code> or power loss, the next run replays any leftover journal to delete orphaned databases and run the system's <code>stop</code> hook before starting.</dd>
                     </div>
                     <div>
                         <dt>Local Site Assembly</dt>
@@ -74,75 +326,101 @@
                 </dl>
             </section>
 
+            <section class="panel" id="alpha-architecture">
+                <h2>5. Personal AWS Alpha Setup (<code>LEADERBOARD_PHASE=alpha</code> · Collapsible)</h2>
+                <p class="panel-note">Designed for staging real benchmarks on cloud NVMe hardware in your own AWS account and collapsing every resource back to <code>$0.00/hr</code> immediately after testing. Displays a compact amber <code>ALPHA</code> badge in the top brand header.</p>
+                <dl class="rule-list">
+                    <div>
+                        <dt>One-Command Lifecycle</dt>
+                        <dd><code>./leaderboard/aws_alpha.sh {up,run,deploy-site,status,collapse}</code> (backed by <code>python -m leaderboard.aws_alpha</code>) tags every provisioned AWS resource with <code>Project=BranchBench</code>, <code>Phase=alpha</code>, and <code>Stack=&lt;stack&gt;</code>, recording state in <code>leaderboard/.runs/aws_alpha_state.json</code>.</dd>
+                    </div>
+                    <div>
+                        <dt>Provision &amp; Execute</dt>
+                        <dd><code>up</code> provisions a Spot <code>i4i.2xlarge</code> Ubuntu 24.04 runner with local NVMe formatted as XFS (<code>reflink=1</code> for Kpg copy-on-write cloning), a Caller-IP-only (<code>/32</code>) SSH Security Group, and a private S3 bucket (<code>BlockPublicAcls=true</code>). <code>run</code> syncs the repo over SSH and invokes <code>leaderboard/aws_worker.sh</code> with <code>LEADERBOARD_PHASE=alpha</code>.</dd>
+                    </div>
+                    <div>
+                        <dt>Real Runs Without Mock Rows</dt>
+                        <dd><code>python -m leaderboard.site --phase alpha</code> publishes all validated microbench and macrobench records found on disk (both <code>mini</code> and <code>full</code> presets) without requiring <code>publish.json</code> and without injecting <code>leaderboard.mock</code> rows or the macOS-only <code>run.html</code> launcher.</dd>
+                    </div>
+                    <div>
+                        <dt>Complete Collapse to Zero Cost</dt>
+                        <dd><code>./leaderboard/aws_alpha.sh collapse</code> discovers resources by both local state and AWS tags, terminates the EC2 runner, deletes any leftover EBS volumes, security groups, and key pairs, empties and deletes the S3 bucket (unless <code>--keep-bucket</code> is passed), and removes local state and PEM files.</dd>
+                    </div>
+                </dl>
+            </section>
+
             <section class="panel" id="submission-flow">
-                <h2>3. Cloud Official Setup (<code>LEADERBOARD_PHASE=prod</code> &amp; <code>1 DB = 1 VM</code>)</h2>
-                <p class="panel-note">Official rankings never ingest timing JSON files from developer laptops. Contributors submit a self-contained adapter directory and CI executes the benchmark on dedicated cloud hardware.</p>
+                <h2>6. Official Cloud Production Setup (<code>LEADERBOARD_PHASE=prod</code>)</h2>
+                <p class="panel-note">Official rankings never ingest timing JSON files from developer laptops. Contributors submit a self-contained adapter directory and the official runner executes on dedicated cloud NVMe hardware. The production UI removes the phase badge completely.</p>
                 <dl class="rule-list">
                     <div>
                         <dt>Plugin Submission (<code>leaderboard/&lt;system&gt;/</code>)</dt>
                         <dd>A database developer submits a pull request adding <code>leaderboard/&lt;system&gt;/</code> with <code>system.json</code>, executable lifecycle hooks (<code>install</code>, <code>start</code>, <code>check</code>, <code>stop</code>), and <code>connector.py</code> exporting <code>CONNECTOR</code>. See the <a class="text-link" href="README.md">Database Developer Guide</a> for the full contract.</dd>
                     </div>
                     <div>
-                        <dt>Dedicated Ephemeral VM per System</dt>
-                        <dd>For self-hosted engines (<code>"hosted": "no"</code>), CI provisions one dedicated ephemeral cloud VM per database system in parallel (standard reference tier, such as 16 vCPUs, 32 GiB RAM, NVMe SSD). Each engine receives 100% of its VM's CPU, memory, and disk I/O with zero noisy-neighbor interference or leftover page cache.</dd>
+                        <dt>Economic Single-VM Sequential Batch (<code>aws_worker.sh</code>)</dt>
+                        <dd>In official AWS production, <code>./leaderboard/aws_worker.sh --systems all --preset full --publish</code> runs all database adapters sequentially on one shared bare-NVMe instance (such as <code>i4i.2xlarge</code>) under <code>batch.lock</code> and <code>run.lock</code>. Between engines, the worker stops systemd services, runs the adapter's <code>stop</code> hook, syncs filesystems, and drops Linux page cache (<code>/proc/sys/vm/drop_caches = 3</code>) so every database gets 100% of the machine with identical hardware provenance.</dd>
                     </div>
                     <div>
                         <dt>Managed Cloud Services</dt>
-                        <dd>For hosted services (<code>"hosted": "yes"</code>), the runner executes from a cloud client VM pinned to the same region, requires a client location flag, and records the measured SQL round-trip latency (<code>rtt_ms</code>) alongside the service region.</dd>
-                    </div>
-                    <div>
-                        <dt>Unified Board &amp; Hardware Badges</dt>
-                        <dd>All systems render in one unified ranking table per suite. Every row displays a <strong>Hosting badge</strong> (<code>Self-hosted</code> vs. <code>Managed service</code>) and a <strong>Hardware / Spec badge</strong> (such as <code>16 CPUs · 32 GiB</code> or cloud region), paired with top-bar <strong>Hosting</strong> and <strong>Machine</strong> filters.</dd>
+                        <dd>For hosted services (<code>"hosted": "yes"</code>), the runner executes from the cloud worker pinned to the target region, verifies credentials via <code>preflight()</code> before creating any project, requires <code>--client-location</code>, and records measured SQL round-trip latency (<code>rtt_ms</code>) alongside the service region.</dd>
                     </div>
                     <div>
                         <dt>Publication Manifest (<code>publish.json</code>)</dt>
-                        <dd><code>python -m leaderboard.site</code> (default <code>prod</code> phase) publishes only records explicitly listed in <code>leaderboard/publish.json</code> that pass full validation (clean git commit, matching suite/dataset SHA-256, <code>full</code> macro preset, and verified database cleanup). The production output in <code>leaderboard/.site/prod/</code> omits <code>run.html</code>, <code>README.md</code>, <code>architecture.html</code>, and all mock or quick runs.</dd>
+                        <dd><code>python -m leaderboard.site</code> (default <code>prod</code> phase) publishes only records explicitly listed in <code>leaderboard/publish.json</code> that pass full validation (clean git commit, matching suite/dataset SHA-256, homogeneous comparison group, <code>full</code> macro preset, and verified database cleanup). The production output in <code>leaderboard/.site/prod/</code> omits <code>run.html</code>, <code>README.md</code>, <code>architecture.html</code>, the phase badge, and all mock or quick runs.</dd>
                     </div>
                 </dl>
             </section>
 
             <section class="panel" id="prod-vs-local">
-                <h2>4. Official Cloud (<code>prod</code>) vs. Local Dev (<code>local</code>)</h2>
-                <p class="panel-note">Both phases execute the exact same runner, validator, and UI scripts; the build phase controls only record selection and developer affordances.</p>
+                <h2>7. Phase Comparison: <code>prod</code> vs. <code>alpha</code> vs. <code>local</code></h2>
+                <p class="panel-note">All three phases execute the exact same runner, validator, and UI scripts; the phase controls only record selection, cloud lifecycle, and developer affordances.</p>
                 <div class="scroll">
-                    <table class="detail-table" aria-label="Comparison between Official Cloud Architecture and Local Dev Architecture">
+                    <table class="detail-table" aria-label="Comparison between Official Cloud prod, Personal AWS alpha, and Local Dev local phases">
                         <thead>
                             <tr>
                                 <th scope="col">Dimension</th>
-                                <th scope="col">Official Cloud Leaderboard (<code>prod</code>)</th>
+                                <th scope="col">Official Cloud (<code>prod</code>)</th>
+                                <th scope="col">Personal AWS Staging (<code>alpha</code>)</th>
                                 <th scope="col">Local Developer Mode (<code>local</code>)</th>
                             </tr>
                         </thead>
                         <tbody>
                             <tr>
                                 <th scope="row">Build Command</th>
-                                <td><code>python -m leaderboard.site</code> (default is <code>prod</code>)</td>
+                                <td><code>python -m leaderboard.site</code> (default <code>prod</code>)</td>
+                                <td><code>python -m leaderboard.site --phase alpha</code></td>
                                 <td><code>python -m leaderboard.site --phase local</code></td>
                             </tr>
                             <tr>
                                 <th scope="row">Output Directory</th>
                                 <td><code>leaderboard/.site/prod/</code></td>
+                                <td><code>leaderboard/.site/alpha/</code></td>
                                 <td><code>leaderboard/.site/local/</code></td>
                             </tr>
                             <tr>
-                                <th scope="row">Execution Hardware</th>
-                                <td><strong>1 Self-Hosted DB = 1 Dedicated Cloud VM</strong> in CI.</td>
-                                <td>Developer workstation running 1 database at a time under <code>run.lock</code>.</td>
+                                <th scope="row">Header Phase Badge</th>
+                                <td><strong>None</strong> (<code>#phase-badge</code> removed from DOM)</td>
+                                <td>Compact amber <code>ALPHA</code> pill badge</td>
+                                <td>Compact mint <code>LOCAL</code> pill badge</td>
                             </tr>
                             <tr>
-                                <th scope="row">Server Lifecycle</th>
-                                <td>Fresh VM executes <code>leaderboard/&lt;system&gt;/{install,start,check,stop}</code> and terminates.</td>
-                                <td>Local runner executes <code>leaderboard/&lt;system&gt;/{install,start,check,stop}</code> with <code>active.json</code> crash recovery.</td>
+                                <th scope="row">Execution Hardware</th>
+                                <td>Shared AWS NVMe VM running 1 DB at a time via <code>aws_worker.sh</code></td>
+                                <td>Collapsible personal AWS Spot VM via <code>aws_alpha.sh</code></td>
+                                <td>Developer workstation under <code>.runs/run.lock</code></td>
                             </tr>
                             <tr>
                                 <th scope="row">Record Selection</th>
-                                <td>Allowlisted in <code>leaderboard/publish.json</code>; requires clean git tree and <code>full</code> macro preset.</td>
-                                <td>All validated local runs in <code>results/</code> and <code>macro/</code> (including <code>mini</code> preset) plus <code>leaderboard.mock</code> rows.</td>
+                                <td>Allowlisted in <code>publish.json</code>; clean git tree; <code>full</code> macro only</td>
+                                <td>All validated runs in <code>results/</code> and <code>macro/</code> (<code>mini</code> + <code>full</code>); no mocks</td>
+                                <td>All validated runs in <code>results/</code> and <code>macro/</code> plus <code>leaderboard.mock</code> rows</td>
                             </tr>
                             <tr>
-                                <th scope="row">Developer Tools</th>
-                                <td>Read-only static bundle (no wizard, no <code>/api/run</code>, no developer docs).</td>
-                                <td>Includes <code>run.html</code> wizard, <code>architecture.html</code>, <code>README.md</code>, and loopback <code>POST /api/run</code>.</td>
+                                <th scope="row">Published Pages</th>
+                                <td><code>index.html</code> only (read-only static bundle)</td>
+                                <td><code>index.html</code>, <code>architecture.html</code>, <code>README.md</code></td>
+                                <td><code>index.html</code>, <code>run.html</code>, <code>architecture.html</code>, <code>README.md</code>, <code>POST /api/run</code></td>
                             </tr>
                         </tbody>
                     </table>

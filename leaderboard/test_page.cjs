@@ -750,8 +750,14 @@ assert.equal(headRow(boards(many)[0]).length, 11, 'Nine workflow columns between
 assert.equal(classNodes(many.elements.get('macro-groups'), 'done-count')[0].textContent, '9 / 9');
 
 // Production and alpha: the same page with no developer wizard affordances; alpha still links bundled README and excluded records.
+// Phase badge: shown in local ('local') and alpha ('alpha'), completely removed from the DOM in prod.
+assert.equal(macroEl('phase-badge').removed, undefined);
+assert.equal(macroEl('phase-badge').hidden, false);
+assert.equal(macroEl('phase-badge').textContent, 'local');
+assert.equal(macroEl('phase-badge').getAttribute('data-phase'), 'local');
 const prod = mount(data, [], macroData, '#agent-workflows', 'prod');
 assert.equal(prod.elements.get('nav-run').removed, true, 'The run wizard is not in the production page');
+assert.equal(prod.elements.get('phase-badge').removed, true, 'Production removes the phase badge completely');
 assert.equal(prod.elements.get('doc-nav').href, 'https://github.com/elaineang/db-fork/blob/main/leaderboard/README.md');
 assert.equal(prod.elements.get('doc-macro').href, 'https://github.com/elaineang/db-fork/blob/main/leaderboard/README.md#agent-workflows');
 assert.equal(rowsOf(prod).length, 3);
@@ -762,9 +768,18 @@ assert.equal(mount(data, [], macroData, '', 'prod').run('state.suite'), 'macro',
 assert.equal(mount(data, [], macroData, '#microbench', 'prod').run('state.suite'), 'micro', 'The microbench stays reachable');
 const alpha = mount(data, [], macroData, '#agent-workflows', 'alpha');
 assert.equal(alpha.elements.get('nav-run').removed, true, 'The macOS run wizard is not in the alpha AWS page');
+assert.equal(alpha.elements.get('phase-badge').removed, undefined, 'Alpha keeps the phase badge');
+assert.equal(alpha.elements.get('phase-badge').hidden, false);
+assert.equal(alpha.elements.get('phase-badge').textContent, 'alpha');
+assert.equal(alpha.elements.get('phase-badge').getAttribute('data-phase'), 'alpha');
 assert.equal(alpha.elements.get('doc-nav').href, 'README.md', 'Alpha serves its bundled README');
 assert.equal(descendants(alpha.elements.get('macro-excluded')).find(e => e.tag === 'a').href, 'dolt/macro/20261010/campaign_deadbeef.json', 'Alpha links bundled excluded records');
 assert.equal(mount(data, [], macroData, '', 'alpha').run('state.suite'), 'macro', 'Alpha opens on the agent workflows');
+const archHtml = fs.readFileSync(`${__dirname}/architecture.html`, 'utf8');
+assert.equal((archHtml.match(/<svg class="arch-svg"/g) || []).length, 2, 'Architecture page carries end-to-end and single-run lifecycle SVG diagrams');
+for (const token of ['STAGE 1', 'STAGE 2', 'MICROBENCH LANE', 'MACROBENCH LANE', 'STAGE 4', 'STAGE 5', 'aws_alpha.sh', 'aws_worker.sh', 'site.py']) {
+    assert.ok(archHtml.includes(token), `architecture.html diagram includes ${token}`);
+}
 const prodEmpty = mount([], [{system: 'Old', machine: 'box', source: 'dolt/results/20261001/box.json', reason: 'server did not start'}], {suite: macroData.suite, campaigns: [], excluded: []}, '', 'prod');
 assert.equal(emptyRow(prodEmpty).textContent, 'No published results yet. Results appear here once a validated run is published.');
 prodEmpty.document.getElementById('tab-micro').click();

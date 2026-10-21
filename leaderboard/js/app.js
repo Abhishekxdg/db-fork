@@ -98,6 +98,12 @@ function render() {
 
 for (const id of ['doc-nav', 'doc-scoring', 'doc-macro', 'doc-footer']) el(id).href = el(id).getAttribute('href').replace(/^README\.md/, DOCS);
 if (PROD) el('nav-run').remove();  // production has no run wizard
+if (PHASE === 'prod') el('phase-badge').remove();
+else {
+    el('phase-badge').textContent = PHASE;
+    el('phase-badge').setAttribute('data-phase', PHASE);
+    el('phase-badge').hidden = false;
+}
 wireDetails(); wireMicro(); wireMacro();
 // A header link to the section already in the URL fires no hashchange, so it reveals and focuses the section itself.
 for (const id of ['nav-board', 'nav-workflows', 'nav-operations']) el(id).addEventListener('click', event => {
