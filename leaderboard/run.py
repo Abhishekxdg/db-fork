@@ -167,24 +167,31 @@ def check_alpha_lease(runs_dir: Path = RUNS) -> None:
             raw = owner_path.read_text(encoding="utf-8").strip()
         except OSError:
             continue
-        if not raw or ":" not in raw:
+        if not raw or ":" not in raw or "\n" in raw:
             raise RunError("another alpha sync/benchmark session owns this worker")
         parts = raw.split(":")
+        if len(parts) not in (2, 3) or not parts[0].strip():
+            raise RunError("another alpha sync/benchmark session owns this worker")
         owner_token = parts[0]
         try:
             owner_ts = float(parts[1].strip())
-        except (IndexError, ValueError):
-            raise RunError("another alpha sync/benchmark session owns this worker") from None
-        try:
-            lease_ttl = (
-                float(parts[2].strip())
-                if len(parts) >= 3 and parts[2].strip()
-                else float(DEFAULT_ALPHA_LEASE_TTL_SEC)
-            )
         except ValueError:
+            raise RunError("another alpha sync/benchmark session owns this worker") from None
+        if not math.isfinite(owner_ts) or owner_ts <= 0:
+            raise RunError("another alpha sync/benchmark session owns this worker")
+        if len(parts) == 2:
             lease_ttl = float(DEFAULT_ALPHA_LEASE_TTL_SEC)
+        else:
+            if not parts[2].strip():
+                raise RunError("another alpha sync/benchmark session owns this worker")
+            try:
+                lease_ttl = float(parts[2].strip())
+            except ValueError:
+                raise RunError("another alpha sync/benchmark session owns this worker") from None
+            if not math.isfinite(lease_ttl) or lease_ttl <= 0:
+                raise RunError("another alpha sync/benchmark session owns this worker")
         if now_ts - owner_ts < lease_ttl:
-            if not owner_token or not caller_token or not secrets.compare_digest(owner_token, caller_token):
+            if not caller_token or not secrets.compare_digest(owner_token, caller_token):
                 raise RunError("another alpha sync/benchmark session owns this worker")
 
 

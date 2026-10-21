@@ -1137,9 +1137,21 @@ class AwsAlphaLifecycle(Board):
         import time as _time
 
         six_hr_plus_ts = int(_time.time()) - 21601
-        (runs_sub / "alpha.owner").write_text(f"foreign_token:{six_hr_plus_ts}:86400\n")
-        with self.assertRaisesRegex(micro.RunError, "another alpha sync/benchmark session owns this worker"):
-            micro.check_alpha_lease(runs_sub)
+        for bad_or_active_owner in (
+            f"foreign_token:{six_hr_plus_ts}:86400\n",
+            f"foreign_token:{six_hr_plus_ts}\n",
+            f"foreign_token:{six_hr_plus_ts}:0\n",
+            f"foreign_token:{six_hr_plus_ts}:-5\n",
+            f"foreign_token:{six_hr_plus_ts}:\n",
+            f"foreign_token:{six_hr_plus_ts}:NaN\n",
+            "foreign_token:NaN:86400\n",
+            "foreign_token:0:86400\n",
+            f": {six_hr_plus_ts}:86400\n",
+            f"foreign_token:{six_hr_plus_ts}:86400:extra\n",
+        ):
+            (runs_sub / "alpha.owner").write_text(bad_or_active_owner)
+            with self.assertRaisesRegex(micro.RunError, "another alpha sync/benchmark session owns this worker"):
+                micro.check_alpha_lease(runs_sub)
         (runs_sub / "alpha.owner").unlink(missing_ok=True)
 
         collapse_verify_fail_calls = []

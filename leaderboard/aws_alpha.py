@@ -1165,10 +1165,20 @@ def run_alpha_benchmarks(
             "lock_fd 8 || exit 42; "
             "for owner_file in ~/db-fork.alpha.owner ~/db-fork/leaderboard/.runs/alpha.owner; do "
             'if [ -f "$owner_file" ]; then '
-            'owner_ts="$(cut -d: -f2 "$owner_file" 2>/dev/null)"; '
-            'owner_ttl="$(cut -d: -f3 "$owner_file" 2>/dev/null)"; '
+            '[ "$(wc -l < "$owner_file" 2>/dev/null | tr -d " ")" -le 1 ] || exit 42; '
+            'owner_raw="$(head -n 1 "$owner_file" 2>/dev/null)"; '
+            'colon_cnt="$(printf "%s" "$owner_raw" | tr -cd ":" | wc -c | tr -d " ")"; '
+            'owner_tok="$(printf "%s" "$owner_raw" | cut -d: -f1)"; '
+            'owner_ts="$(printf "%s" "$owner_raw" | cut -d: -f2)"; '
+            '[ -n "$owner_tok" ] || exit 42; '
             "case \"$owner_ts\" in ''|*[!0-9]*) exit 42 ;; esac; "
-            "case \"$owner_ttl\" in ''|*[!0-9]*) owner_ttl=86400 ;; esac; "
+            '[ "$owner_ts" -gt 0 ] || exit 42; '
+            'if [ "$colon_cnt" -eq 1 ]; then owner_ttl=86400; '
+            'elif [ "$colon_cnt" -eq 2 ]; then '
+            'owner_ttl="$(printf "%s" "$owner_raw" | cut -d: -f3)"; '
+            "case \"$owner_ttl\" in ''|*[!0-9]*) exit 42 ;; esac; "
+            '[ "$owner_ttl" -gt 0 ] || exit 42; '
+            "else exit 42; fi; "
             'now_ts="$(date +%s)"; '
             'if [ "$((now_ts - owner_ts))" -lt "$owner_ttl" ]; then exit 42; fi; '
             "fi; "
