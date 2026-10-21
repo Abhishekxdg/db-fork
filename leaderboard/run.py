@@ -150,6 +150,9 @@ def catch_sigterm():
         signal.signal(signal.SIGTERM, previous)
 
 
+DEFAULT_ALPHA_LEASE_TTL_SEC = 86400
+
+
 def check_alpha_lease(runs_dir: Path = RUNS) -> None:
     """Reject direct or batch runs when an active remote alpha sync/run session owns the worker under another token."""
     owner_candidates = [runs_dir / "alpha.owner"]
@@ -166,12 +169,21 @@ def check_alpha_lease(runs_dir: Path = RUNS) -> None:
             continue
         if not raw or ":" not in raw:
             continue
-        owner_token, ts_str = raw.split(":", 1)
+        parts = raw.split(":")
+        owner_token = parts[0]
         try:
-            owner_ts = float(ts_str.strip())
-        except ValueError:
+            owner_ts = float(parts[1].strip())
+        except (IndexError, ValueError):
             owner_ts = now_ts
-        if now_ts - owner_ts < 21600:
+        try:
+            lease_ttl = (
+                float(parts[2].strip())
+                if len(parts) >= 3 and parts[2].strip()
+                else float(DEFAULT_ALPHA_LEASE_TTL_SEC)
+            )
+        except ValueError:
+            lease_ttl = float(DEFAULT_ALPHA_LEASE_TTL_SEC)
+        if now_ts - owner_ts < lease_ttl:
             if not owner_token or not caller_token or not secrets.compare_digest(owner_token, caller_token):
                 raise RunError("another alpha sync/benchmark session owns this worker")
 

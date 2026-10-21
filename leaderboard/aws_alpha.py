@@ -1132,6 +1132,7 @@ def run_alpha_benchmarks(
     collapse_failed = False
     collapse_armed = False
     lease_acquired = False
+    lease_ttl_sec = max(86400, int(batch_deadline_min * 60) + 7200)
     sync_token = f"{os.getpid()}_{int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)}"
     sync_dir = f"~/db-fork.sync.{sync_token}"
 
@@ -1152,15 +1153,17 @@ def run_alpha_benchmarks(
             "for owner_file in ~/db-fork.alpha.owner ~/db-fork/leaderboard/.runs/alpha.owner; do "
             'if [ -f "$owner_file" ]; then '
             'owner_ts="$(cut -d: -f2 "$owner_file" 2>/dev/null || echo 0)"; '
+            'owner_ttl="$(cut -d: -f3 "$owner_file" 2>/dev/null)"; '
+            '[ -n "$owner_ttl" ] || owner_ttl=86400; '
             'now_ts="$(date +%s)"; '
-            'if [ "$((now_ts - owner_ts))" -lt 21600 ]; then exit 42; fi; '
+            'if [ "$((now_ts - owner_ts))" -lt "$owner_ttl" ]; then exit 42; fi; '
             "fi; "
             "done; "
             "for f in ~/db-fork/leaderboard/.runs/*.journal.json ~/db-fork/leaderboard/.runs/*.active.json; do "
             '[ -e "$f" ] && exit 43; '
             "done; "
-            f'now_ts="$(date +%s)" && printf "%s:%s\\n" {shlex.quote(sync_token)} "$now_ts" >~/db-fork.alpha.owner && '
-            f'printf "%s:%s\\n" {shlex.quote(sync_token)} "$now_ts" >~/db-fork/leaderboard/.runs/alpha.owner && '
+            f'now_ts="$(date +%s)" && printf "%s:%s:%s\\n" {shlex.quote(sync_token)} "$now_ts" "{lease_ttl_sec}" >~/db-fork.alpha.owner && '
+            f'printf "%s:%s:%s\\n" {shlex.quote(sync_token)} "$now_ts" "{lease_ttl_sec}" >~/db-fork/leaderboard/.runs/alpha.owner && '
             f"rm -rf {sync_dir} && mkdir -p {sync_dir} && exit 0; "
             "fi; "
             "sleep 5; "
@@ -1266,7 +1269,13 @@ def run_alpha_benchmarks(
             + "lock_fd 9 || exit 42; "
             + f"grep -q '^{sync_token}:' ~/db-fork.alpha.owner 2>/dev/null || exit 42; "
             + "}",
-            f'trap "rm -rf {sync_dir}" EXIT',
+            (
+                f'trap \'now_ts="$(date +%s)"; '
+                f'if grep -q "^{sync_token}:" ~/db-fork.alpha.owner 2>/dev/null; then '
+                f'printf "%s:%s:%s\\n" {shlex.quote(sync_token)} "$now_ts" "{lease_ttl_sec}" >~/db-fork.alpha.owner; '
+                f'printf "%s:%s:%s\\n" {shlex.quote(sync_token)} "$now_ts" "{lease_ttl_sec}" >~/db-fork/leaderboard/.runs/alpha.owner; '
+                f'fi; rm -rf {sync_dir}\' EXIT'
+            ),
             f"sudo -n /sbin/shutdown -P +{deadman_min} >/dev/null 2>&1",
             *(["eval \"$(cat)\""] if env_stdin else []),
             activate_sync,
@@ -1312,11 +1321,15 @@ def run_alpha_benchmarks(
         rc = run_res.returncode
     finally:
         release_rc = 0
-        if collapse_after and collapse_armed:
-            col_res = collapse_alpha(aws=aws, stack=stack, board=board, runs_dir=runs_dir, keep_local_site=True)
-            if not col_res.get("collapsed", True):
-                collapse_failed = True
-        elif lease_acquired:
+        if lease_acquired:
+            will_collapse = bool(collapse_after and collapse_armed)
+            owner_post_action = (
+                f'now_ts="$(date +%s)" && '
+                f'printf "%s:%s:%s\\n" {shlex.quote(sync_token)} "$now_ts" "{lease_ttl_sec}" >~/db-fork.alpha.owner && '
+                f'printf "%s:%s:%s\\n" {shlex.quote(sync_token)} "$now_ts" "{lease_ttl_sec}" >~/db-fork/leaderboard/.runs/alpha.owner; exit 0; '
+                if will_collapse
+                else "rm -f ~/db-fork.alpha.owner ~/db-fork/leaderboard/.runs/alpha.owner; exit 0; "
+            )
             release_script = (
                 "{ "
                 + _PORTABLE_LOCK_FD
@@ -1324,19 +1337,24 @@ def run_alpha_benchmarks(
                 "exec 9>>~/db-fork/leaderboard/.runs/alpha.lock || exit 1; "
                 "lock_fd 9 || exit 42; "
                 f"rm -rf {sync_dir}; "
-                f"if grep -q '^{sync_token}:' ~/db-fork.alpha.owner 2>/dev/null || "
-                f"grep -q '^{sync_token}:' ~/db-fork/leaderboard/.runs/alpha.owner 2>/dev/null; then "
-                "rm -f ~/db-fork.alpha.owner ~/db-fork/leaderboard/.runs/alpha.owner; exit 0; "
-                "fi; exit 42; "
+                f"if grep -q '^{sync_token}:' ~/db-fork.alpha.owner 2>/dev/null && "
+                f"{{ [ ! -f ~/db-fork/leaderboard/.runs/alpha.owner ] || grep -q '^{sync_token}:' ~/db-fork/leaderboard/.runs/alpha.owner 2>/dev/null; }}; then "
+                + owner_post_action
+                + "fi; exit 42; "
                 "}"
             )
             rel_res = cmd_runner(["ssh", *ssh_opts, ssh_target, release_script])
             if rel_res.returncode != 0:
                 release_rc = rel_res.returncode or 1
+                collapse_failed = True
                 print(
-                    f"error: failed to release alpha lease on {ssh_target} (exit {rel_res.returncode})",
+                    f"error: failed to verify/release alpha lease on {ssh_target} (exit {rel_res.returncode})",
                     file=sys.stderr,
                 )
+        if collapse_after and collapse_armed and release_rc == 0:
+            col_res = collapse_alpha(aws=aws, stack=stack, board=board, runs_dir=runs_dir, keep_local_site=True)
+            if not col_res.get("collapsed", True):
+                collapse_failed = True
     if release_rc != 0 and rc == 0:
         return release_rc
     return 1 if collapse_failed and rc == 0 else rc

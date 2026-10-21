@@ -748,7 +748,7 @@ class AwsAlphaLifecycle(Board):
             cmd_runner=fake_cmd_runner,
         )
         self.assertEqual(rc, 0)
-        self.assertEqual(len(ssh_rsync_calls), 4, "wait for bootstrap, rsync up, ssh worker run, rsync pull (lease retained through collapse)")
+        self.assertEqual(len(ssh_rsync_calls), 5, "wait for bootstrap, rsync up, ssh worker run, rsync pull, ssh teardown ownership verify+refresh")
         self.assertTrue((self.site / "alpha" / "data.js").is_file(), "--collapse-after keeps local .site/alpha while tearing down AWS")
         self.assertFalse((self.runs / "aws_alpha_state.json").exists(), "AWS state is collapsed after the run")
         self.assertEqual(self.cloud["sgs"], [])
@@ -1131,6 +1131,38 @@ class AwsAlphaLifecycle(Board):
             cmd_runner=fail_on_lease_release,
         )
         self.assertEqual(rc_rel_fail, 42, "failed lease release when retaining instance must return nonzero")
+
+        # Lease aged 21,601s (>6h, within 12h batch deadline / 24h TTL) still blocks check_alpha_lease and wait_script;
+        # and if teardown ownership check fails (exit 42) when collapse_after=True, collapse_alpha is skipped
+        import time as _time
+
+        six_hr_plus_ts = int(_time.time()) - 21601
+        (runs_sub / "alpha.owner").write_text(f"foreign_token:{six_hr_plus_ts}:86400\n")
+        with self.assertRaisesRegex(micro.RunError, "another alpha sync/benchmark session owns this worker"):
+            micro.check_alpha_lease(runs_sub)
+        (runs_sub / "alpha.owner").unlink(missing_ok=True)
+
+        collapse_verify_fail_calls = []
+
+        def fail_on_teardown_verify(cmd: list[str], **_kw):
+            collapse_verify_fail_calls.append(cmd)
+            if len(collapse_verify_fail_calls) == 5:
+                return subprocess.CompletedProcess(cmd, 42, stdout="", stderr="ownership lost")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        rc_col_verify_fail = self.aws_alpha.run_alpha_benchmarks(
+            aws=aws,
+            stack="branchbench-alpha",
+            systems="dolt",
+            deploy_site_after=False,
+            collapse_after=True,
+            board=self.board,
+            runs_dir=self.runs,
+            cmd_runner=fail_on_teardown_verify,
+        )
+        self.assertEqual(rc_col_verify_fail, 42, "lost ownership before teardown must return nonzero and skip collapse")
+        self.assertTrue((self.runs / "aws_alpha_state.json").is_file(), "worker must not be collapsed when ownership check fails")
+        self.assertNotIn("rm -f ~/db-fork.alpha.owner", " ".join(collapse_verify_fail_calls[4]), "collapse path refreshes owner rather than deleting it")
 
         # Execute the complete generated remote_script with a failing sudo stub and assert worker does not execute
         import shlex as _shlex
