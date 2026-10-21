@@ -185,9 +185,12 @@ usermod -aG docker ubuntu || true
 systemctl enable --now docker
 
 cat >/etc/sudoers.d/branchbench-shutdown <<'EOF'
-ubuntu ALL=(root) NOPASSWD: /sbin/shutdown -h now, /usr/sbin/shutdown -h now
+ubuntu ALL=(root) NOPASSWD: /sbin/shutdown, /usr/sbin/shutdown
 EOF
 chmod 0440 /etc/sudoers.d/branchbench-shutdown
+
+# Dead-man auto-poweroff timer (6 hours) in case the operator disconnects after 'up'
+/sbin/shutdown -P +360 >/dev/null 2>&1 || true
 
 mkdir -p /mnt/nvme
 ROOT_DISK="$(lsblk -no PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null | head -n1 || true)"
@@ -369,6 +372,20 @@ def discover_stack_resources(aws: AwsCli, stack: str, state: dict[str, Any]) -> 
         keys.append(state_key)
 
     bucket = str(state.get("bucket") or "")
+    if not bucket:
+        try:
+            b_resp = aws.call_json(["s3api", "list-buckets"])
+            for b_item in b_resp.get("Buckets") or []:
+                b_name = str((b_item or {}).get("Name") or "")
+                if b_name.startswith(f"{stack}-"):
+                    try:
+                        verify_bucket_ownership(aws, stack, b_name)
+                        bucket = b_name
+                        break
+                    except AlphaError:
+                        continue
+        except AlphaError:
+            pass
     return {
         "stack": stack,
         "region": aws.region,
@@ -459,6 +476,18 @@ def ensure_security_group(aws: AwsCli, stack: str, ssh_cidr: str, vpc_id: str = 
     return sg_id
 
 
+def _classify_head_bucket(aws: AwsCli, bucket: str) -> str:
+    """Return 'exists' if head-bucket succeeds, 'missing' on 404/NoSuchBucket, or raise AlphaError on 403/other errors."""
+    head = aws.call_text(["s3api", "head-bucket", "--bucket", bucket], check=False)
+    if head.returncode == 0:
+        return "exists"
+    detail = (head.stderr or head.stdout or "").strip()
+    low = detail.lower()
+    if not detail or "404" in low or "not found" in low or "nosuchbucket" in low:
+        return "missing"
+    raise AlphaError(f"aws s3api head-bucket failed for {bucket!r}: {detail}")
+
+
 def verify_bucket_ownership(aws: AwsCli, stack: str, bucket: str) -> None:
     """Refuse to overwrite, sync-delete, or destroy a pre-existing bucket unless its tags prove alpha stack ownership."""
     try:
@@ -486,8 +515,8 @@ def verify_bucket_ownership(aws: AwsCli, stack: str, bucket: str) -> None:
 def ensure_bucket(aws: AwsCli, stack: str, bucket: str, public_site: bool = False) -> str:
     if not BUCKET_RE.fullmatch(bucket):
         raise AlphaError(f"invalid S3 bucket name {bucket!r}")
-    head = aws.call_text(["s3api", "head-bucket", "--bucket", bucket], check=False)
-    if head.returncode != 0:
+    bstate = _classify_head_bucket(aws, bucket)
+    if bstate == "missing":
         create_args = ["s3api", "create-bucket", "--bucket", bucket]
         if aws.region != "us-east-1":
             create_args.extend(
@@ -505,7 +534,7 @@ def ensure_bucket(aws: AwsCli, stack: str, bucket: str, public_site: bool = Fals
     )
     aws.call_text(
         ["s3api", "put-bucket-tagging", "--bucket", bucket, "--tagging", tagging],
-        check=False,
+        check=True,
     )
     if public_site:
         aws.call_text(
@@ -516,9 +545,10 @@ def ensure_bucket(aws: AwsCli, stack: str, bucket: str, public_site: bool = Fals
                 bucket,
                 "--public-access-block-configuration",
                 "BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false",
-            ]
+            ],
+            check=True,
         )
-        aws.call_text(["s3", "website", f"s3://{bucket}/", "--index-document", "index.html"])
+        aws.call_text(["s3", "website", f"s3://{bucket}/", "--index-document", "index.html"], check=True)
         policy = json.dumps(
             {
                 "Version": "2012-10-17",
@@ -533,7 +563,7 @@ def ensure_bucket(aws: AwsCli, stack: str, bucket: str, public_site: bool = Fals
                 ],
             }
         )
-        aws.call_text(["s3api", "put-bucket-policy", "--bucket", bucket, "--policy", policy])
+        aws.call_text(["s3api", "put-bucket-policy", "--bucket", bucket, "--policy", policy], check=True)
     else:
         aws.call_text(
             [
@@ -544,7 +574,7 @@ def ensure_bucket(aws: AwsCli, stack: str, bucket: str, public_site: bool = Fals
                 "--public-access-block-configuration",
                 "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true",
             ],
-            check=False,
+            check=True,
         )
     return bucket
 
@@ -640,7 +670,15 @@ def up_alpha(
     bucket_name = ""
     if not no_bucket:
         target_bucket = bucket.strip() or default_bucket_name(stack, ident["account_id"], aws.region)
-        bucket_name = ensure_bucket(aws, stack, target_bucket, public_site=public_site)
+        state["bucket"] = target_bucket
+        save_state(state, runs_dir, stack)
+        try:
+            bucket_name = ensure_bucket(aws, stack, target_bucket, public_site=public_site)
+        except BaseException:
+            if _classify_head_bucket(aws, target_bucket) == "missing":
+                state["bucket"] = ""
+                save_state(state, runs_dir, stack)
+            raise
         state["bucket"] = bucket_name
         save_state(state, runs_dir, stack)
 
@@ -691,6 +729,8 @@ def up_alpha(
                     "MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate}",
                 ]
             )
+        else:
+            run_args.extend(["--instance-initiated-shutdown-behavior", "terminate"])
         launched = aws.call_json(run_args)
     finally:
         ud_path.unlink(missing_ok=True)
@@ -744,6 +784,8 @@ def deploy_alpha_site(
         raise AlphaError(
             f"no alpha S3 bucket recorded for stack {stack!r}; pass --bucket <name> or run 'up' without --no-bucket"
         )
+    if _classify_head_bucket(aws, target_bucket) != "exists":
+        raise AlphaError(f"S3 bucket {target_bucket!r} does not exist; run 'up' first")
     verify_bucket_ownership(aws, stack, target_bucket)
     aws.call_text(
         [
@@ -789,6 +831,44 @@ def deploy_alpha_site(
         )
     print("Serve the full multi-asset alpha site locally with: python -m leaderboard.serve --phase alpha", flush=True)
     return result
+
+
+def write_sync_filelist(runs_dir: Path, stack: str, root: Path = ROOT) -> Path:
+    """Write an explicit allowlist of git-tracked files and safe git object/ref metadata (never untracked files or .git/config)."""
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    filelist_path = runs_dir / f"{stack}-sync-files.txt"
+    tracked: list[str] = []
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(root), "ls-files"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        for line in res.stdout.splitlines():
+            rel = line.strip()
+            if not rel:
+                continue
+            if (
+                rel == ".env"
+                or rel.startswith(".env.")
+                or rel.endswith((".pem", ".key"))
+                or rel.startswith("leaderboard/.site/")
+                or rel.startswith("leaderboard/.runs/")
+            ):
+                continue
+            if (root / rel).exists():
+                tracked.append(rel)
+    except Exception:
+        tracked = ["leaderboard", "microbench", "macrobench", "dblib", "util", "pyproject.toml", "uv.lock", "build_protos.py"]
+    for git_rel in (".git/HEAD", ".git/packed-refs", ".git/refs", ".git/objects"):
+        if (root / git_rel).exists():
+            tracked.append(git_rel)
+    dataset_rel = "leaderboard/data/tpcc_10w.sql"
+    if (root / dataset_rel).is_file() and dataset_rel not in tracked:
+        tracked.append(dataset_rel)
+    filelist_path.write_text("\n".join(dict.fromkeys(tracked)) + "\n", encoding="utf-8")
+    return filelist_path
 
 
 def run_alpha_benchmarks(
@@ -882,30 +962,35 @@ def run_alpha_benchmarks(
                 f"timed out waiting for cloud-init bootstrap (/var/lib/branchbench-alpha-ready) on {ssh_target}"
             )
 
-        # 2. Sync repository to worker (excluding gitignored/untracked secrets and local runtime state)
-        sync_up = [
-            "rsync",
-            "-az",
-            "--delete",
-            "--filter=:- .gitignore",
-            "--exclude=.git/objects/pack/*.tmp",
-            "--exclude=.venv",
-            "--exclude=.env",
-            "--exclude=.env.*",
-            "--exclude=*.pem",
-            "--exclude=*.key",
-            "--exclude=credentials*",
-            "--exclude=run_stats",
-            "--exclude=*_stats/",
-            "--exclude=leaderboard/.site",
-            "--exclude=leaderboard/.runs",
-            "-e",
-            ssh_rsh,
-            f"{ROOT}/",
-            f"{ssh_target}:~/db-fork/",
-        ]
-        if cmd_runner(sync_up).returncode != 0:
-            raise AlphaError(f"failed to rsync repository to {ssh_target}:~/db-fork/")
+        # 2. Sync only git-tracked files and safe .git metadata (never untracked files or .git/config)
+        filelist_path = write_sync_filelist(runs_dir, stack, ROOT)
+        try:
+            sync_up = [
+                "rsync",
+                "-az",
+                "--recursive",
+                "--delete",
+                "--delete-missing-args",
+                f"--files-from={filelist_path}",
+                "--exclude=.git/objects/pack/*.tmp",
+                "--exclude=.git/config",
+                "--exclude=.venv",
+                "--exclude=.env",
+                "--exclude=.env.*",
+                "--exclude=*.pem",
+                "--exclude=*.key",
+                "--exclude=credentials*",
+                "--exclude=leaderboard/.site",
+                "--exclude=leaderboard/.runs",
+                "-e",
+                ssh_rsh,
+                f"{ROOT}/",
+                f"{ssh_target}:~/db-fork/",
+            ]
+            if cmd_runner(sync_up).returncode != 0:
+                raise AlphaError(f"failed to rsync repository to {ssh_target}:~/db-fork/")
+        finally:
+            filelist_path.unlink(missing_ok=True)
 
         # 3. Execute benchmark batch on worker (pass hosted DB secrets over encrypted SSH stdin, never in argv)
         env_stdin = "".join(
@@ -913,11 +998,13 @@ def run_alpha_benchmarks(
             for k in HOSTED_ENV_KEYS
             if os.environ.get(k)
         )
+        deadman_min = max(15, int(batch_deadline_min) + 15)
         remote_steps = [
             'export PATH="$HOME/.local/bin:$PATH"',
+            f"sudo -n /sbin/shutdown -P +{deadman_min} >/dev/null 2>&1 || true",
             *(["eval \"$(cat)\""] if env_stdin else []),
             "cd ~/db-fork",
-            "uv sync --frozen",
+            "(uv sync --frozen --extra chronos || uv sync --frozen)",
             "uv run --frozen python build_protos.py",
             shlex.join(worker_cmd),
         ]
@@ -928,13 +1015,14 @@ def run_alpha_benchmarks(
         else:
             run_res = cmd_runner(ssh_run_cmd)
 
-        # 4. Pull results and macro records back to local leaderboard/ even if a benchmark step failed
+        # 4. Pull results, macro, and verbs records back to local leaderboard/ even if a benchmark step failed
         pull_cmd = [
             "rsync",
             "-az",
             "--include=*/",
             "--include=*/results/***",
             "--include=*/macro/***",
+            "--include=*/verbs/***",
             "--exclude=*",
             "-e",
             ssh_rsh,
@@ -980,8 +1068,7 @@ def status_alpha(
     discovered = discover_stack_resources(aws, stack, state)
     bucket_exists = False
     if discovered["bucket"]:
-        head = aws.call_text(["s3api", "head-bucket", "--bucket", discovered["bucket"]], check=False)
-        bucket_exists = head.returncode == 0
+        bucket_exists = _classify_head_bucket(aws, discovered["bucket"]) == "exists"
     active_compute = any(
         i["state"] in ("pending", "running", "stopping", "stopped") for i in discovered["instances"]
     )
@@ -1009,24 +1096,36 @@ def status_alpha(
 
 
 def _empty_and_delete_bucket(aws: AwsCli, bucket: str, stack: str = DEFAULT_STACK) -> bool:
-    head = aws.call_text(["s3api", "head-bucket", "--bucket", bucket], check=False)
-    if head.returncode != 0:
+    try:
+        bstate = _classify_head_bucket(aws, bucket)
+    except AlphaError:
+        return False
+    if bstate == "missing":
         return True
     verify_bucket_ownership(aws, stack, bucket)
-    aws.call_text(["s3", "rm", f"s3://{bucket}", "--recursive"], check=False)
-    versions = aws.call_json(["s3api", "list-object-versions", "--bucket", bucket])
-    objs = [
-        {"Key": str(item["Key"]), "VersionId": str(item["VersionId"])}
-        for key in ("Versions", "DeleteMarkers")
-        for item in (versions.get(key) or [])
-        if item.get("Key") and item.get("VersionId")
-    ]
-    for idx in range(0, len(objs), 500):
-        batch = json.dumps({"Objects": objs[idx : idx + 500], "Quiet": True})
-        aws.call_text(
-            ["s3api", "delete-objects", "--bucket", bucket, "--delete", batch],
-            check=False,
-        )
+    rm_res = aws.call_text(["s3", "rm", f"s3://{bucket}", "--recursive"], check=False)
+    if rm_res.returncode != 0:
+        return False
+    for _ in range(10):
+        versions = aws.call_json(["s3api", "list-object-versions", "--bucket", bucket])
+        objs = [
+            {"Key": str(item["Key"]), "VersionId": str(item["VersionId"])}
+            for key in ("Versions", "DeleteMarkers")
+            for item in (versions.get(key) or [])
+            if item.get("Key") and item.get("VersionId")
+        ]
+        if not objs:
+            break
+        for idx in range(0, len(objs), 500):
+            batch = json.dumps({"Objects": objs[idx : idx + 500], "Quiet": True})
+            del_obj = aws.call_text(
+                ["s3api", "delete-objects", "--bucket", bucket, "--delete", batch],
+                check=False,
+            )
+            if del_obj.returncode != 0:
+                return False
+        if not versions.get("IsTruncated"):
+            break
     del_res = aws.call_text(["s3api", "delete-bucket", "--bucket", bucket], check=False)
     return del_res.returncode == 0
 
@@ -1140,11 +1239,16 @@ def collapse_alpha(
         "phase": "alpha",
         "stack": stack,
         "region": aws.region,
+        "collapsed": not has_remaining,
         "terminated_instances": instance_ids,
         "deleted_volumes": deleted_volumes,
         "deleted_security_groups": deleted_sgs,
         "deleted_key_pairs": deleted_keys,
         "deleted_bucket": deleted_bucket,
+        "remaining_volumes": remaining_volumes,
+        "remaining_security_groups": remaining_sgs,
+        "remaining_key_pairs": remaining_keys,
+        "remaining_bucket": remaining_bucket or None,
         "local_alpha_site_removed": not keep_local_site and not alpha_site.exists(),
         "state_file_removed": not spath.exists(),
         "ongoing_aws_cost": "$0.00/hr" if not has_remaining else "partial (see remaining resources)",
@@ -1257,13 +1361,13 @@ def main(argv: list[str] | None = None) -> int:
             status_alpha(aws=aws, stack=args.stack)
             return 0
         if args.command in ("collapse", "down", "destroy", "teardown"):
-            collapse_alpha(
+            res = collapse_alpha(
                 aws=aws,
                 stack=args.stack,
                 keep_bucket=args.keep_bucket,
                 keep_local_site=args.keep_local_site,
             )
-            return 0
+            return 0 if res.get("collapsed", True) else 1
     except AlphaError as exc:
         print(f"aws_alpha: {exc}", file=sys.stderr)
         return 2

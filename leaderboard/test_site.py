@@ -606,7 +606,16 @@ class AwsAlphaLifecycle(Board):
             self.cloud["keys"] = [k for k in self.cloud["keys"] if k["KeyName"] != kname]
         elif (svc, op) == ("s3api", "head-bucket"):
             bname = tokens[tokens.index("--bucket") + 1]
+            if bname in self.cloud.get("forbidden_buckets", set()):
+                return subprocess.CompletedProcess(
+                    cmd,
+                    1,
+                    stdout="",
+                    stderr="An error occurred (403) when calling the HeadBucket operation: Forbidden",
+                )
             rc = 0 if bname in self.cloud["buckets"] else 1
+        elif (svc, op) == ("s3api", "list-buckets"):
+            out = json.dumps({"Buckets": [{"Name": b} for b in sorted(self.cloud["buckets"])]})
         elif (svc, op) == ("s3api", "create-bucket"):
             bname = tokens[tokens.index("--bucket") + 1]
             self.cloud["buckets"].add(bname)
@@ -679,16 +688,15 @@ class AwsAlphaLifecycle(Board):
         )
         self.assertFalse(active_status["collapsed"])
 
-        # Even if state file is lost before collapse, tag discovery still tears everything down
+        # Even if state file is completely lost before collapse, tag discovery (including list-buckets + tag check) tears everything down
         (self.runs / "aws_alpha_state.json").unlink()
-        # Re-save bucket in state or test tag discovery for EC2/EBS/SG/Key + state bucket
-        self.aws_alpha.save_state({"bucket": state["bucket"]}, self.runs, "branchbench-alpha")
         collapsed = self.aws_alpha.collapse_alpha(
             aws=aws,
             stack="branchbench-alpha",
             board=self.board,
             runs_dir=self.runs,
         )
+        self.assertTrue(collapsed["collapsed"])
         self.assertEqual(collapsed["terminated_instances"], ["i-0alpha999"])
         self.assertEqual(collapsed["deleted_volumes"], ["vol-0alpha1"])
         self.assertEqual(collapsed["deleted_security_groups"], ["sg-0alpha123"])
@@ -797,6 +805,44 @@ class AwsAlphaLifecycle(Board):
         self.assertFalse((self.runs / "aws_alpha_state.json").exists(), "collapse_after ran in finally despite pull failure")
         self.assertEqual(self.cloud["sgs"], [])
         self.assertEqual(self.cloud["buckets"], set())
+
+    def test_head_bucket_403_fails_closed_and_partial_collapse_retains_state_and_Sync_excludes_untracked(self):
+        aws = self.aws_alpha.AwsCli(region="us-east-1", runner=self.fake_aws_runner)
+        self.cloud.setdefault("forbidden_buckets", set()).add("forbidden-bucket")
+        with self.assertRaisesRegex(self.aws_alpha.AlphaError, "403|Forbidden"):
+            self.aws_alpha.up_alpha(
+                aws=aws,
+                stack="branchbench-alpha",
+                bucket="forbidden-bucket",
+                runs_dir=self.runs,
+                http_getter=lambda _url: "203.0.113.9",
+            )
+
+        # Partial collapse keeps state file and returns collapsed=False
+        state = self.aws_alpha.up_alpha(
+            aws=aws,
+            stack="branchbench-alpha",
+            runs_dir=self.runs,
+            http_getter=lambda _url: "203.0.113.9",
+        )
+        self.cloud.setdefault("fail_delete_buckets", set()).add(state["bucket"])
+        partial = self.aws_alpha.collapse_alpha(
+            aws=aws,
+            stack="branchbench-alpha",
+            board=self.board,
+            runs_dir=self.runs,
+        )
+        self.assertFalse(partial["collapsed"])
+        self.assertEqual(partial["remaining_bucket"], state["bucket"])
+        self.assertTrue((self.runs / "aws_alpha_state.json").is_file(), "state file retained when bucket delete fails")
+
+        # write_sync_filelist never includes untracked files or .git/config
+        untracked = self.board / "untracked_secret_notes.txt"
+        untracked.write_text("TOP_SECRET")
+        flist = self.aws_alpha.write_sync_filelist(self.runs, "branchbench-alpha", self.aws_alpha.ROOT)
+        lines = set(flist.read_text().splitlines())
+        self.assertNotIn(".git/config", lines)
+        self.assertFalse(any("untracked_secret_notes.txt" in ln for ln in lines))
 
 
 if __name__ == "__main__":
