@@ -72,9 +72,11 @@ CAMPAIGN_FIELDS = {
 ENVIRONMENT = ("cpu", "cpus", "memory_bytes")
 # What the page may see of the child's e2e stats. Paths, logs and Parquet stay private.
 EVIDENCE_KEYS = ("run_id", "backend", "scenario", "status", "elapsed_sec", "max_runtime_sec", "timed_out",
-                 "seed", "schema", "workload", "setup", "capabilities", "implementation", "native_only", "invariants",
-                 "metrics", "work", "worker_errors", "failed_verbs", "workflow_supported", "unsupported_ops",
-                 "op_status_counts", "commit_ref_fallbacks", "spine_load")
+                 "stop_reason", "op_stall_sec", "stalls", "seed", "schema", "workload", "setup", "capabilities",
+                 "implementation", "native_only", "invariants", "metrics", "work", "worker_errors", "failed_verbs",
+                 "workflow_supported", "unsupported_ops", "op_status_counts", "commit_ref_fallbacks", "spine_load",
+                 "backend_observations", "storage_before_bytes", "storage_after_bytes", "storage_delta_bytes",
+                 "storage", "worker_time")
 SAMPLE = 400  # scrubbed() keeps at most this many entries of any list or dict
 URI_PASSWORD = re.compile(r"(://[^:/@\s]+):[^@/\s]*@")
 # Evidence legitimately holds "passed" counters and masked URIs (user:***@host).
@@ -229,6 +231,18 @@ def evidence_problems(e: dict) -> list[str]:
          and all(isinstance(e.get("implementation", {}).get(k, {}), dict) for k in ("verbs", "notes")),
          "declared implementation is malformed")
     need("native_only" not in e or isinstance(e["native_only"], bool), "native_only is not a boolean")
+    need("stop_reason" not in e or isinstance(e["stop_reason"], str), "stop_reason is not a string")
+    need("op_stall_sec" not in e or seconds(e["op_stall_sec"]), "op_stall_sec is not a non-negative finite number")
+    need("stalls" not in e or (isinstance(e["stalls"], list) and all(isinstance(s, dict) for s in e["stalls"])),
+         "stalls is not a list of objects")
+    need("backend_observations" not in e or isinstance(e["backend_observations"], (dict, list)),
+         "backend_observations is not an object")
+    for s_key in ("storage_before_bytes", "storage_after_bytes", "storage_delta_bytes"):
+        need(s_key not in e or type(e[s_key]) is int, f"{s_key} is not an integer")
+    need("storage" not in e or isinstance(e["storage"], dict), "storage is not an object")
+    wt = e.get("worker_time")
+    need(wt is None or (isinstance(wt, dict) and all(seconds(wt.get(k)) for k in ("branch_sec", "data_sec", "total_sec", "spine_sec") if k in wt)),
+         "worker_time is malformed")
     return problems
 
 

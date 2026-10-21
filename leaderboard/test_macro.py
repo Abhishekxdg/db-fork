@@ -825,6 +825,116 @@ class ChildProcess(unittest.TestCase):
             digest_b = run_macro.source_digest({"files": {"/home/ubuntu/checkout_b/uv.lock": "abc", "/home/ubuntu/checkout_b/leaderboard/run.py": "def"}})
         self.assertEqual(digest_a, digest_b)
 
+    def test_upstream_result_collector_and_parquet_are_bridged_into_verified_evidence(self):
+        from dblib.result_collector import ResultCollector
+        import dblib.result_pb2 as rslt
+        from leaderboard import validate_macro
+        from macrobench import task_pb2 as tp
+
+        with tempfile.TemporaryDirectory() as folder:
+            outdir = Path(folder)
+            run_id = "bb_12345678"
+            cfg_file = outdir / "config.textproto"
+            cfg, _ = run_macro.effective_config(run_macro.config_path("rl_env", "mini"), tp.Backend.DOLT, run_id)
+            from google.protobuf import text_format
+            cfg_file.write_text(text_format.MessageToString(cfg))
+
+            collector = ResultCollector(run_id=run_id, output_dir=str(outdir))
+            collector.set_context(table_name="macrobench", table_schema="rl_env", initial_db_size=0, seed=42)
+            expected = run_macro.expected_work_units(cfg)
+            self.assertGreater(expected, 0)
+            for i in range(expected):
+                collector.emit(rslt.OpType.BRANCH, status=rslt.OpStatus.OK, latency=0.01, start_time=1.0, end_time=1.01)
+                collector.emit(rslt.OpType.COMMIT, status=rslt.OpStatus.OK, latency=0.02, start_time=1.01, end_time=1.03)
+                collector.emit(rslt.OpType.EXEC, status=rslt.OpStatus.OK, latency=0.05, start_time=1.03, end_time=1.08, exec_id=i + 1)
+                collector.emit(rslt.OpType.READ, status=rslt.OpStatus.OK, latency=0.01, start_time=1.04, end_time=1.05, exec_id=i + 1)
+                collector.emit(rslt.OpType.DELETE, status=rslt.OpStatus.OK, latency=0.01, start_time=1.08, end_time=1.09)
+            collector.write_to_parquet(append=False)
+
+            e2e = {
+                "run_id": run_id,
+                "backend": "DOLT",
+                "scenario": "rl_env",
+                "status": "completed",
+                "elapsed_sec": 2.5,
+                "max_runtime_sec": 60,
+                "timed_out": False,
+                "stop_reason": "",
+                "op_stall_sec": 30.0,
+                "stalls": [],
+                "seed": 42,
+                "setup": {"setup_sec": 1.2, "schema_failed": [], "seed_commit": "OK"},
+                "capabilities": {"branch": True, "commit": True, "diff": True, "merge": True, "delete": True},
+                "implementation": {"verbs": {"branch": "native", "commit": "native", "delete": "native"}, "notes": {}},
+                "native_only": False,
+                "invariants": {
+                    "enabled": True,
+                    "checked": 1,
+                    "passed": 1,
+                    "failed": 0,
+                    "not_applicable": 0,
+                    "all_passed": True,
+                    "results": [{"name": "trajectory_determinism", "passed": True, "detail": "deterministic"}],
+                },
+                "metrics": {"rollouts_completed": expected},
+                "backend_observations": {"isolation": "clean snapshot visibility"},
+                "storage_before_bytes": 1024 * 1024,
+                "storage_after_bytes": 2 * 1024 * 1024,
+                "storage_delta_bytes": 1024 * 1024,
+                "storage": {
+                    "unit": "bytes",
+                    "scope": "database",
+                    "points": {
+                        "after_setup": 1024 * 1024,
+                        "after_workflow": 2 * 1024 * 1024,
+                        "after_gc": 1536 * 1024,
+                        "after_cleanup": 1024 * 1024,
+                    },
+                },
+            }
+            e2e.update(collector.support_summary())
+            (outdir / f"{run_id}_e2e_stats.json").write_text(json.dumps(e2e))
+            (outdir / "runner.log").write_text("[rl_env] Task 0 rollout 0 done\n")
+
+            raw_before = json.loads((outdir / f"{run_id}_e2e_stats.json").read_text())
+            self.assertNotIn("work", raw_before, "upstream ResultCollector does not emit work directly")
+            self.assertNotIn("ok_seconds", raw_before["op_status_counts"]["BRANCH"], "upstream ResultCollector does not emit ok_seconds directly")
+
+            evidence, problems = run_macro.read_evidence(outdir, run_id)
+            self.assertEqual(problems, [])
+            self.assertIsNotNone(evidence)
+            status, reasons = validate_macro.classify(evidence, {"exit_code": 0, "ended": "exited", "error": None, "deadline_sec": 60, "log_tail": ""})
+            self.assertEqual((status, reasons), ("verified", []))
+            self.assertEqual(evidence["work"], {"expected": expected, "succeeded": expected, "failed": 0, "skipped": 0})
+            self.assertAlmostEqual(evidence["op_status_counts"]["BRANCH"]["ok_seconds"], round(expected * 0.01, 6))
+            self.assertIn("worker_time", evidence)
+            self.assertGreater(evidence["worker_time"]["total_sec"], 0.0)
+            self.assertEqual(evidence["storage"]["points"]["after_setup"], 1024 * 1024)
+            self.assertEqual(evidence["backend_observations"], {"isolation": "clean snapshot visibility"})
+
+    def test_paper_diagnostics_fields_are_preserved_and_validated(self):
+        from leaderboard import validate_macro
+        ev = good_evidence(
+            op_stall_sec=30.0,
+            stalls=[{"op": "BRANCH", "duration_sec": 45.2, "thread_id": 1}],
+            backend_observations={"retry": "connect retry observed"},
+            storage={"after_setup": 100, "after_workflow": 250, "after_gc": 200, "after_cleanup": 120},
+            storage_before_bytes=100,
+            storage_after_bytes=120,
+            storage_delta_bytes=20,
+            worker_time={"branch_sec": 1.2, "data_sec": 3.4, "total_sec": 4.6, "spine_sec": 0.5},
+        )
+        cleaned = validate_macro.evidence_summary(ev)
+        self.assertEqual(validate_macro.evidence_problems(cleaned), [])
+        self.assertEqual(cleaned["worker_time"]["total_sec"], 4.6)
+        self.assertEqual(cleaned["storage"]["after_workflow"], 250)
+        self.assertEqual(cleaned["stalls"][0]["op"], "BRANCH")
+
+        bad_wt = good_evidence(worker_time={"branch_sec": -1.0, "data_sec": 1.0, "total_sec": 0.0})
+        self.assertIn("worker_time is malformed", validate_macro.evidence_problems(bad_wt))
+        bad_stalls = good_evidence(stalls="not-a-list")
+        self.assertIn("stalls is not a list of objects", validate_macro.evidence_problems(bad_stalls))
+
 
 if __name__ == "__main__":
     unittest.main()
