@@ -30,7 +30,7 @@
 <main class="shell" id="main-content">
     <section aria-labelledby="arch-title">
         <h1 class="page-title" id="arch-title" tabindex="-1">System Architecture</h1>
-        <p class="section-description">A minimalist five-stage pipeline from local, collapsible AWS Alpha, and official production entrypoints to validated static leaderboard bundles.</p>
+        <p class="section-description">A five-stage pipeline from local and collapsible AWS Alpha entrypoints to validated static bundles, plus the fixed-hardware production target.</p>
 
         <div class="arch-grid">
             <section class="panel" id="system-diagram">
@@ -54,7 +54,7 @@
                     <div class="arch-diagram-frame" role="region" aria-label="End-to-end technical architecture diagram">
                         <svg class="arch-svg" viewBox="0 0 1120 364" role="img" aria-labelledby="arch-svg-title arch-svg-desc">
                             <title id="arch-svg-title">BranchBench Five-Stage Architecture Pipeline</title>
-                            <desc id="arch-svg-desc">Left-to-right five-column pipeline: Stage 1 Entrypoints (Local dev, AWS Alpha, Official Prod), Stage 2 Lock and Lease Gate, Stage 3 Suite Lanes (Microbench, Macrobench, Verb Scaling), Stage 4 Pluggable DB Adapters (Self-Hosted and Managed Cloud), and Stage 5 Validation and Static Site Assembly.</desc>
+                            <desc id="arch-svg-desc">Left-to-right five-column pipeline: Stage 1 Entrypoints and the planned fixed m7a.2xlarge production target with 200 GiB gp3 storage per self-hosted database; Stage 2 Lock and Lease Gate; Stage 3 Suite Lanes; Stage 4 System Integrations and compute placement; and Stage 5 Validation and Static Site Assembly.</desc>
                             <defs>
                                 <marker id="mk-ink" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
                                     <path class="arrow-ink" d="M 0 1.5 L 9 5 L 0 8.5 z"/>
@@ -78,7 +78,7 @@
                             <text class="lane-kicker" x="478" y="40">STAGE 3 · SUITE LANES</text>
 
                             <rect class="lane-bg arch-col-4" x="688" y="16" width="192" height="332" rx="12"/>
-                            <text class="lane-kicker" x="702" y="40">STAGE 4 · DB ADAPTERS</text>
+                            <text class="lane-kicker" x="702" y="40">STAGE 4 · DB SYSTEMS</text>
 
                             <rect class="lane-bg arch-col-5" x="912" y="16" width="192" height="332" rx="12"/>
                             <text class="lane-kicker" x="926" y="40">STAGE 5 · SITE PUBLISH</text>
@@ -98,9 +98,9 @@
                             </g>
                             <g class="arch-node" data-stage="1" data-path="prod">
                                 <rect class="node-accent" x="28" y="246" width="168" height="78" rx="8"/>
-                                <text class="node-title" x="40" y="270">Official Prod</text>
-                                <text class="node-mono" x="40" y="290">aws_worker.sh</text>
-                                <text class="node-sub" x="40" y="308">Dedicated cloud VM</text>
+                                <text class="node-title" x="40" y="270">Prod Target</text>
+                                <text class="node-mono" x="40" y="290">m7a.2xlarge</text>
+                                <text class="node-sub" x="40" y="308">1 DB/VM · gp3 200 GiB</text>
                             </g>
 
                             <!-- Edges 1 -> 2 -->
@@ -164,13 +164,13 @@
                                 <text class="node-title-inv" x="712" y="84">Self-Hosted DBs</text>
                                 <text class="node-mono-inv" x="712" y="106">Dolt · MO · SeekDB</text>
                                 <text class="node-mono-inv" x="712" y="126">FILE_COPY · Chronos</text>
-                                <text class="node-sub-inv" x="712" y="148">start → check → stop</text>
+                                <text class="node-sub-inv" x="712" y="148">systems/&lt;key&gt;/ hooks</text>
                             </g>
                             <g class="arch-node" data-stage="4" data-path="local alpha prod">
                                 <rect class="node-code" x="700" y="202" width="168" height="122" rx="8"/>
                                 <text class="node-title-inv" x="712" y="228">Managed Cloud</text>
                                 <text class="node-mono-inv" x="712" y="250">Neon · Tiger · Xata</text>
-                                <text class="node-sub-inv" x="712" y="272">preflight() API key</text>
+                                <text class="node-sub-inv" x="712" y="272">system.json + connector</text>
                                 <text class="node-sub-inv" x="712" y="292">SQL rtt_ms probe</text>
                             </g>
 
@@ -222,8 +222,8 @@
                         <label class="arch-step-tab">
                             <input type="radio" name="arch-stage" id="stage-4">
                             <span class="arch-step-kicker">Stage 04</span>
-                            <span class="arch-step-name">DB Adapters</span>
-                            <span class="arch-step-meta">Self-hosted &amp; cloud hooks</span>
+                            <span class="arch-step-name">DB Systems</span>
+                            <span class="arch-step-meta">Validated integration catalog</span>
                         </label>
                         <label class="arch-step-tab">
                             <input type="radio" name="arch-stage" id="stage-5">
@@ -247,13 +247,13 @@
                                 </div>
                                 <div class="arch-detail-box">
                                     <h4>Personal AWS Staging (<code>alpha</code>)</h4>
-                                    <p>Provisions a Spot <code>i4i.2xlarge</code> with XFS <code>reflink=1</code> NVMe and private S3, then collapses all resources to <code>$0.00/hr</code>.</p>
+                                    <p>Defaults to a Spot <code>i4i.2xlarge</code> with XFS <code>reflink=1</code> NVMe and private S3, then collapses all resources to <code>$0.00/hr</code>.</p>
                                     <code class="arch-code-pill">./leaderboard/aws_alpha.sh run --preset mini --collapse-after</code>
                                 </div>
                                 <div class="arch-detail-box">
-                                    <h4>Official Cloud Batch (<code>prod</code>)</h4>
-                                    <p>Runs database adapters sequentially on dedicated cloud NVMe hardware and publishes allowlisted runs without a phase badge.</p>
-                                    <code class="arch-code-pill">./leaderboard/aws_worker.sh --machine &lt;id&gt; --preset full</code>
+                                    <h4>Official Cloud Target (<code>prod</code>)</h4>
+                                    <p>The planned launcher assigns one On-Demand <code>m7a.2xlarge</code> to each self-hosted database. Each worker has a dedicated 200 GiB <code>gp3</code> data volume. Workers may run concurrently. Each worker runs Microbench and Macrobench sequentially.</p>
+                                    <code class="arch-code-pill">worker command: aws_worker.sh --systems &lt;db&gt; --machine &lt;id&gt; --preset full</code>
                                 </div>
                             </div>
                         </article>
@@ -308,24 +308,24 @@
 
                         <article class="arch-detail-card" data-stage="4">
                             <div class="arch-detail-head">
-                                <h3>Stage 04 · Pluggable System Adapters &amp; dblib Connectors</h3>
-                                <span class="count-badge">leaderboard/&lt;system&gt;/</span>
+                                <h3>Stage 04 · System Integrations &amp; dblib Connectors</h3>
+                                <span class="count-badge">leaderboard/systems/&lt;system&gt;/</span>
                             </div>
                             <div class="arch-detail-cols">
                                 <div class="arch-detail-box">
                                     <h4>Self-Hosted Engines</h4>
-                                    <p>Dolt, Doltgres, MatrixOne, SeekDB, PostgreSQL <code>FILE_COPY</code>, and Chronos implement executable lifecycle hooks inside <code>leaderboard/&lt;system&gt;/</code>.</p>
+                                    <p>Dolt, Doltgres, MatrixOne, SeekDB, PostgreSQL <code>FILE_COPY</code>, and Chronos keep metadata, connector code, and executable lifecycle hooks inside <code>leaderboard/systems/&lt;system&gt;/</code>.</p>
                                     <code class="arch-code-pill">install → start → check → CONNECTOR → stop</code>
                                 </div>
                                 <div class="arch-detail-box">
                                     <h4>Managed Cloud Services</h4>
-                                    <p>Neon, Tiger Cloud, and Xata (<code>"hosted": "yes"</code>) validate credentials via <code>preflight()</code> and record SQL round-trip latency (<code>rtt_ms</code>).</p>
+                                    <p>Each hosted manifest declares public credential variable names. The runnable Neon and Xata connectors call <code>preflight()</code> and record SQL round-trip latency (<code>rtt_ms</code>). Tiger Cloud remains metadata-only.</p>
                                     <code class="arch-code-pill">--client-location &lt;loc&gt; · rtt_ms probe</code>
                                 </div>
                                 <div class="arch-detail-box">
-                                    <h4>Open-Closed Repository Boundary</h4>
-                                    <p>All orchestration, adapters, and UI assets live strictly inside <code>leaderboard/</code> without modifying upstream <code>dblib/</code> or benchmark logic.</p>
-                                    <code class="arch-code-pill">leaderboard/&lt;system&gt;/{system.json,connector.py}</code>
+                                    <h4>Production Compute Placement</h4>
+                                    <p>The current policy assigns <code>m7a.2xlarge</code> and the same <code>gp3</code> profile to every database. A future per-database map may override it. Different profiles must use separate hardware cohorts.</p>
+                                    <code class="arch-code-pill">current: m7a.2xlarge + gp3 · future key: database</code>
                                 </div>
                             </div>
                         </article>
@@ -441,7 +441,7 @@
                     </div>
                     <div>
                         <dt>Hardware Cohorts</dt>
-                        <dd>Every artifact records <code>execution_profile</code> (<code>local_single_host</code>, <code>economic_single_vm</code>, or <code>paper_separated_vms</code>) and only competes inside its matching profile group.</dd>
+                        <dd>Every artifact records <code>execution_profile</code> and only competes inside its matching profile group. The production target uses one fixed compute and storage profile. Per-database profiles require instance and volume provenance plus separate ranking groups before activation.</dd>
                     </div>
                 </dl>
             </section>
@@ -460,7 +460,7 @@
                     </div>
                     <div id="submission-flow">
                         <dt>Official Cloud (<code>prod</code>)</dt>
-                        <dd><code>python -m leaderboard.site</code> (default <code>prod</code>) publishes only records listed in <code>leaderboard/publish.json</code> that pass full validation (clean git commit, <code>full</code> macro preset, and a homogeneous <code>execution_profile</code> cohort across compared runs), omitting the phase badge and developer wizard.</dd>
+                        <dd>The production site already publishes only allowlisted records that pass full validation and belong to a homogeneous cohort. The planned fleet launcher will run each self-hosted database on its own On-Demand <code>m7a.2xlarge</code> with a 200 GiB <code>gp3</code> data volume.</dd>
                     </div>
                 </dl>
             </section>
@@ -501,6 +501,12 @@
                                 <td>Allowlisted in <code>publish.json</code>; clean git tree; <code>full</code> macro only</td>
                                 <td>All validated runs in <code>results/</code> and <code>macro/</code>; no mocks</td>
                                 <td>All validated runs plus <code>leaderboard.mock</code> reference rows</td>
+                            </tr>
+                            <tr>
+                                <th scope="row">Compute Placement</th>
+                                <td>Planned: one On-Demand <code>m7a.2xlarge</code> plus 200 GiB <code>gp3</code> per self-hosted database; fixed within one cohort</td>
+                                <td>One user-provisioned EC2 worker; <code>i4i.2xlarge</code> is the default</td>
+                                <td>Developer workstation</td>
                             </tr>
                             <tr>
                                 <th scope="row">Published Pages</th>
