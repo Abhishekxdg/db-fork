@@ -21,7 +21,7 @@ from pathlib import Path
 from microbench.runner2 import BackendInfo
 
 BOARD = Path(__file__).resolve().parent
-SYSTEM_KEY_RE = re.compile(r"[a-z0-9][a-z0-9_]*")
+SYSTEM_KEY_RE = re.compile(r"[a-z][a-z0-9_]*")
 ENV_NAME_RE = re.compile(r"[A-Z_][A-Z0-9_]*")
 IDENTITY_FIELDS = ("system", "proprietary", "hosted", "tuned", "tags")
 SYSTEM_FIELDS = (*IDENTITY_FIELDS, "requirements", "credentials")

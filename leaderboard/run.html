@@ -46,7 +46,7 @@
                 <p class="wizard-description">Database authors submit <code>system.json</code> and adapter code in a Pull Request — never local timing JSONs. A merged PR registers the integration. The production target assigns each self-hosted system to its own dedicated cloud VM (<code>1 DB = 1 VM</code>), but the fleet launcher is not implemented yet.</p>
                 <div class="wizard-fields">
                     <label for="custom-name">Display name<input id="custom-name" name="custom-name" maxlength="64" value="MyForkDB" placeholder="e.g. MyForkDB" autocomplete="off"><span>Shown on the leaderboard table and charts.</span></label>
-                    <label for="custom-slug">Folder / adapter ID<input id="custom-slug" name="custom-slug" maxlength="40" pattern="[a-z0-9][a-z0-9_]{1,39}" value="myforkdb" placeholder="e.g. myforkdb" autocomplete="off" spellcheck="false"><span>Start with a lowercase letter or digit. Then use lowercase letters, digits, or underscores (<code>leaderboard/systems/&lt;id&gt;/</code>).</span></label>
+                    <label for="custom-slug">Folder / adapter ID<input id="custom-slug" name="custom-slug" maxlength="40" pattern="[a-z][a-z0-9_]{1,39}" value="myforkdb" placeholder="e.g. myforkdb" autocomplete="off" spellcheck="false"><span>Start with a lowercase letter. Then use lowercase letters, digits, or underscores (<code>leaderboard/systems/&lt;id&gt;/</code>).</span></label>
                 </div>
                 <fieldset class="option-grid"><legend class="sr-only">Hosting model</legend>
                     <label class="option-card"><input id="custom-hosted-no" type="radio" name="custom-hosted" value="no" checked><strong>Self-hosted</strong><span>Targets 1 dedicated reference VM for a production run.</span></label>
@@ -126,7 +126,7 @@ function commandsFor(systems, machine, location, macro = null) {
 function submissionScaffold(name, slug, hosted, machine, macro) {
     const cleanName = (name || '').trim() || 'MyForkDB';
     const cleanSlug = (slug || '').trim();
-    if (!/^[a-z0-9][a-z0-9_]{1,39}$/.test(cleanSlug)) throw new Error('Use a valid folder/adapter ID that starts with a lowercase letter or digit.');
+    if (!/^[a-z][a-z0-9_]{1,39}$/.test(cleanSlug)) throw new Error('Use a valid folder/adapter ID that starts with a lowercase letter.');
     const hostVal = hosted ? 'yes' : 'no';
     const sysJson = JSON.stringify({system: cleanName, proprietary: 'no', hosted: hostVal, tuned: 'no', tags: ['SQL', 'copy-on-write', 'branching'], requirements: 'Add the database client and required tools to PATH.', credentials: hosted ? [`${cleanSlug.toUpperCase()}_API_KEY`] : []}, null, 2);
     const localMachine = /^[a-z0-9][a-z0-9._-]{0,63}$/.test(machine || '') ? machine : 'local-dev';

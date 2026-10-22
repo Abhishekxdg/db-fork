@@ -1154,6 +1154,7 @@ const submissionScaffold = vm.runInContext('submissionScaffold', wizardContext);
 assert.match(submissionScaffold('AcmeDB', 'acmedb', false, 'dev-box', {preset: 'mini'}), /leaderboard\/systems\/acmedb\/system\.json[\s\S]*"system": "AcmeDB"[\s\S]*"requirements":[\s\S]*"credentials": \[\][\s\S]*python -m leaderboard\.run_macro acmedb --preset mini --machine 'dev-box'/);
 assert.throws(() => submissionScaffold('AcmeDB', 'bad-slug!', false, 'dev-box', null), /adapter ID/);
 assert.throws(() => submissionScaffold('AcmeDB', '__proto__', false, 'dev-box', null), /adapter ID/);
+assert.throws(() => submissionScaffold('AcmeDB', '1db', true, 'dev-box', null), /adapter ID/);
 const systemDisplaySlug = vm.runInContext('systemDisplaySlug', wizardContext);
 assert.deepEqual(['Dolt', 'Doltgres'].map(system => systemDisplaySlug({system})), ['dolt', 'doltgres'], 'Wizard icons use display identities, not connector keys');
 

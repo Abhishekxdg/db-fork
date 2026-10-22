@@ -14,11 +14,13 @@ prod  carries the micro results and the Full campaigns that publish.json names, 
       workflow diagram PNGs. No mock, quick, unvalidated or unselected record, no wizard, no README.
 alpha carries what build() and build_macro.build() find (every validated micro result
       and macro campaign on disk, including mini smoke campaigns), architecture.html,
-      the README and all raw records, without mock rows or the local macOS wizard.
+      the README, the hardware requirements and all raw records, without mock rows or
+      the local macOS wizard.
 local carries what build() and build_macro.build() find: the newest micro result per
       system and machine (an invalid or failed newest file is listed as excluded), every
-      campaign that passes validation, the wizard and the README, plus the rows of
-      leaderboard.mock, the one module that knows about mock data.
+      campaign that passes validation, the wizard, the README and the hardware
+      requirements, plus the rows of leaderboard.mock, the one module that knows about
+      mock data.
 
 All phases use the same page and the same ingestion; this module only selects and
 copies. Output goes only to <board>/.site/<phase>: it is prepared in a staging
@@ -48,8 +50,8 @@ SITE = BOARD / ".site"
 SCRIPTS = tuple(f"js/{name}.js" for name in ("dom", "details", "scenes", "micro", "macro", "app"))
 PAGES = {
     "prod": ("index.html", "styles.css", *SCRIPTS),
-    "alpha": ("index.html", "architecture.html", "styles.css", "README.md", *SCRIPTS),
-    "local": ("index.html", "run.html", "architecture.html", "styles.css", "README.md", *SCRIPTS),
+    "alpha": ("index.html", "architecture.html", "styles.css", "README.md", "requirements/README.md", *SCRIPTS),
+    "local": ("index.html", "run.html", "architecture.html", "styles.css", "README.md", "requirements/README.md", *SCRIPTS),
 }
 # The six agent-workflow process maps, rendered from workflow-diagrams/source.html, which itself is a build input and is never published.
 WORKFLOW_DIAGRAMS = tuple(f"workflow-diagrams/{key}.png" for key in ("rl_env", "context_mgmt", "multi_agent", "dev_agent", "ops_agent", "data_agent"))

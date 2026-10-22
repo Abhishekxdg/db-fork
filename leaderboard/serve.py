@@ -7,9 +7,9 @@ From the repository root:
 
 All assemble the phase's site first (leaderboard.site), then serve only that
 directory. Production serves index.html, styles.css, the two data files, the six
-workflow diagram PNGs and the published raw records; it has no wizard, no launcher
-routes and no README. Alpha serves all validated records, architecture.html and
-README.md without mock rows or launcher routes.
+workflow diagram PNGs and the published raw records. It has no wizard, launcher routes,
+README or hardware requirements. Alpha serves all validated records, architecture.html,
+README.md and the hardware requirements without mock rows or launcher routes.
 """
 
 import argparse

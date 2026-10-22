@@ -16,7 +16,7 @@ All leaderboard code, database lifecycle scripts, and connector adapters must li
 
 ## How to Submit a Database System (`leaderboard/systems/<system>/`)
 
-Contributors submit one integration folder at `leaderboard/systems/<system>/` (where `<system>` matches `^[a-z0-9][a-z0-9_]*$`). You never submit pre-recorded benchmark timing JSON from a personal workstation. Official production rankings come from a dedicated ephemeral cloud VM (`1 Self-Hosted DB = 1 Cloud VM`). Generated evidence remains at `leaderboard/<system>/results/`, `leaderboard/<system>/macro/`, and `leaderboard/<system>/verbs/`.
+Contributors submit one integration folder at `leaderboard/systems/<system>/` (where `<system>` matches `^[a-z][a-z0-9_]*$`). You never submit pre-recorded benchmark timing JSON from a personal workstation. Official production rankings come from a dedicated ephemeral cloud VM (`1 Self-Hosted DB = 1 Cloud VM`). Generated evidence remains at `leaderboard/<system>/results/`, `leaderboard/<system>/macro/`, and `leaderboard/<system>/verbs/`.
 
 An integration directory contains:
 
@@ -227,9 +227,11 @@ Running `./leaderboard/aws_alpha.sh collapse` (or `down` / `destroy`) terminates
 
 ### Production Target (`prod` Phase, One Fixed Worker per Database)
 
-The planned first automated production release will use one On-Demand **`m7a.2xlarge`** worker for each self-hosted database. Each worker has 8 physical CPU cores and 32 GiB of memory. It also has a 40 GiB `gp3` root volume and a dedicated 200 GiB `gp3` data volume. All workers in one ranked cohort use this fixed profile. The planned launcher may start database workers concurrently. Each worker will run Microbench and Macrobench sequentially for one database.
+The provisional production profile uses one On-Demand **`m7a.2xlarge`** worker for each self-hosted database. Each worker has 8 physical CPU cores and 32 GiB of memory. It also has a 40 GiB `gp3` root volume and a dedicated 200 GiB `gp3` data volume. All workers in one ranked cohort use this fixed profile. When implemented, the launcher may start database workers concurrently. Each worker will run Microbench and Macrobench sequentially for one database.
 
-This profile fits the full suite's maximum of 16 concurrent database clients at two clients per physical core. The 32 GiB memory allocation gives the database, runner, and filesystem cache twice MatrixOne's 16 GiB standalone test recommendation. The 200 GiB data volume covers the full CH-benCHmark dataset, branch history, write-ahead logs, and temporary data without buying unused local NVMe capacity.
+The full suite configures at most 16 concurrent database clients, which is two clients per physical core on this profile. The 32 GiB memory allocation is twice MatrixOne's 16 GiB standalone test recommendation. The 200 GiB data volume is the initial allowance for the dataset, branch history, write-ahead logs, and temporary data. These inputs do not prove that the profile has sufficient capacity. Complete the [required full calibration](requirements/README.md#official-aws-compute) before the first ranked release, and change the fixed cohort profile if calibration finds memory exhaustion, disk exhaustion, or sustained EBS saturation.
+
+No production fleet launcher or merge-trigger workflow exists yet. A GitHub merge trigger must live under `.github/workflows/`, outside the requested `leaderboard/`-only scope. Until that automation exists, maintainers must perform the production steps below.
 
 The production launcher will own EC2 placement. A later version can select an instance type for each database without changing `aws_worker.sh`. Before that version mixes instance types, result provenance and ranking groups must separate runs by instance type.
 

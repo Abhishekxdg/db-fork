@@ -205,8 +205,9 @@ class Connectors(unittest.TestCase):
 
     def test_system_metadata_rejects_unsafe_or_ambiguous_fields(self) -> None:
         meta = load_system("dolt")
-        with self.assertRaisesRegex(ValueError, "invalid system key"):
-            load_system("__proto__")
+        for name in ("__proto__", "1db"):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "invalid system key"):
+                load_system(name)
         cases = (
             ({**meta, "credentials": ["SAFE", "BAD-NAME"]}, "environment variable names"),
             ({**meta, "credentials": ["SAME", "SAME"]}, "unique environment variable names"),
