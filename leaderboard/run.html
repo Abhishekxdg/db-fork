@@ -38,36 +38,26 @@
             </section>
             <section class="wizard-section" id="existing-db-section" aria-labelledby="databases-title">
                 <h2 id="databases-title">Database (1 per run)</h2><p class="wizard-description">Select one database to benchmark in isolation. Running one database at a time prevents thermal throttling and shared page-cache interference.</p>
-                <fieldset class="option-grid" aria-describedby="database-selection"><legend class="sr-only">Databases</legend>
-                    <label class="option-card"><input id="database-dolt" type="radio" name="database" value="dolt_mysql" checked><span class="system-icon" data-system="dolt">D</span><strong>Dolt</strong><span>MySQL protocol</span><small>Self-hosted</small></label>
-                    <label class="option-card"><input id="database-doltgres" type="radio" name="database" value="dolt"><span class="system-icon" data-system="doltgres">D</span><strong>Doltgres</strong><span>Postgres protocol</span><small>Self-hosted</small></label>
-                    <label class="option-card"><input id="database-seekdb" type="radio" name="database" value="seekdb"><span class="system-icon" data-system="seekdb">S</span><strong>SeekDB</strong><span>MySQL protocol</span><small>Self-hosted</small></label>
-                    <label class="option-card"><input id="database-matrixone" type="radio" name="database" value="matrixone"><span class="system-icon" data-system="matrixone">M</span><strong>MatrixOne</strong><span>MySQL protocol</span><small>Self-hosted</small></label>
-                    <label class="option-card"><input id="database-file-copy" type="radio" name="database" value="file_copy"><span class="system-icon" data-system="postgresql-file-copy">P</span><strong>PostgreSQL (FILE_COPY)</strong><span>Full database copy</span><small>Self-hosted</small></label>
-                    <label class="option-card"><input id="database-chronos" type="radio" name="database" value="chronos"><span class="system-icon" data-system="chronos">C</span><strong>Chronos</strong><span>Interval branching</span><small>Self-hosted</small></label>
-                    <label class="option-card"><input id="database-neon" type="radio" name="database" value="neon"><span class="system-icon" data-system="neon">N</span><strong>Neon</strong><span>Serverless Postgres</span><small>Managed service</small></label>
-                    <label class="option-card"><input id="database-tiger" type="radio" name="database" value="tiger" disabled><span class="system-icon" data-system="tiger-cloud">T</span><strong>Tiger Cloud</strong><span>Postgres service forks</span><small>No connector yet</small></label>
-                    <label class="option-card"><input id="database-xata" type="radio" name="database" value="xata"><span class="system-icon" data-system="xata">X</span><strong>Xata</strong><span>Branching Postgres</span><small>Managed service</small></label>
-                </fieldset>
+                <fieldset id="database-options" class="option-grid" aria-describedby="database-selection"><legend class="sr-only">Databases</legend></fieldset>
                 <p id="database-selection" class="database-selection" role="status">1 database selected</p>
             </section>
             <section class="wizard-section" id="custom-db-section" aria-labelledby="custom-db-title" hidden>
                 <h2 id="custom-db-title">Your database metadata</h2>
-                <p class="wizard-description">Database authors submit <code>system.json</code> and adapter code in a Pull Request — never local timing JSONs. CI runs each self-hosted system on its own dedicated cloud VM (<code>1 DB = 1 VM</code>).</p>
+                <p class="wizard-description">Database authors submit <code>system.json</code> and adapter code in a Pull Request — never local timing JSONs. A merged PR registers the integration. The production target assigns each self-hosted system to its own dedicated cloud VM (<code>1 DB = 1 VM</code>), but the fleet launcher is not implemented yet.</p>
                 <div class="wizard-fields">
                     <label for="custom-name">Display name<input id="custom-name" name="custom-name" maxlength="64" value="MyForkDB" placeholder="e.g. MyForkDB" autocomplete="off"><span>Shown on the leaderboard table and charts.</span></label>
-                    <label for="custom-slug">Folder / adapter ID<input id="custom-slug" name="custom-slug" maxlength="40" pattern="[a-z0-9_]{2,40}" value="myforkdb" placeholder="e.g. myforkdb" autocomplete="off" spellcheck="false"><span>Lowercase letters, digits, underscores (<code>leaderboard/&lt;id&gt;/</code>).</span></label>
+                    <label for="custom-slug">Folder / adapter ID<input id="custom-slug" name="custom-slug" maxlength="40" pattern="[a-z0-9][a-z0-9_]{1,39}" value="myforkdb" placeholder="e.g. myforkdb" autocomplete="off" spellcheck="false"><span>Start with a lowercase letter or digit. Then use lowercase letters, digits, or underscores (<code>leaderboard/systems/&lt;id&gt;/</code>).</span></label>
                 </div>
                 <fieldset class="option-grid"><legend class="sr-only">Hosting model</legend>
-                    <label class="option-card"><input id="custom-hosted-no" type="radio" name="custom-hosted" value="no" checked><strong>Self-hosted</strong><span>Runs on 1 dedicated reference VM in CI.</span></label>
+                    <label class="option-card"><input id="custom-hosted-no" type="radio" name="custom-hosted" value="no" checked><strong>Self-hosted</strong><span>Targets 1 dedicated reference VM for a production run.</span></label>
                     <label class="option-card"><input id="custom-hosted-yes" type="radio" name="custom-hosted" value="yes"><strong>Managed service</strong><span>Cloud service benchmarked with region &amp; RTT badge.</span></label>
                 </fieldset>
             </section>
             <section class="wizard-section" id="macro-section" aria-labelledby="macro-title" hidden>
-                <h2 id="macro-title">Workload size</h2><p class="wizard-description">Every run covers all six workflows and starts only from committed sources. Use Quick locally to verify your adapter; CI runs Full on an isolated reference VM for publication.</p>
+                <h2 id="macro-title">Workload size</h2><p class="wizard-description">Every run covers all six workflows and starts only from committed sources. Use Quick locally to verify your adapter. A publishable Full run targets an isolated reference VM.</p>
                 <fieldset class="option-grid"><legend class="sr-only">Workload size</legend>
                     <label class="option-card"><input id="preset-mini" type="radio" name="preset" value="mini" checked><strong>Quick</strong><span>Small workloads in minutes for local verification.</span></label>
-                    <label class="option-card"><input id="preset-full" type="radio" name="preset" value="full"><strong>Full</strong><span>Paper-size workloads, run on 1 dedicated VM per database for official publication.</span></label>
+                    <label class="option-card"><input id="preset-full" type="radio" name="preset" value="full"><strong>Full</strong><span>Paper-size workload required for publication. Target: 1 dedicated VM per database.</span></label>
                 </fieldset>
                 <p id="macro-selection" class="database-selection" role="status"></p>
             </section>
@@ -114,23 +104,14 @@ source .venv/bin/activate</code></pre><p>On macOS, libpq’s tools may need addi
 <footer class="site-footer shell"><span>BranchBench <span aria-hidden="true">·</span> Open benchmarks, every attempt published.</span><a href="README.md#what-is-measured">How we measure <span aria-hidden="true">↗</span></a></footer>
 <script src="data.js"></script>
 <script>
-const SYSTEMS = {
-    dolt_mysql: {name: 'Dolt', requirement: 'Dolt CLI on PATH.', keys: []},
-    dolt: {name: 'Doltgres', requirement: 'Doltgres and psql (libpq) on PATH.', keys: []},
-    seekdb: {name: 'SeekDB', requirement: 'SeekDB (OceanBase) binary installed.', keys: []},
-    matrixone: {name: 'MatrixOne', requirement: 'MatrixOne (mo-service) binary installed.', keys: []},
-    file_copy: {name: 'PostgreSQL (FILE_COPY)', requirement: 'PostgreSQL 18 (postgres, pg_ctl, initdb) and psql (libpq) on PATH.', keys: []},
-    chronos: {name: 'Chronos', requirement: 'PostgreSQL 18 (postgres, pg_ctl, initdb), psql (libpq) on PATH, and chronos-db Python package installed.', keys: []},
-    neon: {name: 'Neon', requirement: 'psql (libpq) on PATH.', keys: ['NEON_API_KEY_ORG']},
-    xata: {name: 'Xata', requirement: 'psql (libpq) on PATH.', keys: ['XATA_API_KEY', 'XATA_ORGANIZATION_ID']},
-};
+const SYSTEMS = systems;
 const SCENARIOS = ['rl_env', 'context_mgmt', 'multi_agent', 'dev_agent', 'ops_agent', 'data_agent'];
 function shellQuote(value) { return "'" + value.replaceAll("'", "'\\''") + "'"; }
 function commandsFor(systems, machine, location, macro = null) {
     if (!systems.length || systems.some(system => !Object.hasOwn(SYSTEMS, system))) throw new Error('Choose at least one supported database.');
     if (!machine) throw new Error('Enter a machine name to preview the script.');
     if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(machine)) throw new Error('Use a valid machine name.');
-    const hosted = systems.some(system => SYSTEMS[system].keys.length > 0);
+    const hosted = systems.some(system => SYSTEMS[system].hosted === 'yes');
     if (macro) {
         if (hosted) throw new Error('Macrobench runs only on local databases.');
         if (!['mini', 'full'].includes(macro.preset)) throw new Error('Choose the Quick or Full workload.');
@@ -139,49 +120,66 @@ function commandsFor(systems, machine, location, macro = null) {
         return ['status=0', 'keep() { [ "$status" -ne 0 ] || status=$1; }', ...runs, 'python -m leaderboard.site --phase local || keep $?', 'exit "$status"'].join('\n');
     }
     if (hosted && (!location.trim() || location.length > 120 || /[\x00-\x1f\x7f]/.test(location))) throw new Error('Enter a valid client location for managed databases.');
-    const commands = systems.map(system => `python -m leaderboard.run ${system} --machine ${shellQuote(machine)}${SYSTEMS[system].keys.length ? ` --client-location ${shellQuote(location.trim())}` : ''}`);
+    const commands = systems.map(system => `python -m leaderboard.run ${system} --machine ${shellQuote(machine)}${SYSTEMS[system].hosted === 'yes' ? ` --client-location ${shellQuote(location.trim())}` : ''}`);
     return [...commands, 'python -m leaderboard.site --phase local'].join(' &&\n');
 }
 function submissionScaffold(name, slug, hosted, machine, macro) {
     const cleanName = (name || '').trim() || 'MyForkDB';
     const cleanSlug = (slug || '').trim();
-    if (!/^[a-z0-9_]{2,40}$/.test(cleanSlug)) throw new Error('Use a valid folder/adapter ID (lowercase letters, digits, underscores).');
+    if (!/^[a-z0-9][a-z0-9_]{1,39}$/.test(cleanSlug)) throw new Error('Use a valid folder/adapter ID that starts with a lowercase letter or digit.');
     const hostVal = hosted ? 'yes' : 'no';
-    const sysJson = JSON.stringify({system: cleanName, proprietary: 'no', hosted: hostVal, tuned: 'no', tags: ['SQL', 'copy-on-write', 'branching']}, null, 2);
+    const sysJson = JSON.stringify({system: cleanName, proprietary: 'no', hosted: hostVal, tuned: 'no', tags: ['SQL', 'copy-on-write', 'branching'], requirements: 'Add the database client and required tools to PATH.', credentials: hosted ? [`${cleanSlug.toUpperCase()}_API_KEY`] : []}, null, 2);
     const localMachine = /^[a-z0-9][a-z0-9._-]{0,63}$/.test(machine || '') ? machine : 'local-dev';
     const runCmd = macro
         ? `python -m leaderboard.run_macro ${cleanSlug} --preset mini --machine ${shellQuote(localMachine)}`
         : `python -m leaderboard.run ${cleanSlug} --machine ${shellQuote(localMachine)}`;
     const lifecycleLines = hosted
-        ? [`# 2. Implement hosted Connector contract in leaderboard/${cleanSlug}/connector.py:`,
+        ? [`# 2. Implement hosted Connector contract in leaderboard/systems/${cleanSlug}/connector.py:`,
            `#    - Export CONNECTOR = YourConnector() (subclassing leaderboard.connector.Connector)`,
-           `#    - Define keys, region, service, scope(), preflight(), provision(), load(), delete(), exists(), version()`]
-        : [`# 2. Add executable VM lifecycle scripts in leaderboard/${cleanSlug}/:`,
-           `#    - leaderboard/${cleanSlug}/install  (optional: install binary/package inside the VM)`,
-           `#    - leaderboard/${cleanSlug}/start    (start server daemon and write leaderboard/.runs/${cleanSlug}.pid)`,
-           `#    - leaderboard/${cleanSlug}/check    (exit 0 once server accepts connections)`,
-           `#    - leaderboard/${cleanSlug}/stop     (stop server daemon cleanly)`,
-           `chmod +x leaderboard/${cleanSlug}/start leaderboard/${cleanSlug}/check leaderboard/${cleanSlug}/stop`,
+           `#    - Declare credential variable names in system.json, then implement region, service, scope(), preflight(), provision(), load(), delete(), exists(), version()`]
+        : [`# 2. Add executable VM lifecycle scripts in leaderboard/systems/${cleanSlug}/:`,
+           `#    - leaderboard/systems/${cleanSlug}/install  (optional: install binary/package inside the VM)`,
+           `#    - leaderboard/systems/${cleanSlug}/start    (start server daemon and write leaderboard/.runs/${cleanSlug}.pid)`,
+           `#    - leaderboard/systems/${cleanSlug}/check    (exit 0 once server accepts connections)`,
+           `#    - leaderboard/systems/${cleanSlug}/stop     (stop server daemon cleanly)`,
+           `chmod +x leaderboard/systems/${cleanSlug}/start leaderboard/systems/${cleanSlug}/check leaderboard/systems/${cleanSlug}/stop`,
            ``,
-           `# 3. Implement Connector contract in leaderboard/${cleanSlug}/connector.py:`,
+           `# 3. Implement Connector contract in leaderboard/systems/${cleanSlug}/connector.py:`,
            `#    - Export CONNECTOR = YourConnector() (subclassing leaderboard.connector.Connector)`];
     const stepNum = hosted ? 3 : 4;
     return [
-        `# 1. Create self-contained plugin folder & metadata (only touch leaderboard/${cleanSlug}/):`,
-        `mkdir -p leaderboard/${cleanSlug}`,
-        `cat <<'EOF' > leaderboard/${cleanSlug}/system.json`,
+        `# 1. Create the system integration folder and metadata:`,
+        `mkdir -p leaderboard/systems/${cleanSlug}`,
+        `cat <<'EOF' > leaderboard/systems/${cleanSlug}/system.json`,
         sysJson,
         `EOF`,
         ``,
         ...lifecycleLines,
         ``,
-        `# ${stepNum}. Verify locally on 1 database in isolation, then open a PR (CI runs 1 DB = 1 VM):`,
+        `# ${stepNum}. Verify locally on 1 database in isolation, then open a PR. A merged PR registers the integration:`,
         runCmd,
         `python -m leaderboard.site --phase local`,
     ].join('\n');
 }
+const systemDisplaySlug = system => system.system.toLowerCase().replace(/\s+/g, '-');
 const form = document.getElementById('run-form');
 const el = id => document.getElementById(id);
+function renderSystems() {
+    const choices = Object.entries(SYSTEMS).sort(([, a], [, b]) => (a.hosted === 'yes') - (b.hosted === 'yes') || a.system.localeCompare(b.system));
+    const preferred = Object.hasOwn(SYSTEMS, 'dolt_mysql') ? 'dolt_mysql' : choices[0]?.[0];
+    el('database-options').append(...choices.map(([key, system]) => {
+        const label = document.createElement('label'); label.className = 'option-card';
+        const input = document.createElement('input'); input.type = 'radio'; input.name = 'database'; input.value = key;
+        input.id = `database-${key.replaceAll('_', '-')}`; input.checked = key === preferred;
+        const icon = document.createElement('span'); icon.className = 'system-icon'; icon.dataset.system = systemDisplaySlug(system); icon.textContent = system.system[0];
+        const name = document.createElement('strong'); name.textContent = system.system;
+        const protocol = document.createElement('span'); protocol.textContent = system.tags.find(tag => tag.endsWith(' protocol')) || system.tags[0];
+        const hosting = document.createElement('small'); hosting.textContent = system.hosted === 'yes' ? 'Managed service' : 'Self-hosted';
+        label.append(input, icon, name, protocol, hosting);
+        return label;
+    }));
+}
+renderSystems();
 // A status region is announced only when its text actually changes, not on every keystroke that rewrites the same words.
 const say = (id, text) => { if (el(id).textContent !== text) el(id).textContent = text; };
 // The launch button's label; the arrow that marks it as leaving the page is drawn, not read aloud.
@@ -200,7 +198,7 @@ function refreshPreview() {
     el('existing-db-section').hidden = submitMode;
     el('custom-db-section').hidden = !submitMode;
     const systems = [...form.querySelectorAll('input[name="database"]:checked')].map(input => input.value);
-    const selected = systems.map(system => SYSTEMS[system]), hosted = submitMode ? el('custom-hosted-yes').checked : selected.some(system => system.keys.length > 0);
+    const selected = systems.map(system => SYSTEMS[system]), hosted = submitMode ? el('custom-hosted-yes').checked : selected.some(system => system.hosted === 'yes');
     const macro = el('suite-macro').checked ? {preset: el('preset-full').checked ? 'full' : 'mini'} : null;
     el('macro-section').hidden = !macro;
     for (const input of form.querySelectorAll('input[name="preset"]')) input.disabled = !macro;
@@ -223,15 +221,16 @@ function refreshPreview() {
         return;
     }
     const selectionError = systems.length ? '' : 'Select at least one database.';
-    el('database-dolt').setCustomValidity(selectionError);
+    const firstDatabase = form.querySelector('input[name="database"]');
+    if (firstDatabase) firstDatabase.setCustomValidity(selectionError);
     say('database-selection', selectionError || `${systems.length} database${systems.length === 1 ? '' : 's'} selected`);
     el('client-field').hidden = !hosted; el('client-location').required = hosted; el('client-location').disabled = !hosted;
     el('database-requirements').replaceChildren(...selected.map(system => {
         const item = document.createElement('li'), name = document.createElement('strong'), detail = document.createElement('div'), description = document.createElement('p');
-        name.textContent = system.name; description.textContent = system.requirement; detail.append(description);
-        if (system.keys.length) {
+        name.textContent = system.system; description.textContent = system.requirements; detail.append(description);
+        if (system.credentials.length) {
             const keys = document.createElement('div'); keys.className = 'credential-names';
-            keys.append(...system.keys.map(key => { const code = document.createElement('code'); code.textContent = key; return code; }));
+            keys.append(...system.credentials.map(key => { const code = document.createElement('code'); code.textContent = key; return code; }));
             detail.append(keys);
         }
         item.append(name, detail); return item;
@@ -260,11 +259,11 @@ function describeSuite(macro) {
     el('run-dataset-link').href = macro ? 'index.html#workflows' : 'index.html#dataset';
     el('run-dataset-link').textContent = macro ? 'Workflow definitions' : 'Dataset and operations';
     el('run-dataset').textContent = macro
-        ? `${preset} workloads on the CH-benCHmark schema, with data generated for each workflow. Each workflow runs in its own bb_<id> database, which the runner creates, seeds and deletes; attempts are saved under leaderboard/<system>/macro/<date>/. ${macro.preset === 'full' ? 'Official published Full runs execute on 1 dedicated VM per database.' : 'Quick runs verify your adapter on this machine; official Full runs execute on 1 dedicated VM per database.'}`
+        ? `${preset} workloads on the CH-benCHmark schema, with data generated for each workflow. Each workflow runs in its own bb_<id> database, which the runner creates, seeds and deletes; attempts are saved under leaderboard/<system>/macro/<date>/. ${macro.preset === 'full' ? 'A publishable Full run uses 1 dedicated VM per database.' : 'Quick runs verify your adapter on this machine. A publishable Full run uses 1 dedicated VM per database.'}`
         : `The CH-benCHmark seed, identical for every database: ${rows.reduce((total, count) => total + count, 0).toLocaleString('en-US')} rows across ${rows.length} tables. Reads and writes target ${suite.table}, initially ${suite.dataset.row_counts[suite.table].toLocaleString('en-US')} rows.`;
     el('run-note').textContent = macro
-        ? 'Commit source changes first: a run from uncommitted sources fails validation and does not start. The local leaderboard is rebuilt even when a run fails. For official publication, submit your adapter via PR so CI runs it on an isolated VM.'
-        : 'Commit source changes first. Terminal prompts for missing service credentials with input hidden. For official publication, submit your connector via PR.';
+        ? 'Commit source changes first: a run from uncommitted sources fails validation and does not start. The local leaderboard is rebuilt even when a run fails. A merged PR registers the adapter. Production execution remains a separate maintainer step until fleet automation exists.'
+        : 'Commit source changes first. Terminal prompts for missing service credentials with input hidden. A merged PR registers the connector. Production execution remains a separate maintainer step until fleet automation exists.';
     say('macro-selection', macro ? `All ${SCENARIOS.length} workflows · ${preset} workloads` : '');
 }
 form.addEventListener('submit', event => event.preventDefault());

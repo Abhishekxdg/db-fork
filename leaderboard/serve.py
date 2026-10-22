@@ -23,30 +23,25 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 from leaderboard import site
+from leaderboard.connector import system_catalog
 from leaderboard.validate import BOARD, MACHINE_RE
 from leaderboard.validate_macro import ATTEMPT_RE, CAMPAIGN_FILE_RE, PRESETS, SCENARIOS
 
 ROOT = BOARD.parent
 PYTHON = str(ROOT / ".venv/bin/python") if (ROOT / ".venv/bin/python").exists() else sys.executable
-SYSTEMS = {
-    "dolt_mysql": (), "dolt": (), "seekdb": (), "matrixone": (), "file_copy": (), "chronos": (),
-    "neon": ("NEON_API_KEY_ORG",),
-    "tiger": ("TIGER_ACCESS_KEY", "TIGER_SECRET_KEY", "TIGER_PROJECT_ID"),
-    "xata": ("XATA_API_KEY", "XATA_ORGANIZATION_ID"),
-}
 STATIC = {phase: {"/", "/data.js", "/macro-data.js", *(f"/{rel}" for rel in (*site.PAGES[phase], *site.WORKFLOW_DIAGRAMS))} for phase in site.PHASES}
 SUITES = ("micro", "macro")
 BUILD = ["-m", "leaderboard.site", "--phase", "local"]  # the wizard only runs in the local phase
 
 
-def macro_commands(config: dict, systems: list, machine: str) -> list[str]:
+def macro_commands(config: dict, systems: list, machine: str, catalog: dict[str, dict]) -> list[str]:
     """One run_macro per system, then one build that also runs after a failed run,
     so a failed or incomplete campaign still reaches the page; the first failing
     run's exit status is the script's. Every campaign runs all six workflows."""
     preset = config.get("preset", "mini")
     if not isinstance(preset, str) or preset not in PRESETS:
         raise ValueError("Choose the Quick or Full workload.")
-    if any(SYSTEMS[system] for system in systems):
+    if any(catalog[system]["hosted"] == "yes" for system in systems):
         raise ValueError("Agent workflows run only on local systems.")
     lines = ["", "# Run one database at a time and always rebuild this machine's leaderboard; the first failure's exit status is the script's.",
              "status=0", 'keep() { [ "$status" -ne 0 ] || status=$1; }']
@@ -57,26 +52,27 @@ def macro_commands(config: dict, systems: list, machine: str) -> list[str]:
 
 def script_for(config: dict) -> str:
     systems, machine, location = config.get("systems"), config.get("machine"), config.get("location", "")
+    catalog = system_catalog(BOARD)
+    runnable = system_catalog(BOARD, runnable=True)
     suite = config.get("suite", "micro")
     if not isinstance(suite, str) or suite not in SUITES:
         raise ValueError("Choose the microbench or the agent-workflow suite.")
-    if (not isinstance(systems, list) or not 1 <= len(systems) <= len(SYSTEMS)
-            or any(not isinstance(system, str) or system not in SYSTEMS for system in systems)
+    if (not isinstance(systems, list) or not 1 <= len(systems) <= len(catalog)
+            or any(not isinstance(system, str) or system not in catalog for system in systems)
             or len(set(systems)) != len(systems)):
         raise ValueError("Choose one or more distinct supported databases.")
-    if any(not all((BOARD / system / filename).is_file() for filename in ("connector.py", "system.json"))
-           for system in systems):
+    if any(system not in runnable for system in systems):
         raise ValueError("A selected database has no runnable leaderboard connector.")
     if not isinstance(machine, str) or not MACHINE_RE.fullmatch(machine):
         raise ValueError("Use a valid machine name.")
     if not isinstance(location, str) or len(location) > 120 or any(ord(c) < 32 or ord(c) == 127 for c in location):
         raise ValueError("Use a valid client location.")
-    keys = [key for system in systems for key in SYSTEMS[system]]
+    keys = [key for system in systems for key in catalog[system]["credentials"]]
     if keys and not location.strip():
         raise ValueError("Enter the client location for managed services.")
     lines = ["#!/bin/bash", "set -e", f"cd {shlex.quote(str(ROOT))}"]
     if suite == "macro":
-        return "\n".join(lines + macro_commands(config, systems, machine)) + "\n"
+        return "\n".join(lines + macro_commands(config, systems, machine, catalog)) + "\n"
     if keys:
         lines += ["", "# Terminal prompts for missing credentials; input is hidden.",
                   f"for benchmark_key in {' '.join(keys)}; do",
@@ -86,7 +82,7 @@ def script_for(config: dict) -> str:
     lines += ["", "# Run one database at a time, then rebuild this machine's leaderboard from validated current-suite results."]
     for system in systems:
         args = [PYTHON, "-m", "leaderboard.run", system, "--machine", machine]
-        if SYSTEMS[system]:
+        if catalog[system]["hosted"] == "yes":
             args += ["--client-location", location.strip()]
         lines.append(shlex.join(args))
     lines += [shlex.join([PYTHON, *BUILD])]
@@ -129,7 +125,7 @@ class Handler(SimpleHTTPRequestHandler):
             return None
         path = unquote(urlsplit(self.path).path)
         parts = Path(path).parts[1:]
-        result = (len(parts) == 4 and parts[0] in SYSTEMS and len(parts[2]) == 8 and parts[2].isdigit()
+        result = (len(parts) == 4 and parts[0] in system_catalog(BOARD) and len(parts[2]) == 8 and parts[2].isdigit()
                   and ((parts[1] == "results" and parts[3].endswith(".json"))
                        or (parts[1] == "macro" and parts[3].endswith(".json")
                            and any(r.fullmatch(parts[3].removesuffix(".json")) for r in (ATTEMPT_RE, CAMPAIGN_FILE_RE)))))

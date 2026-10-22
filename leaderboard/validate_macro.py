@@ -26,6 +26,7 @@ import re
 import sys
 from pathlib import Path
 
+from leaderboard.connector import load_system, system_dir
 from leaderboard.validate import BOARD, IDENTITY, MACHINE_RE, has_type, parse_day, sha256
 
 
@@ -99,11 +100,11 @@ def credentials(value, where: str = "$") -> list[str]:
 def attempt_files(board: Path = BOARD) -> list[Path]:
     """Every attempt file of every system folder, never private .runs output."""
     return sorted(p for p in board.glob("*/macro/*/*.json")
-                  if (board / p.parts[-4] / "system.json").is_file() and not p.stem.startswith("campaign_"))
+                  if (system_dir(p.parts[-4], board) / "system.json").is_file() and not p.stem.startswith("campaign_"))
 
 
 def campaign_files(board: Path = BOARD) -> list[Path]:
-    return sorted(p for p in board.glob("*/macro/*/campaign_*.json") if (board / p.parts[-4] / "system.json").is_file())
+    return sorted(p for p in board.glob("*/macro/*/campaign_*.json") if (system_dir(p.parts[-4], board) / "system.json").is_file())
 
 
 def config_path(key: str, preset: str) -> Path:
@@ -382,10 +383,10 @@ def load(path: Path, board: Path, fields: dict) -> tuple[list[str], dict | None,
     if (day := parse_day(day_dir)) is None:
         problems.append(f"date directory {day_dir!r} is not a YYYYMMDD date")
     try:
-        meta = json.loads((board / sysdir / "system.json").read_text())
+        meta = load_system(sysdir, board)
         data = json.loads(path.read_text())
     except (OSError, ValueError) as e:
-        return problems + [f"cannot read {sysdir}/system.json or the file as JSON: {e}"], None, None, []
+        return problems + [f"cannot read systems/{sysdir}/system.json or the file as JSON: {e}"], None, None, []
     if not isinstance(data, dict) or not isinstance(meta, dict):
         return problems + ["not a JSON object"], None, None, []
     problems += [f"{where} looks like a credential" for where in credentials(data)]
@@ -446,7 +447,7 @@ def validate(path: Path, board: Path = BOARD) -> list[str]:
     sysdir, day = where
     if data["attempt_id"] != path.stem:
         problems.append("attempt_id differs from the file name")
-    problems += [f"{k} differs from {sysdir}/system.json" for k in IDENTITY if data[k] != meta.get(k)]
+    problems += [f"{k} differs from systems/{sysdir}/system.json" for k in IDENTITY if data[k] != meta.get(k)]
     if day and data["date"] != day.isoformat():
         problems.append(f"date {data['date']} differs from its directory")
     if data["scenario"] not in SCENARIOS:
@@ -516,7 +517,7 @@ def validate_campaign(path: Path, board: Path = BOARD) -> list[str]:
     if data["record"] != "campaign" or f"campaign_{data['id']}" != path.stem:
         problems.append("record must be a campaign whose id is in the file name")
     if data["system"] != meta.get("system"):
-        problems.append(f"system differs from {where[0]}/system.json")
+        problems.append(f"system differs from systems/{where[0]}/system.json")
     problems += campaign_problems(data, data, None)
     problems += provenance_problems(data)
     if data["version"] is not None and not data["version"].strip():

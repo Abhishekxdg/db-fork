@@ -38,6 +38,7 @@ import tempfile
 from pathlib import Path
 
 from leaderboard import build, build_macro, mock, verbs as verbs_lane
+from leaderboard.connector import system_catalog, system_dir
 from leaderboard.validate import BOARD, MACHINE_RE, validate
 from leaderboard.validate_macro import MACRO_SUITE, OUTCOMES, SCENARIOS, VERBS
 
@@ -214,11 +215,15 @@ def raw_files(
     return files
 
 
-def sidecars(board: Path) -> None:
-    """Every system folder's system.json is a regular file reached without a symlink,
+def sidecars(board: Path) -> dict[str, dict]:
+    """Every system integration's system.json is a regular file reached without a symlink,
     checked before any shared validator or builder reads it."""
-    for path in sorted(board.glob("*/system.json")):
+    for path in sorted((board / "systems").glob("*/system.json")):
         plain_file(board, path.relative_to(board).as_posix())
+    try:
+        return system_catalog(board)
+    except ValueError as error:
+        raise SiteError(str(error)) from None
 
 
 def output_dir(board: Path, phase: str) -> Path:
@@ -242,7 +247,8 @@ def assemble(phase: str, board: Path = BOARD) -> Path:
         raise SiteError(f"{board} is not a directory")
     target = output_dir(board, phase)
     suite = read_suite(board)
-    sidecars(board)
+    catalog = sidecars(board)
+    runnable = {name: meta for name, meta in catalog.items() if (system_dir(name, board) / "connector.py").is_file()}
     if phase == "prod":
         manifest = read_manifest(board)
         entries, excluded, campaigns, macro_excluded = published(board, manifest)
@@ -260,6 +266,7 @@ def assemble(phase: str, board: Path = BOARD) -> Path:
             js((
                 ("site", {"phase": phase}),
                 ("suite", suite),
+                ("systems", runnable),
                 ("data", rows),
                 ("excluded", excluded),
                 ("verbs", verbs_entries),

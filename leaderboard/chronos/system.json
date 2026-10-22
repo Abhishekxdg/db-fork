@@ -1,7 +1,0 @@
-{
-  "system": "Chronos",
-  "proprietary": "no",
-  "hosted": "no",
-  "tuned": "no",
-  "tags": ["Python", "Postgres protocol", "Interval branching"]
-}

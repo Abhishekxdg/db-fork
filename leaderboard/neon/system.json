@@ -1,7 +1,0 @@
-{
-  "system": "Neon",
-  "proprietary": "yes",
-  "hosted": "yes",
-  "tuned": "no",
-  "tags": ["Postgres protocol", "Copy-on-write branches"]
-}

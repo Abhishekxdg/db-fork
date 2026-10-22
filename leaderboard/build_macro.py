@@ -22,6 +22,7 @@ import json
 import sys
 from pathlib import Path
 
+from leaderboard.connector import load_system
 from leaderboard.validate import BOARD
 from leaderboard.validate_macro import (
     MACRO_SUITE,
@@ -104,8 +105,7 @@ def build(board: Path = BOARD, sources: set[str] | None = None) -> tuple[list[di
             collided.add((path.parts[-4], data["id"]))
             excluded.append({"system": path.parts[-4], "source": source, "reason": f"campaign {data['id']} is also selected at {campaigns[path.parts[-4], data['id']]['source']}; a campaign is selected once"})
             continue
-        meta_path = board / path.parts[-4] / "system.json"
-        meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
+        meta = load_system(path.parts[-4], board)
         campaigns[(path.parts[-4], data["id"])] = {
             "campaign_id": data["id"], "system": data["system"], "folder": path.parts[-4], "machine": data["machine"],
             "hosted": meta.get("hosted", "no"), "native_only": bool(data.get("native_only", False)),

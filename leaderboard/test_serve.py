@@ -13,11 +13,39 @@ from pathlib import Path
 from unittest import mock
 
 from leaderboard import serve, site
+from leaderboard.connector import system_dir
 from leaderboard.test_site import Board, FULL
 from leaderboard.validate_macro import SCENARIOS
 
 
+def add_system(board: Path, name: str) -> None:
+    sysdir = system_dir(name, board)
+    sysdir.mkdir(parents=True)
+    (sysdir / "connector.py").touch()
+    hosted = name == "neon"
+    (sysdir / "system.json").write_text(json.dumps({
+        "system": name,
+        "proprietary": "no",
+        "hosted": "yes" if hosted else "no",
+        "tuned": "no",
+        "tags": ["test"],
+        "requirements": "Test tools installed.",
+        "credentials": ["NEON_API_KEY_ORG"] if hosted else [],
+    }))
+
+
 class Launcher(unittest.TestCase):
+    def test_invalid_credential_metadata_cannot_reach_script_generation(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(serve, "BOARD", Path(directory)):
+            board = Path(directory)
+            add_system(board, "neon")
+            manifest = system_dir("neon", board) / "system.json"
+            meta = json.loads(manifest.read_text())
+            meta["credentials"] = ["SAFE", "BAD; touch injected"]
+            manifest.write_text(json.dumps(meta))
+            with self.assertRaisesRegex(ValueError, "environment variable names"):
+                serve.script_for({"systems": ["neon"], "machine": "bench-01", "location": "US East"})
+
     def test_script_executes_in_order_quotes_inputs_and_stops_on_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -27,9 +55,7 @@ class Launcher(unittest.TestCase):
                                   "sys.exit(7 if os.environ.get('FAIL_SYSTEM') in sys.argv else 0)\n")
             executable.chmod(0o700)
             for system in ("dolt_mysql", "neon", "dolt"):
-                (root / system).mkdir()
-                (root / system / "connector.py").touch()
-                (root / system / "system.json").write_text("{}")
+                add_system(root, system)
             location = "O'Brien $(touch should-not-exist)"
             config = {"systems": ["dolt_mysql", "neon", "dolt"], "machine": "bench-01", "location": location}
             with mock.patch.object(serve, "ROOT", root), mock.patch.object(serve, "BOARD", root), \
@@ -61,9 +87,7 @@ class Launcher(unittest.TestCase):
                                   "sys.exit(3 if os.environ.get('FAIL_SYSTEM') in sys.argv else 0)\n")
             executable.chmod(0o700)
             for system in ("dolt_mysql", "dolt"):
-                (root / system).mkdir()
-                (root / system / "connector.py").touch()
-                (root / system / "system.json").write_text("{}")
+                add_system(root, system)
             config = {"systems": ["dolt_mysql", "dolt"], "machine": "bench-01", "suite": "macro", "preset": "mini"}
             with mock.patch.object(serve, "ROOT", root), mock.patch.object(serve, "BOARD", root), \
                     mock.patch.object(serve, "PYTHON", str(executable)):
@@ -90,9 +114,7 @@ class Launcher(unittest.TestCase):
                                   "sys.exit(next((int(os.environ[k]) for k in (f'FAIL_{a.replace(\".\", \"_\")}' for a in sys.argv) if k in os.environ), 0))\n")
             executable.chmod(0o700)
             for system in ("dolt_mysql", "dolt"):
-                (root / system).mkdir()
-                (root / system / "connector.py").touch()
-                (root / system / "system.json").write_text("{}")
+                add_system(root, system)
             config = {"systems": ["dolt_mysql", "dolt"], "machine": "bench-01", "suite": "macro", "preset": "mini"}
             with mock.patch.object(serve, "ROOT", root), mock.patch.object(serve, "BOARD", root), mock.patch.object(serve, "PYTHON", str(executable)):
                 script = serve.script_for(config)
@@ -117,9 +139,7 @@ class Launcher(unittest.TestCase):
                 serve.script_for({**base, **invalid})
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(serve, "BOARD", Path(directory)):
             for system in ("neon", "dolt"):
-                (Path(directory) / system).mkdir()
-                (Path(directory) / system / "connector.py").touch()
-                (Path(directory) / system / "system.json").write_text("{}")
+                add_system(Path(directory), system)
             with self.assertRaisesRegex(ValueError, "local"):
                 serve.script_for({**base, "systems": ["neon"], "location": "US East"})
             self.assertIn("leaderboard.run", serve.script_for({**base, "suite": "micro"}))
@@ -129,10 +149,10 @@ class Launcher(unittest.TestCase):
             with self.subTest(system=system), self.assertRaisesRegex(ValueError, "no runnable"):
                 serve.script_for({"systems": [system], "machine": "bench-01", "location": "US East"})
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(serve, "BOARD", Path(directory)):
-            system = Path(directory) / "dolt"
-            system.mkdir()
+            system = system_dir("dolt", Path(directory))
+            system.mkdir(parents=True)
             (system / "connector.py").touch()
-            with self.assertRaisesRegex(ValueError, "no runnable"):
+            with self.assertRaisesRegex(ValueError, "supported"):
                 serve.script_for({"systems": ["dolt"], "machine": "bench-01"})
 
     def test_rejects_invalid_configuration_and_passes_script_as_data(self):

@@ -16,6 +16,7 @@ from unittest import mock
 
 from leaderboard import build_macro, run_macro
 from leaderboard import run as micro
+from leaderboard.connector import load_system, system_dir, system_identity
 from leaderboard.validate import BOARD, sha256
 from leaderboard.validate_macro import (
     SCENARIOS,
@@ -211,7 +212,7 @@ class Classifier(unittest.TestCase):
 
 
 def attempt_payload(**changes) -> dict:
-    meta = json.loads((BOARD / "dolt_mysql" / "system.json").read_text())
+    meta = system_identity(load_system("dolt_mysql"))
     attempt_id, scenario = changes.get("attempt_id", "bb_0123abcd"), changes.get("scenario", "rl_env")
     campaign = changes.get("campaign", CAMPAIGN)
     return {
@@ -228,7 +229,7 @@ def attempt_payload(**changes) -> dict:
 
 
 def campaign_record(**changes) -> dict:
-    meta = json.loads((BOARD / "dolt_mysql" / "system.json").read_text())
+    meta = load_system("dolt_mysql")
     return {"schema_version": 2, "suite": "macro-1", "record": "campaign", **CAMPAIGN, "system": meta["system"],
             "finished": "2026-10-10T11:00:00+00:00", "aborted": None, "server": {"started_here": True, "stop": "stopped"},
             "attempts": {}, "version": "1.81.2", **copy.deepcopy(PROVENANCE), **changes}
@@ -242,9 +243,10 @@ class Contract(unittest.TestCase):
     def setUp(self):
         self.board = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.board)
+        (self.board / "systems").mkdir()
         for system in ("dolt", "dolt_mysql"):
-            (self.board / system).mkdir()
-            shutil.copy(BOARD / system / "system.json", self.board / system)
+            system_dir(system, self.board).mkdir()
+            shutil.copy(system_dir(system) / "system.json", system_dir(system, self.board))
 
     def write(self, payload: dict, system: str = "dolt_mysql", day: str = "20261010", name: str | None = None) -> Path:
         stem = name or (f"campaign_{payload['id']}" if "id" in payload else payload["attempt_id"])
@@ -474,8 +476,9 @@ class Runner(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
         self.board = self.root / "leaderboard"
-        (self.board / "dolt_mysql").mkdir(parents=True)
-        shutil.copy(BOARD / "dolt_mysql" / "system.json", self.board / "dolt_mysql")
+        self.sysdir = system_dir("dolt_mysql", self.board)
+        self.sysdir.mkdir(parents=True)
+        shutil.copy(system_dir("dolt_mysql") / "system.json", self.sysdir)
         (self.root / "uv.lock").write_text("fixture\n")
         (self.board / ".gitignore").write_text(".runs/\n")
         self.git("init", "-q")
@@ -540,7 +543,7 @@ class Runner(unittest.TestCase):
         return json.loads(path.read_text())
 
     def stopped(self) -> None:
-        micro.lifecycle.assert_called_once_with(self.board / "dolt_mysql", "stop")
+        micro.lifecycle.assert_called_once_with(self.sysdir, "stop")
 
     def test_verified_attempt_is_published_with_provenance_and_clean_state(self):
         self.assertEqual(self.campaign(), 0)
@@ -1198,9 +1201,10 @@ class ChildProcess(unittest.TestCase):
     def test_native_only_and_hosted_campaigns_validate_and_build(self):
         board = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, board)
+        (board / "systems").mkdir()
         for system in ("dolt_mysql", "neon"):
-            (board / system).mkdir()
-            shutil.copy(BOARD / system / "system.json", board / system)
+            system_dir(system, board).mkdir()
+            shutil.copy(system_dir(system) / "system.json", system_dir(system, board))
 
         # 1. Native-only campaign on dolt_mysql validates and builds as verified.
         native_camp = {**CAMPAIGN, "id": "1111aaaa", "native_only": True}
@@ -1219,14 +1223,14 @@ class ChildProcess(unittest.TestCase):
         self.assertEqual(validate_campaign(cp, board), [])
 
         # 2. Hosted campaign on neon (server.stop == 'not_started') validates and builds.
-        neon_meta = json.loads((BOARD / "neon" / "system.json").read_text())
+        neon_meta = load_system("neon")
         hosted_camp = {**CAMPAIGN, "id": "2222bbbb"}
         hosted_attempts = {}
         for idx, scen in enumerate(SCENARIOS):
             aid = f"bb_2222000{idx}"
             hosted_attempts[scen] = aid
             ev = evidence_summary(good_evidence(run_id=aid, scenario=scen, backend="NEON"))
-            ap = attempt_payload(attempt_id=aid, scenario=scen, campaign=hosted_camp, evidence=ev, **neon_meta)
+            ap = attempt_payload(attempt_id=aid, scenario=scen, campaign=hosted_camp, evidence=ev, **system_identity(neon_meta))
             p = board / "neon" / "macro" / "20261010" / f"{aid}.json"
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(json.dumps(ap))

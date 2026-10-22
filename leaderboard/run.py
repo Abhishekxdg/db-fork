@@ -3,14 +3,15 @@
 From the repository root:
     python -m leaderboard.run <system> --machine <label>
 
-<system> names a folder with a connector.py, so the runner only loads code that
-lives in this repository. The result lands in <out>/<system>/results/<YYYYMMDD>/<machine>.json
-only after cleanup succeeded. From the server start on, a failure publishes
+<system> names a folder under leaderboard/systems with a connector.py, so the
+runner only loads code that lives in this repository. The result lands in
+<out>/<system>/results/<YYYYMMDD>/<machine>.json only after cleanup succeeded.
+From the server start on, a failure publishes
 {"error": ...} in its place, so a stale success never stays current. A preflight
 failure publishes nothing.
 
-Hosted systems read their API keys from the environment, set at launch from
-Bitwarden. Everything a run creates is named after its database, bb_<run id>,
+Hosted systems read their API keys from the environment at launch. Everything a
+run creates is named after its database, bb_<run id>,
 and cleanup deletes by that name, so even a killed run leaves nothing behind
 once the next run of that system starts with the same target configuration.
 """
@@ -41,7 +42,7 @@ import psycopg2
 
 import dblib.result_collector as rc
 from dblib import result_pb2 as rslt
-from leaderboard.connector import Connector, connector_names, load_connector
+from leaderboard.connector import Connector, connector_names, load_connector, parse_system, system_dir
 from leaderboard.validate import BOARD, MACHINE_RE, SCHEMA_VERSION, sha256
 from microbench import task2_pb2 as tp
 from microbench.operations.crud import (
@@ -490,10 +491,10 @@ def run(system: str, machine: str, out: Path, max_batch: int | None, allow_dirty
         raise RunError("--deadline-min must be finite and greater than zero")
     if os.environ.get("DBFORK_NATIVE_ONLY", "").lower() in ("1", "true", "yes"):
         raise RunError("DBFORK_NATIVE_ONLY is set; unset it so every run uses the standard benchmark mode")
-    server, sysdir = load_connector(system), BOARD / system
+    server, sysdir = load_connector(system), system_dir(system, BOARD)
     meta_path = sysdir / "system.json"
     meta_bytes = meta_path.read_bytes()
-    meta = json.loads(meta_bytes)
+    meta = parse_system(meta_bytes, meta_path)
     hosted = meta["hosted"] == "yes"
     if hosted and not (client_location or "").strip():
         raise RunError("a hosted system needs --client-location, where this machine runs, such as 'US East'")
@@ -513,8 +514,8 @@ def run(system: str, machine: str, out: Path, max_batch: int | None, allow_dirty
     dirty = bool(snapshot["status"].strip())
     if dirty and not allow_dirty:
         raise RunError("the working tree has uncommitted changes")
-    if hosted and (missing := [k for k in server.keys if not os.environ.get(k)]):
-        raise RunError(f"{', '.join(missing)} not set; load them from Bitwarden when launching the run")
+    if hosted and (missing := [key for key in meta["credentials"] if not os.environ.get(key)]):
+        raise RunError(f"{', '.join(missing)} not set in the process environment")
     if hosted:
         try:  # the keys work and the account reaches its project, before anything is created
             with bounded(VENDOR_TIMEOUT, "preflight"):

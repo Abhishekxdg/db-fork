@@ -49,7 +49,7 @@ from google.protobuf import text_format
 from google.protobuf.json_format import MessageToDict
 
 from leaderboard import run as micro
-from leaderboard.connector import Connector, connector_names, load_connector
+from leaderboard.connector import Connector, connector_names, load_connector, load_system, system_dir, system_identity
 from leaderboard.run import RunError, scrub
 from leaderboard.validate import BOARD, MACHINE_RE, sha256
 from leaderboard.validate_macro import (
@@ -896,13 +896,13 @@ def run(system: str, preset: str, keys: list[str], machine: str, out: Path, dead
         raise RunError("--deadline-min must be finite and greater than zero")
     if not native_only and os.environ.get("DBFORK_NATIVE_ONLY", "").lower() in ("1", "true", "yes"):
         raise RunError("DBFORK_NATIVE_ONLY is set; unset it so every run uses the standard benchmark mode")
-    server, sysdir = load_connector(system), BOARD / system
-    meta = json.loads((sysdir / "system.json").read_text())
+    server, sysdir = load_connector(system), system_dir(system, BOARD)
+    meta = load_system(system, BOARD)
     is_hosted = meta["hosted"] == "yes"
     if is_hosted and not allow_hosted:
         raise RunError("agent workflows run only on local systems")
     if is_hosted:
-        missing_keys = [k for k in getattr(server, "keys", ()) if not os.environ.get(k)]
+        missing_keys = [key for key in meta["credentials"] if not os.environ.get(key)]
         if missing_keys:
             raise RunError(f"{system} requires {', '.join(missing_keys)} in the environment")
     if server.needs_psql and shutil.which("psql") is None:
@@ -930,7 +930,7 @@ def run(system: str, preset: str, keys: list[str], machine: str, out: Path, dead
               "system": meta["system"], "finished": None, "aborted": None, "server": {"started_here": False, "stop": "pending"},
               "attempts": {}, "version": None, **provenance(snapshot, env)}
     record_path = out / system / "macro" / started.strftime("%Y%m%d") / f"campaign_{campaign['id']}.json"
-    identity = {k: meta[k] for k in ("system", "proprietary", "hosted", "tuned", "tags")}
+    identity = system_identity(meta)
     child_env = None
     if native_only:
         child_env = dict(os.environ)

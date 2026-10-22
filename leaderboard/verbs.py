@@ -22,7 +22,7 @@ from pathlib import Path
 from leaderboard import aws_worker
 from leaderboard import run as micro
 from leaderboard import run_macro
-from leaderboard.connector import connector_names, load_connector
+from leaderboard.connector import connector_names, load_connector, load_system, system_dir
 from leaderboard.run import RunError, scrub
 from leaderboard.validate import BOARD, MACHINE_RE, parse_day
 from leaderboard.validate_macro import ATTEMPT_RE as RUN_ID_RE, ExecutionProfile, EXECUTION_PROFILES, HEX, SECRET_KEY, SECRET_VALUE
@@ -255,13 +255,13 @@ def run(
     expected_point_ids = [pt.id for pt in points_for_run(scale, verbs, axes)]
     if not expected_point_ids:
         raise RunError("no grid points selected for this scale, verbs, and axes")
-    server, sysdir = load_connector(system), BOARD / system
-    meta = json.loads((sysdir / "system.json").read_text())
+    server, sysdir = load_connector(system), system_dir(system, BOARD)
+    meta = load_system(system, BOARD)
     is_hosted = meta["hosted"] == "yes"
     if is_hosted and not allow_hosted:
         raise RunError("pass --allow-hosted to run verb scaling against a hosted system")
     if is_hosted:
-        missing_keys = [k for k in getattr(server, "keys", ()) if not os.environ.get(k)]
+        missing_keys = [key for key in meta["credentials"] if not os.environ.get(key)]
         if missing_keys:
             raise RunError(f"{system} requires {', '.join(missing_keys)} in the environment")
     if server.needs_psql and shutil.which("psql") is None:
@@ -433,11 +433,11 @@ def validate_verbs(path: Path, board: Path = BOARD) -> list[str]:
     if not VERBS_RE.fullmatch(rel.as_posix()):
         return [f"{rel.as_posix()}: path must match <system>/verbs/<YYYYMMDD>/bb_<id>.json"]
     system_key, _, day_dir, filename = rel.parts
-    meta_path = board / system_key / "system.json"
+    meta_path = system_dir(system_key, board) / "system.json"
     if not meta_path.is_file() or meta_path.is_symlink():
         return [f"{rel.as_posix()}: missing regular system.json for {system_key!r}"]
     try:
-        meta = json.loads(meta_path.read_text())
+        meta = load_system(system_key, board)
         data = json.loads(resolved.read_text())
     except (OSError, ValueError) as exc:
         return [f"{rel.as_posix()}: unreadable JSON: {exc}"]
@@ -546,7 +546,7 @@ def build_verbs(board: Path = BOARD, sources: set[str] | None = None) -> tuple[l
     board = board.resolve()
     candidates: list[Path] = []
     for sysdir in sorted(board.iterdir()):
-        if not sysdir.is_dir() or sysdir.is_symlink() or not (sysdir / "system.json").is_file():
+        if not sysdir.is_dir() or sysdir.is_symlink() or not (system_dir(sysdir.name, board) / "system.json").is_file():
             continue
         verbs_dir = sysdir / "verbs"
         if not verbs_dir.is_dir() or verbs_dir.is_symlink():

@@ -526,6 +526,8 @@ assert.deepEqual(classNodes(macroEl('macro-breakdowns'), 'breakdown-title').map(
     }
     const wizard = fs.readFileSync(`${__dirname}/run.html`, 'utf8');
     const arch = fs.readFileSync(`${__dirname}/architecture.html`, 'utf8');
+    const readme = fs.readFileSync(`${__dirname}/README.md`, 'utf8');
+    const requirements = fs.readFileSync(`${__dirname}/requirements/README.md`, 'utf8');
     for (const [file, markup] of [['index.html', html], ['run.html', wizard], ['architecture.html', arch]]) {
         assert.equal(markup.match(/<meta name="theme-color" content="([^"]+)">/)?.[1], computed('--canvas'), `${file}: theme-color is the --canvas token's value`);
         const rest = markup.replace(/<meta name="theme-color"[^>]*>|<link rel="icon"[^>]*>/g, m => m.replace(/[^\n]/g, ' '));
@@ -536,6 +538,17 @@ assert.deepEqual(classNodes(macroEl('macro-breakdowns'), 'breakdown-title').map(
         'architecture.html must match real CLI syntax, AWS tags, ARIA roles, and CSS selectors');
     assert.match(arch, /Chronos/, 'architecture.html must list Chronos among self-hosted engines');
     assert.match(arch, /python -m leaderboard\.verbs/, 'architecture.html must reference python -m leaderboard.verbs');
+    assert.ok(
+        arch.includes('The planned launcher assigns one On-Demand <code>m7a.2xlarge</code> to each self-hosted database. Each worker has a dedicated 200 GiB <code>gp3</code> data volume.'),
+        'architecture.html must show the fixed production target without claiming that its launcher exists',
+    );
+    assert.ok(
+        arch.includes('A future per-database map may override it. Different profiles must use separate hardware cohorts.'),
+        'architecture.html must preserve the future placement boundary without mixing hardware cohorts',
+    );
+    assert.match(readme, /All workers in one ranked cohort use this fixed profile\./, 'README.md must document the fixed production cohort');
+    assert.match(requirements, /one On-Demand `m7a\.2xlarge` worker for each database system\./, 'requirements must lock the production instance type');
+    assert.match(requirements, /dedicated 200 GiB `gp3` data volume/, 'requirements must lock the production data volume');
     const svgBodies = [...arch.matchAll(/<svg\s+class="arch-svg"[\s\S]*?<\/svg>/g)].map(([s]) => s);
     assert.equal(svgBodies.length, 2, 'architecture.html must render both architecture and lifecycle SVG diagrams');
     const decodeEntities = s => s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCodePoint(parseInt(h, 16)));
@@ -1087,25 +1100,23 @@ assert.equal(noCanvasOp.className, 'diagram-missing'); assert.match(noCanvasOp.t
 // Check the wizard's actual command generator without executing any shell commands.
 const wizardHtml = fs.readFileSync(`${__dirname}/run.html`, 'utf8');
 const wizardScript = wizardHtml.match(/<script>([\s\S]*?)<\/script>/)[1];
-const wizardContext = vm.createContext({});
+const systemsDir = path.join(__dirname, 'systems');
+const runnable = fs.readdirSync(systemsDir).filter(name =>
+    fs.existsSync(path.join(systemsDir, name, 'connector.py')) && fs.existsSync(path.join(systemsDir, name, 'system.json'))).sort();
+const systemMetadata = Object.fromEntries(runnable.map(name => [name, JSON.parse(fs.readFileSync(path.join(systemsDir, name, 'system.json'), 'utf8'))]));
+const wizardContext = vm.createContext({systems: systemMetadata});
 vm.runInContext(wizardScript.slice(0, wizardScript.indexOf('const form =')), wizardContext);
 const commandsFor = vm.runInContext('commandsFor', wizardContext);
 assert.match(commandsFor(['dolt_mysql'], 'bench-01', ''), /^python -m leaderboard.run dolt_mysql --machine 'bench-01' &&\npython -m leaderboard.site --phase local$/, 'The wizard rebuilds the development site, never production');
 assert.match(wizardHtml, /<code>python -m leaderboard\.serve --phase local<\/code>/, 'The fallback names the development server; the production default has no wizard');
+assert.doesNotMatch(wizardHtml, /\bCI runs\b/, 'The wizard must not claim that the planned production launcher exists');
+assert.match(wizardHtml, /fleet launcher is not implemented yet/, 'The submission path states the production automation boundary');
 const mixedCommands = commandsFor(['dolt', 'dolt_mysql'], 'bench-01', '');
 assert.equal(mixedCommands.split(' &&\n').length, 3, 'One run per database, then build once');
 assert.match(mixedCommands, /^python -m leaderboard.run dolt --machine 'bench-01' &&\n/);
 assert.doesNotMatch(mixedCommands, /--client-location|leaderboard\.validate/, 'Local runs need no location; build validates and excludes incompatible history');
-const options = [...wizardHtml.matchAll(/<input\b[^>]*\bname="database"[^>]*>/g)].map(([input]) => ({
-    system: input.match(/\bvalue="([^"]+)"/)[1], disabled: /\bdisabled\b/.test(input),
-}));
-const runnable = fs.readdirSync(__dirname).filter(name =>
-    fs.existsSync(`${__dirname}/${name}/connector.py`) && fs.existsSync(`${__dirname}/${name}/system.json`)).sort();
-assert.deepEqual(options.filter(option => !option.disabled).map(option => option.system).sort(), runnable,
-    'Wizard choices must match runnable leaderboard connectors');
-for (const {system} of options.filter(option => option.disabled)) {
-    assert.throws(() => commandsFor([system], 'bench-01', 'US East'), /database/);
-}
+assert.deepEqual(Object.keys(systemMetadata).sort(), runnable, 'Wizard metadata must match runnable leaderboard connectors');
+assert.doesNotMatch(wizardHtml, /dolt_mysql:\s*\{/, 'The wizard must not duplicate the system registry');
 assert.match(wizardHtml, /uv sync --frozen\nuv run --frozen python build_protos\.py/);
 assert.match(wizardHtml, /Install uv, protoc/);
 assert.doesNotMatch(wizardHtml, /requirements\.lock/);
@@ -1132,16 +1143,19 @@ assert.throws(() => commandsFor(['dolt'], 'bad; command', ''), /machine/);
 assert.throws(() => commandsFor(['unknown'], 'bench-01', ''), /database/);
 assert.throws(() => commandsFor(['dolt'], 'a'.repeat(65), ''), /machine/);
 // Keep credential/location escaping covered without offering an absent connector.
-vm.runInContext("SYSTEMS.neon = {keys: ['NEON_API_KEY_ORG']}", wizardContext);
+vm.runInContext("SYSTEMS.neon = {hosted: 'yes', credentials: ['NEON_API_KEY_ORG']}", wizardContext);
 assert.throws(() => commandsFor(['neon'], 'bench-01', 'US East', {preset: 'mini'}), /local/, 'Hosted systems never get agent workflows');
 assert.ok(commandsFor(['neon'], 'bench-01', "O'Brien $(touch nope)").includes("--client-location 'O'\\''Brien $(touch nope)'"));
 assert.throws(() => commandsFor(['neon'], 'bench-01', '   '), /location/);
 assert.throws(() => commandsFor(['neon'], 'bench-01', 'US\tEast'), /location/);
 vm.runInContext('delete SYSTEMS.neon', wizardContext);
-assert.ok([...wizardHtml.matchAll(/<input\b[^>]*\bname="database"[^>]*>/g)].every(([input]) => /\btype="radio"/.test(input)), 'Wizard selects 1 database per run via radio inputs');
+assert.match(wizardHtml, /input\.type = 'radio'; input\.name = 'database'/, 'Wizard selects 1 database per run via generated radio inputs');
 const submissionScaffold = vm.runInContext('submissionScaffold', wizardContext);
-assert.match(submissionScaffold('AcmeDB', 'acmedb', false, 'dev-box', {preset: 'mini'}), /"system": "AcmeDB"[\s\S]*python -m leaderboard\.run_macro acmedb --preset mini --machine 'dev-box'/);
+assert.match(submissionScaffold('AcmeDB', 'acmedb', false, 'dev-box', {preset: 'mini'}), /leaderboard\/systems\/acmedb\/system\.json[\s\S]*"system": "AcmeDB"[\s\S]*"requirements":[\s\S]*"credentials": \[\][\s\S]*python -m leaderboard\.run_macro acmedb --preset mini --machine 'dev-box'/);
 assert.throws(() => submissionScaffold('AcmeDB', 'bad-slug!', false, 'dev-box', null), /adapter ID/);
+assert.throws(() => submissionScaffold('AcmeDB', '__proto__', false, 'dev-box', null), /adapter ID/);
+const systemDisplaySlug = vm.runInContext('systemDisplaySlug', wizardContext);
+assert.deepEqual(['Dolt', 'Doltgres'].map(system => systemDisplaySlug({system})), ['dolt', 'doltgres'], 'Wizard icons use display identities, not connector keys');
 
 
 // Selecting data rows changes only the reads/writes score, the board names the subset it counts, and the last ticked

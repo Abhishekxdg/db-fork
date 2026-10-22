@@ -16,9 +16,18 @@ from unittest import mock
 
 from leaderboard import aws_worker
 from leaderboard.build import build
-from leaderboard.file_copy.connector import FileCopy
+from leaderboard.systems.file_copy.connector import FileCopy
 from leaderboard.mock import entries as mock_rows
-from leaderboard.connector import Connector, connector_names, load_connector
+from leaderboard.connector import (
+    Connector,
+    connector_names,
+    load_connector,
+    load_system,
+    parse_system,
+    system_catalog,
+    system_dir,
+    system_identity,
+)
 from leaderboard.run import RunError, clean_up, exclusive, scrub
 from leaderboard.validate import BOARD, SCHEMA_VERSION, sha256, validate
 from microbench.datagen import DynamicDataGenerator
@@ -50,12 +59,13 @@ class ResultFiles(unittest.TestCase):
         self.board = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.board)
         shutil.copy(BOARD / "suite.json", self.board)
+        (self.board / "systems").mkdir()
         for system in ("dolt", "neon"):
-            shutil.copytree(BOARD / system, self.board / system, ignore=shutil.ignore_patterns("results"))
+            shutil.copytree(system_dir(system), system_dir(system, self.board), ignore=shutil.ignore_patterns("__pycache__"))
         self.suite = json.loads((BOARD / "suite.json").read_text())
 
     def payload(self, date: str = "2026-09-30", **changes) -> dict:
-        meta = json.loads((BOARD / "dolt" / "system.json").read_text())
+        meta = system_identity(load_system("dolt"))
         return {"schema_version": SCHEMA_VERSION, "run_id": "0123abcd", **meta, "date": date, "machine": "box",
                 "version": "0.54.10", "suite": self.suite["suite"], "suite_sha256": sha256(BOARD / "suite.json"),
                 "seed": self.suite["seed"], "commit": "0" * 40, "dirty": False,
@@ -91,7 +101,7 @@ class ResultFiles(unittest.TestCase):
 
     def test_hosted_results_need_their_fields(self) -> None:
         def hosted(**changes) -> dict:
-            meta = json.loads((BOARD / "neon" / "system.json").read_text())
+            meta = system_identity(load_system("neon"))
             return self.payload(**{**meta, "region": "aws-us-east-1", "rtt_ms": 12.5, "client_location": "US East",
                                    "service": {"region": "aws-us-east-1", "pg_version": 17}, **changes})
 
@@ -134,7 +144,7 @@ class ResultFiles(unittest.TestCase):
         for path in sorted((BOARD / "mock").glob("*.json")):
             with self.subTest(path.name):
                 mock = json.loads(path.read_text())
-                self.assertEqual(json.loads((BOARD / path.stem / "system.json").read_text())["hosted"], "yes")
+                self.assertEqual(load_system(path.stem)["hosted"], "yes")
                 self.assertEqual([len(r) for r in mock["result"]], [self.suite["tries"]] * len(self.suite["rows"]))
                 self.assertTrue(all(c > 0 for r in mock["result"] for c in r))
 
@@ -147,6 +157,10 @@ class ResultFiles(unittest.TestCase):
 
 
 class Runner(unittest.TestCase):
+    def test_runner_has_no_personal_secret_manager_policy(self) -> None:
+        forbidden = "bit" + "warden"
+        self.assertNotIn(forbidden, (BOARD / "run.py").read_text(encoding="utf-8").lower())
+
     def test_a_second_run_of_a_system_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as runs, mock.patch("leaderboard.run.RUNS", Path(runs)):
             with exclusive("neon"), self.assertRaisesRegex(RunError, "another run of neon"):
@@ -171,6 +185,7 @@ class Runner(unittest.TestCase):
 class Connectors(unittest.TestCase):
     def test_every_connector_in_the_repository_fills_the_contract(self) -> None:
         self.assertTrue(connector_names())
+        self.assertEqual(connector_names(), list(system_catalog(runnable=True)))
         for name in connector_names():
             self.assertIsInstance(load_connector(name), Connector)
         with self.assertRaises(ValueError):
@@ -178,12 +193,28 @@ class Connectors(unittest.TestCase):
 
     def test_adding_a_system_is_adding_its_folder(self) -> None:
         with tempfile.TemporaryDirectory() as board:
+            systems = Path(board) / "systems"
+            systems.mkdir()
             for name, files in (("new", ("system.json", "connector.py")), ("preview", ("system.json",)),
                                 ("stray", ("connector.py",))):
-                (Path(board) / name).mkdir()
+                (systems / name).mkdir()
                 for file in files:
-                    (Path(board) / name / file).write_text("")
+                    content = json.dumps({**load_system("dolt"), "system": name}) if file == "system.json" else ""
+                    (systems / name / file).write_text(content)
             self.assertEqual(connector_names(Path(board)), ["new"])
+
+    def test_system_metadata_rejects_unsafe_or_ambiguous_fields(self) -> None:
+        meta = load_system("dolt")
+        with self.assertRaisesRegex(ValueError, "invalid system key"):
+            load_system("__proto__")
+        cases = (
+            ({**meta, "credentials": ["SAFE", "BAD-NAME"]}, "environment variable names"),
+            ({**meta, "credentials": ["SAME", "SAME"]}, "unique environment variable names"),
+            ({**meta, "requirements": "line one\nline two"}, "printable text"),
+        )
+        for value, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                parse_system(json.dumps(value), Path("system.json"))
 
     def test_file_copy_provision_runs_info_before_create_database_and_restores_method(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -209,8 +240,8 @@ class Connectors(unittest.TestCase):
                 return info
 
             with mock.patch.object(fc, "_admin", return_value=conn), \
-                    mock.patch("leaderboard.file_copy.connector.FileCopyToolSuite.FileCopyInfo", side_effect=make_info), \
-                    mock.patch("leaderboard.file_copy.connector.file_copy.drop_database", side_effect=lambda db: events.append(f"drop({db})")), \
+                    mock.patch("leaderboard.systems.file_copy.connector.FileCopyToolSuite.FileCopyInfo", side_effect=make_info), \
+                    mock.patch("leaderboard.systems.file_copy.connector.file_copy.drop_database", side_effect=lambda db: events.append(f"drop({db})")), \
                     mock.patch.object(fc, "exists", return_value=False):
                 fc.provision("bb_1234abcd")
                 self.assertEqual(prev_file.read_text().strip(), "copy")
@@ -245,16 +276,18 @@ class Connectors(unittest.TestCase):
             fake_bin.write_text("#!/bin/bash\npwd > \"$MO_DATA_DIR/launched_from\"\necho \"$@\" > \"$MO_DATA_DIR/launched_args\"\n")
             fake_bin.chmod(0o755)
             board = root / "leaderboard"
-            (board / "matrixone").mkdir(parents=True)
-            shutil.copy(BOARD / "matrixone" / "start", board / "matrixone" / "start")
+            sysdir = system_dir("matrixone", board)
+            sysdir.mkdir(parents=True)
+            shutil.copy(system_dir("matrixone") / "start", sysdir / "start")
             mount_data = root / "mnt" / "nvme" / "mo" / "matrixone" / "mo-data"
             env = {
                 "PATH": "/usr/bin:/bin",
                 "HOME": str(home),
                 "MO_DATA_DIR": str(mount_data),
             }
-            res = subprocess.run([str(board / "matrixone" / "start")], env=env, capture_output=True, text=True)
+            res = subprocess.run([str(sysdir / "start")], env=env, capture_output=True, text=True)
             self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertTrue((board / ".runs" / "matrixone.pid").is_file())
             self.assertTrue((mo_home / "mo-data").is_symlink())
             self.assertEqual((mo_home / "mo-data").resolve(), mount_data.resolve())
             for _ in range(20):
@@ -272,9 +305,9 @@ class Connectors(unittest.TestCase):
                 conn = mock.MagicMock()
                 cur = conn.cursor.return_value.__enter__.return_value
                 cur.fetchone.return_value = None
-                target = mock.patch.object(srv, "_admin", return_value=conn) if name == "dolt" else mock.patch("leaderboard.dolt_mysql.connector.dolt_mysql.connect", return_value=conn)
+                target = mock.patch.object(srv, "_admin", return_value=conn) if name == "dolt" else mock.patch("leaderboard.systems.dolt_mysql.connector.dolt_mysql.connect", return_value=conn)
                 with mock.patch.object(srv, "data_dir", Path(tmp)), target, \
-                        mock.patch("leaderboard.dolt_mysql.connector.dolt_mysql.drop_database"):
+                        mock.patch("leaderboard.systems.dolt_mysql.connector.dolt_mysql.drop_database"):
                     self.assertTrue(srv.exists("bb_1234abcd"))
                     srv.delete("bb_1234abcd")
                     self.assertFalse(trash.exists())
@@ -311,7 +344,7 @@ class AwsWorker(unittest.TestCase):
         self.addCleanup(patch.stop)
 
     def _valid_micro_payload(self, system: str = "dolt", machine: str = "aws-box") -> dict:
-        meta = json.loads((self.board / system / "system.json").read_text())
+        meta = system_identity(load_system(system, self.board))
         return {
             "schema_version": SCHEMA_VERSION,
             "run_id": "0123abcd",

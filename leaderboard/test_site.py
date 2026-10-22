@@ -14,6 +14,7 @@ from unittest import mock
 
 from leaderboard import build, build_macro, site
 from leaderboard import run as micro
+from leaderboard.connector import connector_names, load_system, system_dir, system_identity
 from leaderboard.test_macro import CAMPAIGN, SOURCE, attempt_payload, campaign_record, evidence_summary, good_evidence, outcome
 from leaderboard.validate import BOARD, SCHEMA_VERSION, sha256
 from leaderboard.validate_macro import SCENARIOS
@@ -53,8 +54,9 @@ class Board(unittest.TestCase):
         self.board = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.board)
         shutil.copy(BOARD / "suite.json", self.board)
+        (self.board / "systems").mkdir()
         for system in ("dolt", "dolt_mysql", "neon", "tiger", "xata"):
-            shutil.copytree(BOARD / system, self.board / system, ignore=shutil.ignore_patterns("results", "macro", "__pycache__"))
+            shutil.copytree(system_dir(system), system_dir(system, self.board), ignore=shutil.ignore_patterns("__pycache__"))
         shutil.copytree(BOARD / "mock", self.board / "mock")
         self.suite = json.loads((BOARD / "suite.json").read_text())
         for name in site.PAGES["local"]:
@@ -72,7 +74,7 @@ class Board(unittest.TestCase):
         self.manifest.write_text(json.dumps(manifest))
 
     def payload(self, date: str = "2026-09-30", system: str = "dolt", **changes) -> dict:
-        meta = json.loads((BOARD / system / "system.json").read_text())
+        meta = system_identity(load_system(system))
         return {"schema_version": SCHEMA_VERSION, "run_id": "0123abcd", **meta, "date": date, "machine": "box",
                 "version": "0.54.10", "suite": self.suite["suite"], "suite_sha256": sha256(BOARD / "suite.json"),
                 "seed": self.suite["seed"], "commit": "0" * 40, "dirty": False,
@@ -131,6 +133,7 @@ class Local(Board):
         local = self.assemble("local")
         data = self.read(local)
         self.assertEqual(data["site"], {"phase": "local"})
+        self.assertEqual(sorted(data["systems"]), connector_names(self.board))
         self.assertEqual([(e["system"], "source" in e) for e in data["data"]], [("Doltgres", True), ("Neon", False), ("Tiger Cloud", False), ("Xata", False)], "mock rows follow the real ones and link to no record")
         self.assertFalse([k for e in data["data"] for k in ("mock", "basis", "note") if k in e], "a mock row looks like any other row")
         self.assertEqual([c["preset"] for c in data["macroCampaigns"]], ["mini"], "a quick campaign is a result on the machine that ran it")
@@ -266,9 +269,9 @@ class Local(Board):
     def test_system_sidecars_must_be_regular_files(self):
         self.write(self.payload())
         self.publish({"micro": ["dolt/results/20260930/box.json"], "macro": []})
-        meta = self.board / "dolt" / "system.json"; meta.unlink(); meta.symlink_to(BOARD / "dolt" / "system.json")
+        meta = system_dir("dolt", self.board) / "system.json"; meta.unlink(); meta.symlink_to(system_dir("dolt") / "system.json")
         for phase in ("prod", "alpha", "local"):
-            with self.assertRaisesRegex(site.SiteError, "dolt/system.json is a symlink"):
+            with self.assertRaisesRegex(site.SiteError, "systems/dolt/system.json is a symlink"):
                 self.assemble(phase)
         self.assertFalse(self.site.exists() and any(self.site.iterdir()))
 

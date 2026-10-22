@@ -16,10 +16,11 @@ import re
 import sys
 from pathlib import Path
 
-BOARD = Path(__file__).resolve().parent
+from leaderboard.connector import BOARD, IDENTITY_FIELDS, load_system
+
 SCHEMA_VERSION = 1
 MACHINE_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
-IDENTITY = ("system", "proprietary", "hosted", "tuned", "tags")
+IDENTITY = IDENTITY_FIELDS
 # Every key of a result file and its type. float also admits int; no type admits bool.
 FIELDS = {
     "schema_version": int, "run_id": str, "system": str, "date": str, "machine": str,
@@ -78,10 +79,10 @@ def validate(path: Path, board: Path = BOARD) -> list[str]:
     if not MACHINE_RE.fullmatch(path.stem):
         problems.append(f"machine {path.stem!r} must match {MACHINE_RE.pattern}")
     try:
-        meta = json.loads((board / sysdir / "system.json").read_text())
+        meta = load_system(sysdir, board)
         data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as e:
-        return problems + [f"cannot read {sysdir}/system.json or the file as JSON: {e}"]
+    except (OSError, ValueError) as e:
+        return problems + [f"cannot read systems/{sysdir}/system.json or the file as JSON: {e}"]
     if not isinstance(data, dict):
         return problems + ["not a JSON object"]
     problems += [f"{where} looks like a credential" for where in credentials(data)]
@@ -113,7 +114,7 @@ def validate(path: Path, board: Path = BOARD) -> list[str]:
     current = {"schema_version": SCHEMA_VERSION, "suite": suite["suite"], "seed": suite["seed"],
                "suite_sha256": sha256(board / "suite.json"), "dataset_sha256": suite["dataset"]["sha256"]}
     problems += [f"{k} differs from the current suite.json" for k, v in current.items() if data[k] != v]
-    problems += [f"{k} differs from {sysdir}/system.json" for k in IDENTITY if data[k] != meta.get(k)]
+    problems += [f"{k} differs from systems/{sysdir}/system.json" for k in IDENTITY if data[k] != meta.get(k)]
     if day and data["date"] != day.isoformat():
         problems.append(f"date {data['date']} differs from its directory")
     if data["machine"] != path.stem:

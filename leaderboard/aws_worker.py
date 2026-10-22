@@ -18,7 +18,7 @@ import threading
 import time
 from typing import Callable, Iterator
 
-from leaderboard.connector import connector_names, load_connector
+from leaderboard.connector import load_connector, system_catalog
 from leaderboard.run import (
     MACHINE_RE,
     RUNS,
@@ -60,10 +60,7 @@ class DeadlineExceededError(RuntimeError):
 
 
 def runnable_systems(board: Path = BOARD) -> dict[str, dict]:
-    return {
-        name: json.loads((board / name / "system.json").read_text(encoding="utf-8"))
-        for name in connector_names(board)
-    }
+    return system_catalog(board, runnable=True)
 
 
 def parse_systems_arg(raw: str) -> list[str]:

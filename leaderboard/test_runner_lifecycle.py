@@ -15,7 +15,7 @@ import psycopg2
 
 from dblib import chronos, dolt as dolt_pg, dolt_mysql, file_copy, matrixone, seekdb
 from leaderboard import run as runner
-from leaderboard.connector import load_connector
+from leaderboard.connector import load_connector, system_dir
 
 
 class Recovery(unittest.TestCase):
@@ -87,10 +87,12 @@ class RunLifecycle(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
         self.board = self.root / "leaderboard"
-        (self.board / "dolt").mkdir(parents=True)
-        self.meta = self.board / "dolt" / "system.json"
+        self.sysdir = system_dir("dolt", self.board)
+        self.sysdir.mkdir(parents=True)
+        self.meta = self.sysdir / "system.json"
         self.meta.write_text(json.dumps({"system": "Doltgres", "hosted": "no", "proprietary": "no",
-                                         "tuned": "no", "tags": []}))
+                                         "tuned": "no", "tags": ["test"],
+                                         "requirements": "Test database tools installed.", "credentials": []}))
         self.dump = self.root / "dump.sql"
         self.dump.write_text("SELECT 1;")
         self.suite = self.board / "suite.json"
@@ -138,7 +140,9 @@ class RunLifecycle(unittest.TestCase):
             self.assertEqual(json.loads(path.read_text())["scope"], self.server.scope())
 
         self.server.provision.side_effect = provision
-        payload = json.loads(self.bench().read_text())
+        result_path = self.bench()
+        self.assertEqual(result_path.relative_to(self.board).parts[:2], ("dolt", "results"))
+        payload = json.loads(result_path.read_text())
         self.assertEqual(payload["commit"], before["commit"])
         self.assertEqual(payload["suite_sha256"], before["files"][str(self.suite)])
         self.assertEqual(payload["lock_sha256"], before["files"][str(self.root / "uv.lock")])
@@ -167,7 +171,7 @@ class RunLifecycle(unittest.TestCase):
             self.lifecycle.side_effect = OSError("stop failed")
             with self.assertRaisesRegex(runner.RunError, "cleanup failed"):
                 self.bench()
-        self.lifecycle.assert_called_once_with(self.board / "dolt", "stop")
+        self.lifecycle.assert_called_once_with(self.sysdir, "stop")
         self.assertIn("cleanup failed", self.error())
 
     def test_stop_exception_publishes_an_error(self):
@@ -181,7 +185,7 @@ class RunLifecycle(unittest.TestCase):
         with self.assertRaisesRegex(runner.RunError, "deadline"):
             self.bench(deadline_min=0.001)
         self.server.provision.assert_not_called()
-        self.lifecycle.assert_called_once_with(self.board / "dolt", "stop")
+        self.lifecycle.assert_called_once_with(self.sysdir, "stop")
         self.assertIn("deadline", self.error())
 
     def test_cleanup_deadline_retains_journal_and_still_stops(self):
@@ -190,7 +194,7 @@ class RunLifecycle(unittest.TestCase):
                 self.assertRaisesRegex(runner.RunError, "cleanup passed"):
             self.bench()
         self.assertTrue(runner.journal("dolt").exists())
-        self.lifecycle.assert_called_once_with(self.board / "dolt", "stop")
+        self.lifecycle.assert_called_once_with(self.sysdir, "stop")
         self.assertIn("cleanup passed", self.error())
 
     def test_ctrl_c_cleans_up_without_publishing(self):
@@ -198,7 +202,7 @@ class RunLifecycle(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             self.bench()
         self.server.delete.assert_called_once()
-        self.lifecycle.assert_called_once_with(self.board / "dolt", "stop")
+        self.lifecycle.assert_called_once_with(self.sysdir, "stop")
         self.assertFalse((self.board / "dolt" / "results").exists())
 
     def test_sigterm_cleans_up_without_publishing(self):
@@ -206,7 +210,7 @@ class RunLifecycle(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             self.bench()
         self.server.delete.assert_called_once()
-        self.lifecycle.assert_called_once_with(self.board / "dolt", "stop")
+        self.lifecycle.assert_called_once_with(self.sysdir, "stop")
         self.assertFalse((self.board / "dolt" / "results").exists())
 
     def test_native_only_env_is_rejected_before_start(self):
@@ -219,7 +223,6 @@ class RunLifecycle(unittest.TestCase):
         meta = json.loads(self.meta.read_text())
         meta["hosted"] = "yes"
         self.meta.write_text(json.dumps(meta))
-        self.server.keys = ()
         self.server.region = "test"
         self.server.service = {}
         with mock.patch.dict(os.environ, {"PGOPTIONS": "-c statement_timeout=0 -c application_name=bench"}):
@@ -275,8 +278,8 @@ class RunLifecycle(unittest.TestCase):
         ):
             rc = verbs.run("dolt", 1, "box", self.board, verbs=["branch", "commit"], native_only=True)
         self.assertEqual(rc, 0)
-        self.start_server.assert_called_once_with(self.board / "dolt")
-        self.lifecycle.assert_called_once_with(self.board / "dolt", "stop")
+        self.start_server.assert_called_once_with(self.sysdir)
+        self.lifecycle.assert_called_once_with(self.sysdir, "stop")
         proc_run.assert_called_once()
         written = list((self.board / "dolt" / "verbs").rglob("bb_*.json"))
         self.assertEqual(len(written), 1)
@@ -394,7 +397,7 @@ class RunLifecycle(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 verbs.run("dolt", 1, "box", self.board, verbs=["branch"])
         self.assertGreaterEqual(self.server.delete.call_count, 1)
-        self.lifecycle.assert_called_once_with(self.board / "dolt", "stop")
+        self.lifecycle.assert_called_once_with(self.sysdir, "stop")
 
     def test_launch_verbs_child_kills_sigterm_ignoring_descendants_and_validates_reps_and_profile(self):
         import sys

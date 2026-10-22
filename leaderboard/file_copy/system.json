@@ -1,7 +1,0 @@
-{
-  "system": "PostgreSQL (FILE_COPY)",
-  "proprietary": "no",
-  "hosted": "no",
-  "tuned": "no",
-  "tags": ["C", "Postgres protocol", "Full database copy"]
-}

@@ -12,10 +12,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from leaderboard.connector import load_system, system_identity
+
 
 def entries(board: Path) -> list[dict]:
     """A row per mock whose system has no result file yet: its identity from
     system.json and the mock's numbers."""
     measured = {path.parts[-4] for path in board.glob("*/results/*/*.json")}
-    return [{**json.loads((board / path.stem / "system.json").read_text()), **json.loads(path.read_text())}
+    return [{**system_identity(load_system(path.stem, board)), **json.loads(path.read_text())}
             for path in sorted((board / "mock").glob("*.json")) if path.stem not in measured]
