@@ -153,7 +153,7 @@ def _fmt_bytes(b):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--backend", required=True, help="dolt | dolt_mysql | seekdb | matrixone | file_copy | chronos | neon")
+    ap.add_argument("--backend", required=True, help="dolt | dolt_mysql | seekdb | matrixone | file_copy | chronos | chronosdb | neon")
     ap.add_argument("--scale", type=int, default=BASE["scale"], help="W warehouses of CH data (default 1)")
     ap.add_argument("--outdir", required=True)
     ap.add_argument("--db-name", default="micro_verbs")

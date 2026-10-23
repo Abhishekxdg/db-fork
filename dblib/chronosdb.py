@@ -213,6 +213,9 @@ class ChronosDBToolSuite(DBToolSuite):
         self._past: dict = {}        # commit id -> connection to 'world@moment' (see _connect_impl)
         self._side = None            # connection for storage samples (another thread)
         self._side_lock = threading.Lock()
+        # the connection opens on the run's main; a worker may start elsewhere
+        if self.default_branch != MAIN_BRANCH:
+            self._execute(f"SWITCH WORLD {_q(self._world(self.default_branch))}")
         self._current_ref = Ref(self.default_branch)
 
     # ------------------------------------------------------------------
@@ -221,7 +224,7 @@ class ChronosDBToolSuite(DBToolSuite):
 
     def _world(self, branch: str) -> str:
         """The world behind a benchmark branch name."""
-        if branch == self.default_branch:
+        if branch == MAIN_BRANCH:
             return self.db_name
         return f"{self.db_name}{SEP}{branch}"
 
@@ -592,7 +595,7 @@ class ChronosDBToolSuite(DBToolSuite):
         with _REG.lock:
             merged = world in _REG.merged_into
         if self._current_ref and self._current_ref.branch == ref.branch:
-            self._on(Ref(self.default_branch))
+            self._on(Ref(MAIN_BRANCH))
         if merged:
             self.observe("delete_after_merge")
             return
@@ -619,7 +622,7 @@ class ChronosDBToolSuite(DBToolSuite):
     def list_branches(self) -> list:
         prefix = f"{self.db_name}{SEP}"
         rows = self._execute("SHOW WORLDS") or []
-        out = [self.default_branch] if any(r[0] == self.db_name for r in rows) else []
+        out = [MAIN_BRANCH] if any(r[0] == self.db_name for r in rows) else []
         out += [r[0][len(prefix):] for r in rows if str(r[0]).startswith(prefix)]
         return out
 
