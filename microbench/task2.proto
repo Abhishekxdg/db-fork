@@ -14,6 +14,7 @@ enum Backend {
   CHRONOS = 10;
   BAUPLAN = 11;
   TERMINUSDB = 12;
+  CHRONOSDB = 13;  // Chronos DB (dblib/chronosdb.py), not MIT's Chronos above
   
 }
 

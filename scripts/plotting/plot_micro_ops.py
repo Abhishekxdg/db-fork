@@ -38,7 +38,7 @@ LABELS = {"BRANCH": "Branch", "CONNECT": "Connect", "COMMIT": "Commit", "DIFF": 
 BACKEND_COLORS = {
     "dolt": "#0072B2", "dolt_mysql": "#56B4E9", "neon": "#D55E00", "xata": "#CC79A7",
     "file_copy": "#E69F00", "seekdb": "#009E73", "matrixone": "#999999",
-    "chronos": "#000000", "terminusdb": "#882255",
+    "chronos": "#000000", "chronosdb": "#44AA99", "terminusdb": "#882255",
 }
 
 

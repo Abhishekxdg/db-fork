@@ -1,8 +1,8 @@
 # Database Benchmarking Framework
 
 A parametrized and extensible benchmarking framework for branchable database
-backends (Dolt, Neon, Xata, SeekDB, MatrixOne, Bauplan, plain Postgres copies,
-...). Every backend
+backends (Dolt, Neon, Xata, SeekDB, MatrixOne, Bauplan, Chronos DB, plain Postgres
+copies, ...). Every backend
 is driven through one git-like API (`dblib/db_api.py`): `branch`, `commit`,
 `diff`, `log`, `merge`, `rebase`, `revert`, `reset`, `delete`, plus `exec()`
 to run a workload script on one or more branches. Each operation is timed and
@@ -117,6 +117,7 @@ both under `capabilities` and `implementation`.
 | `matrixone` | yes | yes (snapshots) | yes (DATA BRANCH MERGE) | yes | yes (diff-driven) | yes | yes | yes | yes |
 | `bauplan` | yes | yes (tags) | yes (native; row-level on conflict) | yes | yes (branch from tag) | yes | yes | | |
 | `file_copy` | yes (CREATE DATABASE clone) | yes (clone per commit + log table) | yes (SQL three-way over postgres_fdw) | yes | yes (drop + clone from the snapshot) | yes | yes | yes (postgres_fdw) | yes |
+| `chronosdb` (Chronos DB) | yes (copy-on-write world) | yes (moments + log table) | yes (MERGE WORLD) | rebase: yes (REBASE WORLD); revert: engine's inverse diff | yes (RESTORE WORLD) | yes (deferred while forks live) | yes (`world@time`) | | yes |
 | `chronos` | yes (interval fork, metadata only) | yes (checkpoint + log table) | yes (three-way over Chronos diffs) | yes | yes (diff-driven) | yes (deferred while children live) | yes (checkpoints) | yes (interval views) | |
 | `terminusdb` (microbench only) | yes | commit: reads the head (every write commits); diff, log: yes | yes (`apply` of the diff since the common ancestor) | rebase: yes; revert: `apply` of the inverse diff | yes | yes | yes | | |
 
@@ -236,7 +237,7 @@ workload {
 | Argument | Description |
 |----------|-------------|
 | `scenario` | `rl_env`, `context_mgmt`, `multi_agent`, `dev_agent`, `ops_agent`, `data_agent` |
-| `backend` | `dolt`, `dolt_mysql`, `seekdb`, `matrixone`, `bauplan`, `neon`, `xata`, `file_copy`, `chronos` |
+| `backend` | `dolt`, `dolt_mysql`, `seekdb`, `matrixone`, `bauplan`, `neon`, `xata`, `file_copy`, `chronos`, `chronosdb` |
 | `scale_factor` | W warehouses for the generated data (default: the config's) |
 | `--max-runtime-sec N` | runtime cap; default one hour times the largest of the scale factor and the intensity multipliers (3600 s at scale 1, intensity 1), 0 = no cap. A run that reaches it (or gets Ctrl-C / SIGTERM) is recorded as `interrupted` with its rows and stats written |
 | `--op-stall-sec N` | stall limit for one operation: a verb or an exec that has been running longer than this (default 600 s, 0 = off) is cancelled and recorded `FAILED` with a `stalled: cancelled after Ns` note; the run goes on, so later failures and invariant results are recorded too; the e2e stats list the cancelled operations under `stalls` with their outcome (`failed`, or `completed` when it finished before the cancel landed), and a run with a cancelled operation that failed ends with status `incomplete` instead of `completed` |
@@ -321,7 +322,7 @@ Use `scripts/run_single_thread_bench.sh` to measure single-threaded operation la
 
 | Argument | Description |
 |----------|-------------|
-| `backend` | Database backend: `dolt`, `dolt_mysql`, `seekdb`, `matrixone`, `neon`, `xata`, `file_copy`, `chronos`, `terminusdb` |
+| `backend` | Database backend: `dolt`, `dolt_mysql`, `seekdb`, `matrixone`, `neon`, `xata`, `file_copy`, `chronos`, `chronosdb`, `terminusdb` |
 | `sql_dump_path` | Path to SQL dump file (e.g., `db_setup/tpcc_schema.sql`) |
 | `num_branches` | Number of branches to create for testing |
 
@@ -415,7 +416,7 @@ Use `scripts/run_throughput_bench.sh` with one of three sweep modes:
 The script runs in **async mode** by default: each thread keeps
 `--concurrent-requests` ops in flight, each on its own pooled connection
 checked out on the thread's branch. Async mode supports `dolt`, `dolt_mysql`,
-`seekdb` and `neon`; use `--mode sync` for the other backends (one op at a time per
+`seekdb`, `neon` and `chronosdb`; use `--mode sync` for the other backends (one op at a time per
 thread). Every point of a sweep uses the same mode, including concurrency 1.
 
 Each thread works on one branch, assigned round-robin. With fewer threads
@@ -426,7 +427,7 @@ than branches, threads share branches.
 
 | Argument | Description |
 |----------|-------------|
-| `backend` | Database backend: `dolt`, `dolt_mysql`, `seekdb`, `matrixone`, `neon`, `xata`, `file_copy`, `chronos` |
+| `backend` | Database backend: `dolt`, `dolt_mysql`, `seekdb`, `matrixone`, `neon`, `xata`, `file_copy`, `chronos`, `chronosdb` |
 | `sql_dump_path` | Path to SQL dump file |
 | `--sweep-concurrency` | Fix threads and branches, vary concurrent requests (requires `--threads` and `--branches`; async only) |
 | `--sweep-branches` | Fix threads, vary branches (requires `--threads`) |
@@ -1193,6 +1194,88 @@ reclamation and runs `VACUUM`.
 
 ---
 
+## Chronos DB backend — `chronosdb`
+
+**Not the `chronos` backend above.** `chronos` is MIT's Chronos
+(mitdbg/chronos), a library that adds interval branching to a PostgreSQL
+database. [Chronos DB](https://github.com/Abhishekxdg/chronosdb-engine) is a
+separate system, unrelated to it: a database server of its own (Rust, the
+Postgres wire protocol, `chronos serve`) whose copy-on-write branches are
+called *worlds*. The backend is `dblib/chronosdb.py`; it talks to the server
+with psycopg, and every verb is one or two of the engine's SQL statements.
+
+### Setup
+
+```bash
+chronos serve /path/to/folder          # Postgres protocol on 127.0.0.1:5433
+./scripts/run_macrobench.sh --mini rl_env chronosdb
+uv run pytest tests/test_chronosdb_live.py tests/test_chronosdb_unit.py
+```
+
+| Variable | Meaning (default) |
+|----------|-------------------|
+| `CHRONOSDB_HOST`, `CHRONOSDB_PORT` | server (`127.0.0.1`, `5433`) |
+| `CHRONOSDB_USER`, `CHRONOSDB_PASSWORD` | role (`chronos`) and the server's token, if it was started with one |
+| `CHRONOSDB_HISTORY_RETENTION` | how far back commits stay readable, set server-wide at setup (`1 day`) |
+
+The run's database is a world of its own: `CREATE DATABASE <db_name>` makes
+an empty world with no parent, which is the run's `main`; branch `x` is the
+world `<db_name>__x` (Chronos DB's own `main` is left alone, and is
+protected against direct writes by default). One server folder can hold
+several runs, one at a time for clean storage numbers: storage is `SHOW
+DISK`'s total, the whole folder (`server` scope); `gc()` is `CHECKPOINT`.
+
+### Verbs
+
+| Verb | Statement(s) | Kind |
+|------|--------------|------|
+| `branch` | `CREATE WORLD <db>__x FROM <src>` (a fork copies two pointers); from a commit, `FROM '<world>@<moment>'` | native |
+| connect | `SWITCH WORLD`; a commit ref is `USE WORLD '<world>@<moment>'`, read only (releases up to 0.4.1 refuse that form; the backend then connects to the database `<world>@<moment>`, counted as `past_connections`) | native |
+| `commit` | a row in the world's `_bb_commits` table, then the server's clock (ms) as the commit's moment | composed |
+| `log` | `SELECT` from `_bb_commits` (forks inherit it, merges carry it, a reset rewinds it) | simulated |
+| `diff` | `DIFF WORLD a TO b`; the schema half from the same rows' table schemas | native |
+| `merge` | `MERGE WORLD src` (into its parent), `REBASE WORLD dst` (a parent merged into its child), or `MERGE WORLD src INTO dst` (any other pair) | native |
+| `rebase` | `REBASE WORLD x` (onto its parent); a parent rebased onto its own child is `MERGE WORLD child` | native |
+| `revert` | `DIFF WORLD 'w@commit' TO 'w@previous' AS SQL`, run on the branch in one transaction, then a commit | composed |
+| `reset` | `RESTORE WORLD x TO <moment>` | native |
+| `delete` | `DROP WORLD x` | native |
+
+- **Commits are moments.** Chronos DB keeps every version of every world for
+  `history_retention`, so a commit copies nothing: it records a time, and
+  `'world@time'` reads the world as it was then. The first read of a moment
+  rebuilds it from the log (up to a checkpoint's worth of log), later reads
+  hit a cache. The backend waits for the next millisecond after a commit so
+  the next write falls after its moment.
+- **A merge consumes its source.** A whole merge into the parent drops the
+  merged world, as the engine defines it; a later `delete()` of it records
+  OK and counts `delete_after_merge`. `merge(into=parent_of_x, source=x)`
+  after `rebase(parent, onto=x)` (S2's reject path) finds x merged already
+  and returns `up_to_date` (`merge_already_merged`).
+- **Conflicts.** A plain `MERGE`/`REBASE` fails on a row both sides changed
+  (40001). The backend then lists the rows with `MERGE WORLD ... DRY RUN`
+  (counted as `conflicts`) and redoes the statement with `USING OURS` or
+  `USING THEIRS`; Chronos's `OURS` is the world being merged, so the
+  benchmark's `"ours"` (the target) is `THEIRS` for a child merged into its
+  parent and `OURS` for a parent merged into its child. A resolve callable
+  gets the dry run's rows in Dolt's `base_`/`our_`/`their_` shape and runs
+  on the target after a merge that kept the target's rows. All three
+  statements are in the verb's latency. Chronos DB has no fast-forward:
+  every merge is three-way and `fast_forward` is always false.
+- **Schema conflicts.** When both sides changed one table's columns (S4: the
+  spine adds `c_tier`, a dev branch adds its own column), Chronos DB refuses
+  the merge or rebase ("both sides changed table customer") rather than
+  merging the two column sets; the verb fails with `schema conflict`.
+- **No multi-branch statements.** A statement reads one world (and its own
+  past through `AS OF`); cross-branch reads run once per branch.
+- **Revert overwrites.** The engine's inverse diff sets the commit's rows
+  back to their earlier values whether or not they changed again since;
+  git would report a conflict.
+- **Delete with forks.** `DROP WORLD` is refused while the world has forks
+  (2BP01); the delete is deferred and retried after later deletes and at
+  close (`deferred_deletes`).
+
+---
+
 ## TerminusDB backend — `terminusdb`
 
 [TerminusDB](https://terminusdb.org) is a document/graph database with
@@ -1386,6 +1469,10 @@ PGSQL_HOST=127.0.0.1
 PGSQL_PORT=5434
 PGSQL_DATA_DIR=/mnt/pgbench   # volume dedicated to the server; storage = its usage minus WAL
 # The chronos backend uses the same server (PGSQL_*), one database per run.
+
+# Chronos DB server of the chronosdb backend (a different system from chronos)
+CHRONOSDB_HOST=127.0.0.1
+CHRONOSDB_PORT=5433
 
 # TerminusDB server of the terminusdb backend (see its section for the rest)
 TERMINUSDB_URL=http://127.0.0.1:6363

@@ -58,6 +58,8 @@ from dblib.neon import NeonToolSuite
 from dblib.file_copy import FileCopyToolSuite
 from dblib.chronos import ChronosToolSuite
 from dblib import chronos as chronos_mod
+from dblib.chronosdb import ChronosDBToolSuite
+from dblib import chronosdb as chronosdb_mod
 from dblib.xata import XataToolSuite
 from dblib import terminusdb
 from dblib.terminusdb import TerminusDBToolSuite
@@ -326,6 +328,7 @@ class BackendInfo:
     xata_project_id: Optional[str] = None
     file_copy_info: Optional[FileCopyToolSuite.FileCopyInfo] = None
     chronos_info: Optional[ChronosToolSuite.ChronosInfo] = None
+    chronosdb_info: Optional[ChronosDBToolSuite.ChronosDBInfo] = None
     setup_branches: list = None
 
 
@@ -374,6 +377,10 @@ def create_db_tools(
         )
     if backend == tp.Backend.CHRONOS:
         return ChronosToolSuite.init_for_bench(
+            result_collector, db_name, default_branch, measure_storage
+        )
+    if backend == tp.Backend.CHRONOSDB:
+        return ChronosDBToolSuite.init_for_bench(
             result_collector, db_name, default_branch, measure_storage
         )
     if backend == tp.Backend.TERMINUSDB:
@@ -501,6 +508,14 @@ class BackendManager:
             info.root_branch_name = chronos_mod.MAIN_BRANCH
             print(f"Default CHRONOS connection URI: {info.default_uri}")
 
+        elif backend == tp.Backend.CHRONOSDB:
+            # The run's database is a world with no parent (CREATE DATABASE),
+            # made here with its commit log table; load_sql_file fills it.
+            info.chronosdb_info = ChronosDBToolSuite.ChronosDBInfo(db_name)
+            info.default_uri = ChronosDBToolSuite.get_default_connection_uri()
+            info.default_branch_name = chronosdb_mod.MAIN_BRANCH
+            print(f"Default CHRONOSDB connection URI: {info.default_uri}")
+
         elif backend == tp.Backend.TERMINUSDB:
             info.default_uri = TerminusDBToolSuite.get_default_connection_uri()
             info.default_branch_name = terminusdb.MAIN_BRANCH
@@ -569,6 +584,10 @@ class BackendManager:
             terminusdb.setup_database(db_name, sql_dump_path)
         elif require_db_setup and backend == tp.Backend.BAUPLAN:
             bauplan.setup_database(db_name, sql_dump_path)
+        elif require_db_setup and backend == tp.Backend.CHRONOSDB:
+            # Made by ChronosDBInfo above; load the dump into it.
+            if sql_dump_path:
+                load_sql_file(self._get_connection_uri(info), sql_dump_path)
         elif require_db_setup:
             self._create_database(info.default_uri, db_name)
 
@@ -599,6 +618,8 @@ class BackendManager:
             FileCopyToolSuite.cleanup(info.file_copy_info)
         elif info.chronos_info:
             ChronosToolSuite.cleanup(info.chronos_info)
+        elif info.chronosdb_info:
+            ChronosDBToolSuite.cleanup(info.chronosdb_info)
         elif self.config.backend == tp.Backend.DOLT_MYSQL and db_name:
             try:
                 dolt_mysql.drop_database(db_name)
@@ -687,6 +708,8 @@ class BackendManager:
             return FileCopyToolSuite.get_initial_connection_uri(db_name)
         elif backend == tp.Backend.CHRONOS:
             return ChronosToolSuite.get_initial_connection_uri(db_name)
+        elif backend == tp.Backend.CHRONOSDB:
+            return ChronosDBToolSuite.get_initial_connection_uri(db_name)
         elif backend == tp.Backend.NEON:
             return NeonToolSuite._get_neon_connection_uri(
                 info.neon_project_id, info.default_branch_id, db_name
@@ -2460,6 +2483,7 @@ class ResultManager:
         # Server behaviour the backend worked around (retries and the like)
         suite_class = {
             tp.Backend.CHRONOS: ChronosToolSuite,
+            tp.Backend.CHRONOSDB: ChronosDBToolSuite,
             tp.Backend.TERMINUSDB: TerminusDBToolSuite,
         }.get(self.config.backend)
         observed = getattr(suite_class, "OBSERVED", None)

@@ -45,9 +45,9 @@ TITLES = {"rl_env": "S1 RL env (data-heavy)", "context_mgmt": "S2 context manage
 MARKERS = {"rl_env": ("o", "#4c72b0"), "context_mgmt": ("v", "#937860"), "multi_agent": ("s", "#dd8452"),
            "dev_agent": ("D", "#55a868"), "ops_agent": ("P", "#da8bc3"), "data_agent": ("^", "#8172b3")}
 FOUR = ["rl_env", "multi_agent", "dev_agent", "data_agent"]
-NAMES = {"CHRONOS": "Chronos", "DOLT": "Doltgres", "DOLT_MYSQL": "Dolt", "FILE_COPY": "file_copy",
+NAMES = {"CHRONOS": "Chronos", "CHRONOSDB": "Chronos DB", "DOLT": "Doltgres", "DOLT_MYSQL": "Dolt", "FILE_COPY": "file_copy",
          "MATRIXONE": "MatrixOne", "NEON": "Neon", "SEEKDB": "SeekDB"}
-COLORS = {"Chronos": "#8c6d31", "Doltgres": "#1f77b4", "Dolt": "#6baed6", "file_copy": "#7f7f7f",
+COLORS = {"Chronos": "#8c6d31", "Chronos DB": "#17becf", "Doltgres": "#1f77b4", "Dolt": "#6baed6", "file_copy": "#7f7f7f",
           "MatrixOne": "#d62728", "Neon": "#2ca02c", "SeekDB": "#9467bd"}
 CATS = [("create", "branch create"), ("delete", "branch delete"), ("commit", "commit"),
         ("reconcile", "diff / merge / rebase"), ("history", "reset / revert"), ("data", "ordinary data ops")]
@@ -301,7 +301,7 @@ def fig_bars(t, create_ms, scenarios, out, log=False):
 GROUPS = [("Branch Intensive", ["context_mgmt", "multi_agent", "dev_agent"]),
           ("Data Intensive", ["rl_env", "ops_agent", "data_agent"])]
 # One hatch per system so the bars stay apart in black and white.
-HATCHES = {"Doltgres": "", "Dolt": "//", "Chronos": "..", "MatrixOne": "xx", "file_copy": "\\\\",
+HATCHES = {"Doltgres": "", "Dolt": "//", "Chronos": "..", "Chronos DB": "oo", "MatrixOne": "xx", "file_copy": "\\\\",
            "SeekDB": "--", "Neon": "++"}
 SHORT = {"rl_env": "S1 RL env", "context_mgmt": "S2 context mgmt", "multi_agent": "S3 multi-agent",
          "dev_agent": "S4 dev agent", "ops_agent": "S5 ops agent", "data_agent": "S6 data agent"}
