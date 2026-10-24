@@ -1217,6 +1217,8 @@ uv run pytest tests/test_chronosdb_live.py tests/test_chronosdb_unit.py
 | `CHRONOSDB_HOST`, `CHRONOSDB_PORT` | server (`127.0.0.1`, `5433`) |
 | `CHRONOSDB_USER`, `CHRONOSDB_PASSWORD` | role (`chronos`) and the server's token, if it was started with one |
 | `CHRONOSDB_HISTORY_RETENTION` | how far back commits stay readable, set server-wide at setup (`1 day`) |
+| `CHRONOSDB_BY_COLUMNS` | merge a row both sides changed column by column, as Dolt merges cells (`1`); `0` for whole rows |
+| `CHRONOSDB_LEGACY` | `auto` (by `version()`), `1` for 0.4.1's statements, `0` for 0.4.2's (`auto`) |
 
 The run's database is a world of its own: `CREATE DATABASE <db_name>` makes
 an empty world with no parent, which is the run's `main`; branch `x` is the
@@ -1233,10 +1235,10 @@ DISK`'s total, the whole folder (`server` scope); `gc()` is `CHECKPOINT`.
 | connect | `SWITCH WORLD`; a commit ref is `USE WORLD '<world>@<moment>'`, read only (releases up to 0.4.1 refuse that form; the backend then connects to the database `<world>@<moment>`, counted as `past_connections`) | native |
 | `commit` | a row in the world's `_bb_commits` table, then the server's clock (ms) as the commit's moment | composed |
 | `log` | `SELECT` from `_bb_commits` (forks inherit it, merges carry it, a reset rewinds it) | simulated |
-| `diff` | `DIFF WORLD a TO b`; the schema half from the same rows' table schemas | native |
+| `diff` | `DIFF WORLD a TO b SUMMARY` (rows counted per table without reading them; 0.4.1: `DIFF WORLD a TO b`, its rows counted); the schema half from the same table-level rows | native |
 | `merge` | `MERGE WORLD src` (into its parent), `REBASE WORLD dst` (a parent merged into its child), or `MERGE WORLD src INTO dst` (any other pair) | native |
 | `rebase` | `REBASE WORLD x` (onto its parent); a parent rebased onto its own child is `MERGE WORLD child` | native |
-| `revert` | `DIFF WORLD 'w@commit' TO 'w@previous' AS SQL`, run on the branch in one transaction, then a commit | composed |
+| `revert` | `UNDO DIFF 'w@previous' TO 'w@commit' EXCEPT TABLES (_bb_commits)` on the branch, then a commit (0.4.1: `DIFF WORLD 'w@commit' TO 'w@previous' AS SQL`, run in one transaction) | native |
 | `reset` | `RESTORE WORLD x TO <moment>` | native |
 | `delete` | `DROP WORLD x` | native |
 
@@ -1251,25 +1253,37 @@ DISK`'s total, the whole folder (`server` scope); `gc()` is `CHECKPOINT`.
   OK and counts `delete_after_merge`. `merge(into=parent_of_x, source=x)`
   after `rebase(parent, onto=x)` (S2's reject path) finds x merged already
   and returns `up_to_date` (`merge_already_merged`).
-- **Conflicts.** A plain `MERGE`/`REBASE` fails on a row both sides changed
-  (40001). The backend then lists the rows with `MERGE WORLD ... DRY RUN`
-  (counted as `conflicts`) and redoes the statement with `USING OURS` or
-  `USING THEIRS`; Chronos's `OURS` is the world being merged, so the
-  benchmark's `"ours"` (the target) is `THEIRS` for a child merged into its
-  parent and `OURS` for a parent merged into its child. A resolve callable
-  gets the dry run's rows in Dolt's `base_`/`our_`/`their_` shape and runs
-  on the target after a merge that kept the target's rows. All three
+- **Conflicts.** Merges and rebases run `BY COLUMNS`: a row both sides
+  changed in different columns is combined, and only a column both changed
+  (or a row one side deleted and the other changed) is a conflict, as Dolt
+  counts cells (`CHRONOSDB_BY_COLUMNS=0` for whole rows). With `"ours"` or
+  `"theirs"` the verb is one statement, `... BY COLUMNS USING OURS|THEIRS`,
+  and its NOTICE gives the count (Chronos DB 0.4.2 on). Chronos's `OURS`
+  is the world being merged, so the benchmark's `"ours"` (the target) is
+  `THEIRS` for a child merged into its parent and `OURS` for a parent merged
+  into its child. With a resolve callable, or before 0.4.2: a plain
+  `MERGE`/`REBASE` fails on a conflict (40001), the backend lists the rows
+  with `MERGE WORLD ... DRY RUN` and redoes the statement with `USING`; the
+  callable gets the dry run's rows in Dolt's `base_`/`our_`/`their_` shape
+  and runs on the target after a merge that kept the target's rows. All the
   statements are in the verb's latency. Chronos DB has no fast-forward:
   every merge is three-way and `fast_forward` is always false.
-- **Schema conflicts.** When both sides changed one table's columns (S4: the
-  spine adds `c_tier`, a dev branch adds its own column), Chronos DB refuses
-  the merge or rebase ("both sides changed table customer") rather than
-  merging the two column sets; the verb fails with `schema conflict`.
+- **Schema conflicts.** When both sides added different columns to one
+  table (S4: the spine adds `c_tier`, a dev branch adds its own column),
+  the merge or rebase takes both. Both changing the same column (S4's
+  same-named `c_tier` with another type) is refused ("both sides changed
+  table customer") and the verb fails with `schema conflict`. Releases up
+  to 0.4.1 refuse any table whose columns both sides changed.
 - **No multi-branch statements.** A statement reads one world (and its own
   past through `AS OF`); cross-branch reads run once per branch.
-- **Revert overwrites.** The engine's inverse diff sets the commit's rows
-  back to their earlier values whether or not they changed again since;
-  git would report a conflict.
+- **Revert conflicts.** `UNDO DIFF` fails (40001) when a row the commit
+  changed has changed again since, as git and Dolt fail a revert on a
+  conflict; the verb fails with `revert conflict` and nothing is reverted.
+  On 0.4.1 the inverse diff's statements overwrite such rows instead.
+- **Server version.** The three 0.4.2 statements above (the merge's NOTICE,
+  `DIFF ... SUMMARY`, `UNDO DIFF`) are used when `version()` says Chronos
+  0.4.2 or later; `CHRONOSDB_LEGACY=1` keeps the 0.4.1 statements, `=0`
+  uses the new ones on a build that still says 0.4.1.
 - **Delete with forks.** `DROP WORLD` is refused while the world has forks
   (2BP01); the delete is deferred and retried after later deletes and at
   close (`deferred_deletes`).

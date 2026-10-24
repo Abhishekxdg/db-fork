@@ -15,9 +15,15 @@ Every verb is one or two SQL statements of the engine's, sent over psycopg:
   row in the world's ``_bb_commits`` log table; ``'x@<time>'`` then names
   the world as it was (``DIFF ... TO``, ``CREATE WORLD ... FROM``, a
   read-only ``USE WORLD``), and ``reset()`` is ``RESTORE WORLD x TO <time>``;
-* ``diff()`` is ``DIFF WORLD a TO b``; ``merge()`` is ``MERGE WORLD``
-  (three-way against the fork point), ``rebase()`` is ``REBASE WORLD``; the
-  rows a resolve callable gets come from ``MERGE ... DRY RUN``.
+* ``diff()`` is ``DIFF WORLD a TO b SUMMARY``; ``merge()`` is ``MERGE WORLD
+  ... BY COLUMNS USING OURS|THEIRS`` (three-way against the fork point, its
+  conflicts counted from its NOTICE), ``rebase()`` is ``REBASE WORLD``; the
+  rows a resolve callable gets come from ``MERGE ... DRY RUN``; ``revert()``
+  is ``UNDO DIFF 'x@<before>' TO 'x@<commit>'``.
+
+Those are Chronos DB 0.4.2's statements; on 0.4.1 (``version()`` tells, or
+``CHRONOSDB_LEGACY=1``) diff reads ``DIFF``'s rows, a merge is retried after
+a ``DRY RUN`` lists its conflicts, and revert runs ``DIFF ... AS SQL``.
 
 The run's database is a world of its own: ``CREATE DATABASE <db>`` makes an
 empty world with no parent, which the run uses as its ``main``; branch ``x``
@@ -28,7 +34,8 @@ the whole folder).
 Settings: ``CHRONOSDB_HOST`` (127.0.0.1), ``CHRONOSDB_PORT`` (5433),
 ``CHRONOSDB_USER`` (chronos), ``CHRONOSDB_PASSWORD`` (the server's token, if
 it has one), ``CHRONOSDB_HISTORY_RETENTION`` (1 day: how far back commits
-stay readable; set server-wide at setup).
+stay readable; set server-wide at setup), ``CHRONOSDB_BY_COLUMNS`` (1: merge
+column by column; 0 for whole rows), ``CHRONOSDB_LEGACY`` (auto).
 """
 
 import os
@@ -51,6 +58,14 @@ CHRONOSDB_PORT = int(os.environ.get("CHRONOSDB_PORT", "5433"))
 CHRONOSDB_USER = os.environ.get("CHRONOSDB_USER", "chronos")
 CHRONOSDB_PASSWORD = os.environ.get("CHRONOSDB_PASSWORD", "")
 HISTORY_RETENTION = os.environ.get("CHRONOSDB_HISTORY_RETENTION", "1 day")
+# Merge a row both sides changed column by column (only a column both changed
+# conflicts), as Dolt merges cells; 0 for Chronos DB's whole-row default.
+BY_COLUMNS = os.environ.get("CHRONOSDB_BY_COLUMNS", "1") not in ("0", "false", "no")
+
+# Chronos DB 0.4.2 added what the verbs use when they can: a merge's conflict
+# count in its NOTICE, DIFF ... SUMMARY, UNDO DIFF. "auto" checks the server's
+# version; 1 uses the 0.4.1 statements, 0 the new ones whatever the version says.
+LEGACY = os.environ.get("CHRONOSDB_LEGACY", "auto")
 
 MAIN_BRANCH = "main"
 LOG_TABLE = "_bb_commits"
@@ -87,6 +102,27 @@ def _sqlstate(e: Exception) -> str:
     return getattr(e, "pgcode", None) or ""
 
 
+_SETTLED = re.compile(r"(\d+) rows both sides changed: (\d+) combined by columns")
+
+
+def _settled(notices) -> Optional[tuple]:
+    """(rows both sides changed, of them combined by columns) from a
+    MERGE/REBASE's NOTICE, or None if it sent none."""
+    for n in reversed(notices):
+        m = _SETTLED.search(n)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def _new_verbs(version: str) -> bool:
+    """Whether a server of this version() has 0.4.2's statements (see LEGACY)."""
+    if LEGACY != "auto":
+        return LEGACY in ("0", "false", "no")
+    m = re.search(r"Chronos (\d+)\.(\d+)\.(\d+)", version or "")
+    return bool(m) and tuple(int(x) for x in m.groups()) >= (0, 4, 2)
+
+
 # ----------------------------------------------------------------------------
 # Process-wide state: every worker's suite of one run shares it.
 # ----------------------------------------------------------------------------
@@ -105,6 +141,7 @@ class _Registry:
         self.merged_into: dict = {}    # world -> world it was merged into (and dropped)
         self.parents: dict = {}        # world -> parent world (None for a root)
         self.deferred: set = set()     # worlds whose DROP waits for their forks
+        self.new_verbs = None          # whether the server has 0.4.2's statements (see LEGACY)
         self.seq = 0
 
     def next_id(self, ms: int) -> str:
@@ -134,7 +171,7 @@ class ChronosDBToolSuite(DBToolSuite):
         "log": "simulated",
         "merge": "native",
         "rebase": "native",
-        "revert": "composed",
+        "revert": "native",
         "reset": "native",
         "delete": "native",
         "commit_refs": "native",
@@ -147,27 +184,35 @@ class ChronosDBToolSuite(DBToolSuite):
                   "commit's moment. The engine keeps every version for history_retention, so "
                   "'world@moment' reads it back; no data is copied. The adapter waits for the "
                   "next millisecond so later writes fall after the moment",
-        "diff": "DIFF WORLD a TO b (refs at a commit are 'world@moment'); rows of _bb_ tables "
-                "left out; the schema half from the same rows (create/alter/drop table)",
+        "diff": "DIFF WORLD a TO b SUMMARY (refs at a commit are 'world@moment'): rows counted "
+                "per table without reading them, and the changes to tables themselves; before "
+                "Chronos DB 0.4.2, DIFF WORLD a TO b, its rows counted. Rows of _bb_ tables left "
+                "out; the schema half from the same table-level rows (create/alter/drop table)",
         "log": "SELECT from the _bb_commits bookkeeping table (Chronos has moments, not "
                "commit messages); forks inherit it, merges carry it, a reset rewinds it",
         "merge": "MERGE WORLD src (into its parent; the engine then drops src, so a later "
                  "delete() of it is a no-op), REBASE WORLD into (merging a parent into its "
                  "child keeps the child: Chronos's rebase is that merge), or MERGE WORLD src "
                  "INTO dst (any other pair; src stays open). Three-way against src's fork "
-                 "point. A conflict fails the plain merge (40001); MERGE ... DRY RUN then "
-                 "lists the conflicting rows and the merge is redone with USING OURS|THEIRS; "
-                 "a resolve callable runs after a merge that kept the target's rows. Chronos "
-                 "has no fast-forward: every merge is three-way (fast_forward is always False)",
+                 "point, BY COLUMNS (a row both sides changed in different columns combines; "
+                 "only a column both changed conflicts, as Dolt counts cells). For ours/theirs "
+                 "one statement with USING OURS|THEIRS, the conflicts counted from its NOTICE "
+                 "(Chronos DB 0.4.2 on). Before 0.4.2, and for a resolve callable: a conflict "
+                 "fails the plain merge (40001), MERGE ... DRY RUN lists the conflicting rows "
+                 "and the merge is redone with USING; the callable runs after a merge that "
+                 "kept the target's rows. Chronos has no fast-forward: every merge is "
+                 "three-way (fast_forward is always False)",
         "rebase": "REBASE WORLD x (onto its parent, the only rebase Chronos has: the fork point "
                   "moves to the parent as it is now, x's changes kept on top). Rebasing a "
                   "parent onto its own child is MERGE WORLD child (the child's changes into "
                   "the parent, with the parent's own changes winning per on_conflict). Any "
                   "other pair fails. Conflicts as for merge",
-        "revert": "DIFF WORLD 'w@commit' TO 'w@previous commit' AS SQL: the engine writes the "
-                  "statements that undo the commit; the adapter runs them on the branch in "
-                  "one transaction and commits. Rows changed again after the commit are "
-                  "overwritten with their pre-commit values (no conflict check, unlike git)",
+        "revert": "UNDO DIFF 'w@previous commit' TO 'w@commit' EXCEPT TABLES (_bb_commits) "
+                  "on the branch, then a commit: the engine puts back each row the commit "
+                  "changed. A row changed again since fails it (40001), as a conflict fails "
+                  "git's and Dolt's revert. Before Chronos DB 0.4.2: DIFF WORLD 'w@commit' TO "
+                  "'w@previous commit' AS SQL, its statements run in one transaction, "
+                  "overwriting rows changed since (composed)",
         "reset": "RESTORE WORLD x TO <moment> (an ordinary write of the old rows; history "
                  "keeps what it replaced). Refused by the engine for a moment before the "
                  "world's last rebase",
@@ -356,23 +401,31 @@ class ChronosDBToolSuite(DBToolSuite):
     # ---------------- diff ----------------
 
     def _diff_rows(self, ref_a: Ref, ref_b: Ref) -> list:
+        """The diff as (table, id, change, before, after, columns, rows):
+        id None for a change to a table itself. From DIFF ... SUMMARY where
+        the server has it (one row per table and change, id '*', counted
+        without reading the rows), else DIFF's own rows, one each."""
         self._home()
-        return self._execute(f"DIFF WORLD {self._at(ref_a)} TO {self._at(ref_b)}") or []
+        stmt = f"DIFF WORLD {self._at(ref_a)} TO {self._at(ref_b)}"
+        if self._new_verbs():
+            return [(t, None if n is None else "*", change, before, after, cols, n or 0)
+                    for t, change, n, before, after, cols in self._execute(f"{stmt} SUMMARY") or []]
+        return [(*r, 1) for r in self._execute(stmt) or []]
 
     def _diff_impl(self, ref_a: Ref, ref_b: Ref) -> dict:
         rows = self._diff_rows(ref_a, ref_b)
         self._last_diff = (ref_a, ref_b, rows)
         tables: dict = {}
         totals = {"insert": 0, "delete": 0, "update": 0}
-        for table, rid, change, *_ in rows:
+        for table, rid, change, *_, n in rows:
             if rid is None or str(table).startswith("_bb_"):
                 continue
             t = tables.setdefault(table, {"table_name": table, "rows_added": 0,
                                           "rows_deleted": 0, "rows_modified": 0})
             key = {"insert": "rows_added", "delete": "rows_deleted", "update": "rows_modified"}.get(change)
             if key:
-                t[key] += 1
-                totals[change] += 1
+                t[key] += n
+                totals[change] += n
         return {
             "tables": list(tables.values()),
             "rows_added": totals["insert"],
@@ -389,7 +442,7 @@ class ChronosDBToolSuite(DBToolSuite):
         rows = last[2] if last and last[0] == ref_a and last[1] == ref_b else self._diff_rows(ref_a, ref_b)
         out = {"tables_added": [], "tables_dropped": [], "columns_added": {},
                "columns_dropped": {}, "columns_changed": {}}
-        for table, rid, change, before, after, _columns in rows:
+        for table, rid, change, before, after, _columns, _n in rows:
             if rid is not None or str(table).startswith("_bb_"):
                 continue
             if change == "create table":
@@ -434,7 +487,8 @@ class ChronosDBToolSuite(DBToolSuite):
         """Conflicting rows of merging ``world`` (into its parent, or
         ``into``), grouped per table in Dolt's base_/our_/their_ shape."""
         clause = f" INTO {_q(into)}" if into else ""
-        rows = self._execute(f"MERGE WORLD {_q(world)}{clause} DRY RUN") or []
+        cols = " BY COLUMNS" if BY_COLUMNS else ""
+        rows = self._execute(f"MERGE WORLD {_q(world)}{clause}{cols} DRY RUN") or []
         by_table: dict = {}
         for table, rid, outcome, _detail, base, ours, theirs, *_ in rows:
             if outcome != "conflict" or table is None or str(table).startswith("_bb_"):
@@ -452,9 +506,35 @@ class ChronosDBToolSuite(DBToolSuite):
 
     def _settle(self, stmt: str, world: str, into: Optional[str], target: Ref,
                 bench_ours_is_world: bool, on_conflict) -> dict:
-        """Run a MERGE/REBASE statement; on a row conflict list the rows,
-        then redo it settling them per ``on_conflict``."""
+        """Run a MERGE/REBASE statement settling conflicts per ``on_conflict``.
+        For ours/theirs on a server that counts them, one statement with USING,
+        the count read from its NOTICE. Otherwise (or for a resolve callable,
+        which needs the rows) a plain attempt; on a row conflict list the rows,
+        then redo it settling them."""
         info = {"fast_forward": False, "conflicts": 0, "conflict_tables": [], "resolved": ""}
+        if BY_COLUMNS:
+            stmt += " BY COLUMNS"
+        if not callable(on_conflict) and self._new_verbs():
+            del self.conn.notices[:]
+            try:
+                info["applied"] = self._rowcount(
+                    f"{stmt} {self._using(on_conflict, bench_ours_is_world)}")
+            except psycopg2.Error as e:
+                msg = str(e).strip()
+                if _sqlstate(e) == "40001" and ("columns or constraints" in msg or "schema" in msg.lower()):
+                    raise RuntimeError(f"schema conflict; nothing merged: {msg}") from None
+                raise
+            counts = _settled(self.conn.notices)
+            if counts is None:
+                self.observe("merge_count_missing")
+                return info
+            settled, combined = counts
+            # combined by columns = no cell both changed: no conflict, as in Dolt
+            info["conflicts"] = info["conflict_rows"] = settled - combined
+            info["combined_by_columns"] = combined
+            if info["conflicts"]:
+                info["resolved"] = on_conflict
+            return info
         try:
             info["applied"] = self._rowcount(stmt)
             return info
@@ -477,6 +557,16 @@ class ChronosDBToolSuite(DBToolSuite):
             info["resolution"] = on_conflict(self._conflict_session(target), conflicts)
             info["resolved"] = "custom"
         return info
+
+    def _new_verbs(self) -> bool:
+        with _REG.lock:
+            known = _REG.new_verbs
+        if known is None:
+            rows = self._execute("SELECT version()") or [("",)]
+            known = _new_verbs(str(rows[0][0]))
+            with _REG.lock:
+                _REG.new_verbs = known
+        return known
 
     def _rowcount(self, stmt: str) -> int:
         with self.conn.cursor() as cur:
@@ -548,8 +638,19 @@ class ChronosDBToolSuite(DBToolSuite):
                 pworld, pms = world, _REG.forked_at.get(world)
             if pms is None:
                 raise RuntimeError(f"revert of {commit}: no earlier commit or fork moment of {world}")
-        stmts = self._execute(f"DIFF WORLD {_lit(f'{world}@{_moment(ms)}')} "
-                              f"TO {_lit(f'{pworld}@{_moment(pms)}')} AS SQL") or []
+        before, after = _lit(f'{pworld}@{_moment(pms)}'), _lit(f'{world}@{_moment(ms)}')
+        if self._new_verbs():
+            # one statement; a row changed since the commit fails it, as git
+            # and Dolt fail a revert on a conflict
+            self._on(Ref(ref.branch))
+            try:
+                self._execute(f"UNDO DIFF {before} TO {after} EXCEPT TABLES ({LOG_TABLE})")
+            except psycopg2.Error as e:
+                if _sqlstate(e) == "40001":
+                    raise RuntimeError(f"revert conflict; nothing reverted: {str(e).strip()}") from None
+                raise
+            return self._commit_impl(Ref(ref.branch), f"Revert {commit}")
+        stmts = self._execute(f"DIFF WORLD {after} TO {before} AS SQL") or []
         stmts = [s[0] for s in stmts if not _touches_bookkeeping(s[0])]
         self._on(Ref(ref.branch))
         self._execute("BEGIN")

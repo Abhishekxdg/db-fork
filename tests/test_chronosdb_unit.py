@@ -3,9 +3,19 @@ schema half of diff, names, moments)."""
 
 import json
 
+import pytest
+
 from dblib import chronosdb
 from dblib.chronosdb import ChronosDBToolSuite as S
 from dblib.db_api import Ref
+
+
+@pytest.fixture(autouse=True)
+def _version_from_server(monkeypatch):
+    """Statements chosen by the (fake) server's version, whatever
+    CHRONOSDB_LEGACY says in the environment."""
+    monkeypatch.setattr(chronosdb, "LEGACY", "auto")
+    monkeypatch.setattr(chronosdb._REG, "new_verbs", None)
 
 
 def test_capabilities_and_implementation():
@@ -15,7 +25,7 @@ def test_capabilities_and_implementation():
     assert caps["multi_ref_exec"] is False
     impl = S.implementation()
     assert impl["merge"] == impl["rebase"] == impl["reset"] == "native"
-    assert impl["revert"] == "composed" and impl["log"] == "simulated"
+    assert impl["revert"] == "native" and impl["log"] == "simulated"
     assert set(S.IMPLEMENTATION_NOTES) >= {"branch", "commit", "diff", "log", "merge", "rebase",
                                            "revert", "reset", "delete", "commit_refs"}
 
@@ -112,3 +122,33 @@ def test_bookkeeping_statements_are_left_out_of_revert():
     assert chronosdb._touches_bookkeeping("insert into _bb_commits (id) values ('c1');")
     assert chronosdb._touches_bookkeeping('DELETE FROM public."_bb_commits" WHERE id = 1')
     assert not chronosdb._touches_bookkeeping("update t set v = 1 where id = 2;")
+
+
+def test_settled_counts_from_merge_notice():
+    notices = ["NOTICE:  x is at version 3\n",
+               "NOTICE:  3 rows both sides changed: 1 combined by columns, 0 settled as x has "
+               "them, 1 as main has them, 1 as RESOLVE gave them\n"]
+    assert chronosdb._settled(notices) == (3, 1)
+    assert chronosdb._settled(["NOTICE:  something else\n"]) is None
+
+
+def test_new_verbs_from_version(monkeypatch):
+    v = "PostgreSQL 16.15 (Chronos {}) on x86_64-unknown-linux-gnu"
+    assert not chronosdb._new_verbs(v.format("0.4.1"))
+    assert chronosdb._new_verbs(v.format("0.4.2"))
+    assert chronosdb._new_verbs(v.format("0.10.0"))
+    assert not chronosdb._new_verbs("PostgreSQL 16.4")
+    monkeypatch.setattr(chronosdb, "LEGACY", "0")
+    assert chronosdb._new_verbs(v.format("0.4.1"))
+    monkeypatch.setattr(chronosdb, "LEGACY", "1")
+    assert not chronosdb._new_verbs(v.format("0.4.2"))
+
+
+def test_row_half_from_diff_summary(monkeypatch):
+    rows = [("t", "alter table", None, "{}", "{}", "[]"), ("u", "delete", 4, None, None, None),
+            ("t", "update", 2, None, None, None), ("t", "insert", 7, None, None, None),
+            ("_bb_commits", "insert", 1, None, None, None)]
+    monkeypatch.setattr(chronosdb._REG, "new_verbs", True)
+    out = _Fake(rows)._diff_impl(Ref("a"), Ref("b"))
+    assert (out["rows_added"], out["rows_modified"], out["rows_deleted"]) == (7, 2, 4)
+    assert sorted(t["table_name"] for t in out["tables"]) == ["t", "u"]

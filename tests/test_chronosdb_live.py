@@ -32,9 +32,9 @@ def rows(suite, ref, sql):
 
 def test_implementation_summary():
     impl = chronosdb.ChronosDBToolSuite.implementation()
-    for verb in ("branch", "diff", "merge", "rebase", "reset", "delete", "commit_refs"):
+    for verb in ("branch", "diff", "merge", "rebase", "revert", "reset", "delete", "commit_refs"):
         assert impl[verb] == "native", verb
-    assert impl["commit"] == "composed" and impl["revert"] == "composed"
+    assert impl["commit"] == "composed"
     assert impl["log"] == "simulated" and impl["multi_ref_exec"] == "unsupported"
 
 
@@ -163,3 +163,24 @@ def test_schema_diff_and_delete_with_forks_deferred(suite):
     assert "p" in suite.list_branches()
     assert suite.delete("kid").ok                            # then p goes too
     assert "p" not in suite.list_branches()
+
+
+def test_merge_combines_different_columns(suite):
+    assert suite.branch("d", from_ref=MAIN).ok
+    suite.exec(["UPDATE t SET v='d' WHERE id=2"], refs=["d"])
+    suite.exec(["UPDATE t SET n=22 WHERE id=2"], refs=[MAIN])
+    m = suite.merge(MAIN, "d", on_conflict="ours")
+    assert m.ok and m.value["conflicts"] == 0, (m.error, m.value)
+    assert rows(suite, MAIN, "SELECT v, n FROM t WHERE id=2") == [("d", 22)]
+
+
+def test_revert_of_a_row_changed_since_fails(suite):
+    if not suite._new_verbs():
+        pytest.skip("0.4.1 overwrites rows changed since")
+    suite.commit(MAIN, "one")
+    suite.exec(["UPDATE t SET v='two' WHERE id=1", "UPDATE t SET v='two' WHERE id=2"], refs=[MAIN])
+    c2 = suite.commit(MAIN, "two").value
+    suite.exec(["UPDATE t SET v='later' WHERE id=1"], refs=[MAIN])
+    r = suite.revert(MAIN, c2)
+    assert not r.ok and "revert conflict" in r.error, r.error
+    assert rows(suite, MAIN, "SELECT id, v FROM t WHERE id < 3") == [(1, "later"), (2, "two")]
