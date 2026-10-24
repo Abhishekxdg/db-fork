@@ -1310,9 +1310,10 @@ seconds of workflow, then invariants passed:
 - The `dolt` S6 failures are S6.2: `dolt_reset('--hard', ...)` succeeded
   and the batch still held the rows loaded after the commit. Possibly this
   Doltgres version; not investigated.
-- Conflict counts are not comparable: Chronos DB counts every row both
-  sides changed (whole-row merge; the adapter doesn't use `BY COLUMNS`),
-  Dolt counts cells.
+- Conflict counts are not comparable: in this run Chronos DB counted every
+  row both sides changed (whole-row merge), and Dolt's count is
+  `dolt_merge()`'s `conflicts` result, about one per merge (508 over S3's
+  512 merges), not a row count.
 - Chronos DB's weak spots in this run: the CH queries (Q3/Q18 about 4x
   Postgres at W=1), memory under eight concurrent CH queries (23 GB RSS at
   the peak), the spine's TPC-C throughput while agents work (S4: 28 txn/s,
@@ -1320,6 +1321,13 @@ seconds of workflow, then invariants passed:
   rows: 0.5 s / 2 s).
 - Before those fixes, Chronos DB 0.4.1 ran BranchBench's three-column joins
   as nested loops (S1 made no progress) and was OOM-killed in S4.
+
+Rerun of the chronosdb column with the 0.4.2 statements (merges `BY
+COLUMNS` in one statement, `DIFF ... SUMMARY`, `UNDO DIFF`), same VM:
+S1 994 s, S2 2.0 s, S3 4.7 s, S4 580 s (124/124), S5 505 s (recovery
+10.4 s), S6 2,221 s, every invariant passed. S4's rebase conflicts went
+from 2,174 rows to 254 (Dolt 117). Verbs microbenchmark at 10,000 rows:
+`diff` 14 ms (was 495), `revert` 120 ms (was 2,051).
 
 ---
 
