@@ -1274,6 +1274,39 @@ DISK`'s total, the whole folder (`server` scope); `gc()` is `CHECKPOINT`.
   (2BP01); the delete is deferred and retried after later deletes and at
   close (`deferred_deletes`).
 
+### What the six-scenario run showed
+
+One run of each full configuration at W=5 with the 2 h cap, one job at a
+time on a GCP c2d-standard-16, against `file_copy` (Postgres 18.6, XFS with
+reflinks) and `dolt` (Doltgres 1.4.0) on the same VM. Chronos DB was `main`
+after the engine fixes this benchmark led to (#237 to #244, and #257 for S4);
+seconds of workflow, then invariants passed:
+
+| Scenario | chronosdb | file_copy | dolt |
+|----------|-----------|-----------|------|
+| S1 rl_env | 1,130 s, 560/560 | 2,529 s, 560/560 | 2 h cap (12 of 16 tasks), 420/420 |
+| S2 context_mgmt | 2.2 s, 3/3 | 53 s, 3/3 | 13 s, 3/3 |
+| S3 multi_agent | 3.9 s, 8/8 | 149 s, 8/8 | 19 s, 8/8 |
+| S4 dev_agent | 663 s, 122/122 | 4,987 s, 123/123 | 563 s, 121/121 |
+| S5 ops_agent | 515 s, 10/10 | 1,817 s, 10/10 | 634 s, 10/10 |
+| S6 data_agent | 2,275 s, 128/128 | 2,817 s, 128/128 | 1,493 s, 64/128 |
+
+- S5's time to recovery (the reset to before the bad deploy) was 18.8 s,
+  against 195 s on `file_copy` and 208 s on `dolt`.
+- The `dolt` S6 failures are S6.2: `dolt_reset('--hard', ...)` succeeded
+  and the batch still held the rows loaded after the commit. Possibly this
+  Doltgres version; not investigated.
+- Conflict counts are not comparable: Chronos DB counts every row both
+  sides changed (whole-row merge; the adapter doesn't use `BY COLUMNS`),
+  Dolt counts cells.
+- Chronos DB's weak spots in this run: the CH queries (Q3/Q18 about 4x
+  Postgres at W=1), memory under eight concurrent CH queries (23 GB RSS at
+  the peak), the spine's TPC-C throughput while agents work (S4: 28 txn/s,
+  `dolt` 30, `file_copy` 73), and `diff` / `revert` of many rows (10,000
+  rows: 0.5 s / 2 s).
+- Before those fixes, Chronos DB 0.4.1 ran BranchBench's three-column joins
+  as nested loops (S1 made no progress) and was OOM-killed in S4.
+
 ---
 
 ## TerminusDB backend — `terminusdb`
